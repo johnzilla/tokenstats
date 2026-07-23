@@ -7,11 +7,9 @@ use crate::store::Quote;
 
 use super::catalog::parse_models_payload;
 
-const OPENROUTER_MODELS: &str = "https://openrouter.ai/api/v1/models";
-
-pub async fn fetch_quotes(client: &reqwest::Client) -> Result<Vec<Quote>> {
+pub async fn fetch_quotes(client: &reqwest::Client, url: &str) -> Result<Vec<Quote>> {
     let resp = client
-        .get(OPENROUTER_MODELS)
+        .get(url)
         .send()
         .await
         .context("OpenRouter request")?

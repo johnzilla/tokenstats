@@ -20,6 +20,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use nostr_sdk::prelude::*;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::store::{normalize_endpoint, ProviderNode, Store};
@@ -31,8 +32,13 @@ pub const ROUTSTR_PROVIDER_KIND: u16 = 38421;
 pub const ROUTSTR_LEGACY_KIND: u16 = 40500;
 
 /// Connect to relays and subscribe to Routstr provider announcements.
-pub async fn run_listener(store: Arc<Store>, relays: Vec<String>, kinds: Vec<u16>) -> Result<()> {
-    info!(?relays, ?kinds, "starting Nostr listener");
+pub async fn run_listener(
+    store: Arc<Store>,
+    relays: Vec<String>,
+    kinds: Vec<u16>,
+    cancel: CancellationToken,
+) -> Result<()> {
+    info!(relays = relays.len(), ?kinds, "starting Nostr listener");
 
     let keys = Keys::generate();
     let client = Client::new(&keys);
@@ -59,6 +65,10 @@ pub async fn run_listener(store: Arc<Store>, relays: Vec<String>, kinds: Vec<u16
 
     loop {
         tokio::select! {
+            _ = cancel.cancelled() => {
+                info!("nostr listener received shutdown");
+                break;
+            }
             notification = notifications.recv() => {
                 match notification {
                     Ok(RelayPoolNotification::Event { event, .. }) => {
@@ -80,7 +90,10 @@ pub async fn run_listener(store: Arc<Store>, relays: Vec<String>, kinds: Vec<u16
                     }
                     Err(e) => {
                         warn!(error = %e, "notification channel error");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        }
                     }
                 }
             }
@@ -94,7 +107,9 @@ pub async fn run_listener(store: Arc<Store>, relays: Vec<String>, kinds: Vec<u16
         }
     }
 
-    client.disconnect().await.context("disconnect")?;
+    if let Err(e) = client.disconnect().await {
+        warn!(error = %e, "nostr disconnect error (ignored during shutdown)");
+    }
     Ok(())
 }
 

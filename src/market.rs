@@ -298,3 +298,61 @@ fn privacy_rank(q: &Quote) -> u8 {
         2
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn q(model: &str, pin: f64, pout: f64) -> Quote {
+        Quote {
+            source: "openrouter".into(),
+            provider: "OpenRouter".into(),
+            provider_id: "openrouter".into(),
+            model: model.into(),
+            price_in_usd: Some(pin),
+            price_out_usd: Some(pout),
+            price_in_sats: None,
+            price_out_sats: None,
+            prev_price_out_usd: None,
+            prev_price_in_usd: None,
+            endpoint: Some("https://openrouter.ai/api/v1".into()),
+            region: None,
+            context_length: Some(128_000),
+            observed_at: Utc::now(),
+            raw_kind: None,
+        }
+    }
+
+    #[test]
+    fn blend_1_to_3() {
+        let b = blended_usd(Some(1.0), Some(3.0), 3.0).unwrap();
+        // (1 + 3*3) / 4 = 2.5
+        assert!((b - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn delta_pct_up_and_down() {
+        assert!((delta_pct(Some(110.0), Some(100.0)).unwrap() - 10.0).abs() < 1e-9);
+        assert!((delta_pct(Some(90.0), Some(100.0)).unwrap() + 10.0).abs() < 1e-9);
+        assert!(delta_pct(Some(1.0), None).is_none());
+    }
+
+    #[test]
+    fn best_now_prefers_flagship_over_mini() {
+        let quotes = vec![
+            q("openai/gpt-4o-mini", 0.15, 0.6),
+            q("openai/gpt-4o", 2.5, 10.0),
+        ];
+        let best = best_now(&quotes, 3.0);
+        let gpt = best.iter().find(|b| b.family == "GPT-4o").expect("family");
+        assert_eq!(gpt.quote.model, "openai/gpt-4o");
+    }
+
+    #[test]
+    fn preset_from_str() {
+        assert_eq!(Preset::from_str("frontier"), Some(Preset::CheapestFrontier));
+        assert_eq!(Preset::from_str("private"), Some(Preset::MostPrivate));
+        assert!(Preset::from_str("nope").is_none());
+    }
+}

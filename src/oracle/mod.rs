@@ -4,63 +4,83 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::market::blended_usd;
 use crate::store::{Quote, Store};
 
-const RATE_INTERVAL: Duration = Duration::from_secs(60);
-const NORMALIZE_INTERVAL: Duration = Duration::from_secs(15);
+#[derive(Debug, Clone)]
+pub struct OracleConfig {
+    pub rate_interval: Duration,
+    pub normalize_interval: Duration,
+    pub http_timeout: Duration,
+    pub btc_usd_url: String,
+}
 
-/// Coinbase public spot price (no API key).
-const BTC_USD_URL: &str = "https://api.coinbase.com/v2/prices/BTC-USD/spot";
-
-pub async fn run_oracle(store: Arc<Store>) -> Result<()> {
-    info!("starting oracle loop");
+pub async fn run_oracle(
+    store: Arc<Store>,
+    cfg: OracleConfig,
+    cancel: CancellationToken,
+) -> Result<()> {
+    info!(
+        rate_interval_secs = cfg.rate_interval.as_secs(),
+        normalize_interval_secs = cfg.normalize_interval.as_secs(),
+        "starting oracle loop"
+    );
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(cfg.http_timeout)
         .user_agent(concat!("tokenstats/", env!("CARGO_PKG_VERSION")))
         .build()?;
 
-    if let Err(e) = refresh_btc_usd(&client, &store).await {
+    if let Err(e) = refresh_btc_usd(&client, &store, &cfg.btc_usd_url).await {
         warn!(error = %e, "initial BTC/USD fetch failed");
     }
 
-    let store_rate = Arc::clone(&store);
-    let client_rate = client.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(RATE_INTERVAL);
-        loop {
-            interval.tick().await;
-            if let Err(e) = refresh_btc_usd(&client_rate, &store_rate).await {
-                warn!(error = %e, "BTC/USD refresh failed");
+    let mut rate_interval = tokio::time::interval(cfg.rate_interval);
+    rate_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    rate_interval.tick().await;
+
+    let mut normalize_interval = tokio::time::interval(cfg.normalize_interval);
+    normalize_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    normalize_interval.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                info!("oracle received shutdown");
+                break;
+            }
+            _ = rate_interval.tick() => {
+                if let Err(e) = refresh_btc_usd(&client, &store, &cfg.btc_usd_url).await {
+                    warn!(error = %e, "BTC/USD refresh failed");
+                }
+            }
+            _ = normalize_interval.tick() => {
+                if let Some(btc_usd) = store.btc_usd() {
+                    store.apply_sats_normalization(btc_usd);
+                    debug!(btc_usd, "normalized quotes to dual USD/sats");
+                }
+                log_summary(&store);
             }
         }
-    });
-
-    let mut interval = tokio::time::interval(NORMALIZE_INTERVAL);
-    loop {
-        interval.tick().await;
-        if let Some(btc_usd) = store.btc_usd() {
-            store.apply_sats_normalization(btc_usd);
-            debug!(btc_usd, "normalized quotes to dual USD/sats");
-        }
-        log_summary(&store);
     }
+
+    Ok(())
 }
 
-async fn refresh_btc_usd(client: &reqwest::Client, store: &Store) -> Result<()> {
+async fn refresh_btc_usd(client: &reqwest::Client, store: &Store, url: &str) -> Result<()> {
     let v: serde_json::Value = client
-        .get(BTC_USD_URL)
+        .get(url)
         .send()
         .await
-        .context("coinbase request")?
+        .context("btc usd request")?
         .error_for_status()
-        .context("coinbase status")?
+        .context("btc usd status")?
         .json()
         .await
-        .context("coinbase json")?;
+        .context("btc usd json")?;
 
     let amount = v
         .pointer("/data/amount")

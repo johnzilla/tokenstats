@@ -1,36 +1,34 @@
 # Checkpoint
 
-_Last updated: 2026-07-22 · MVP observability stack + dashboard polish; docs + first full commit_
+_Last updated: 2026-07-22 · Config + graceful shutdown + logging + Docker + unit tests_
 
 ## Where I am
 
-Working **MVP is feature-complete for observation**: CLI `serve`, Nostr RIP-02 (kind 38421) discovery, OpenRouter + Routstr `/v1/models` polling, in-memory store with price deltas and node reliability, BTC/USD oracle (USD+sats), SQLite persistence, Axum dashboard with Best Now, blend ratios, presets, hover copy curl/config, and CSV export.
+MVP is solid for observation **and** ops basics:
 
-Code lives under `src/`; docs updated in `README.md`, `AGENTS.md`, `docs/USAGE.md`.
+- Central `Config` (CLI/env intervals, source toggles, URLs)
+- Graceful shutdown (SIGINT/SIGTERM → cancel tasks → HTTP drain → final SQLite snapshot)
+- Richer tracing (targets, JSON logs, quieter deps, HTTP trace layer)
+- Dockerfile + docker-compose + `docs/DEPLOY.md` for DigitalOcean-style deploy
+- 12 unit tests (config, market, catalog, store)
 
 ## Decisions made
 
-- **RIP-02 kind 38421** for discovery (roadmap 40500 kept as legacy subscribe only).
-- **Single binary crate**, server-rendered HTML (no SPA).
-- **OpenRouter as reference catalog** always polled; Routstr nodes from Nostr + `--node`.
-- **Blend** = weighted avg `(in + r*out)/(1+r)`; default r=3.
-- **SQLite** optional default on (`data/tokenstats.db`), 30s snapshots; rusqlite bundled.
-- **MPL-2.0** license retained from scaffold.
+- Config stays clap/env only (no YAML file yet — keep simple unless asked).
+- `CancellationToken` for all background loops; final persist always attempted when DB open.
+- Docker image binds `0.0.0.0:8080`, data volume `/data`, JSON logs on by default in container.
 
 ## Open questions
 
-- Whether to publish a signed oracle feed (Nostr event) next vs price-history charts.
-- How aggressive to be on “Fastest” (name heuristics vs measured latency).
-- Public demo host / deploy story (none yet).
+- Multi-sample price history / model-compare / signed oracle — still product choices.
+- Whether to add a config file format later.
 
 ## Next step
 
-After push: pick one of (1) multi-sample price history in SQLite + sparkline/delta window, (2) model-compare view across sources, or (3) signed Best Now oracle export — confirm with user.
+Commit + signed push of this hardening batch; then product features if user wants (history charts, compare view, etc.).
 
 ## Anchors
 
-- Branch: `main`
-- Run: `cargo run -- serve` → `http://127.0.0.1:8080/`
-- Key modules: `src/main.rs`, `src/web/handlers.rs`, `src/market.rs`, `src/nostr/mod.rs`, `src/persist.rs`
-- Export: `/export.csv?preset=frontier&ratio=3`
-- Specs: https://github.com/Routstr/protocol (RIP-02, RIP-05)
+- `src/config.rs`, `src/main.rs` (signals)
+- `Dockerfile`, `docker-compose.yml`, `docs/DEPLOY.md`
+- `cargo test` — 12 tests

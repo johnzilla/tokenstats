@@ -7,11 +7,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::store::{ProviderNode, Quote, Store};
-
-const SAVE_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -252,18 +251,38 @@ fn parse_ts(s: &str) -> DateTime<Utc> {
 }
 
 /// Periodic background snapshot of the in-memory store.
-pub async fn run_persist_loop(store: Arc<Store>, db: Arc<Db>) {
-    info!(path = %db.path().display(), "persist loop started");
-    let mut interval = tokio::time::interval(SAVE_INTERVAL);
+pub async fn run_persist_loop(
+    store: Arc<Store>,
+    db: Arc<Db>,
+    interval: Duration,
+    cancel: CancellationToken,
+) {
+    info!(
+        path = %db.path().display(),
+        interval_secs = interval.as_secs(),
+        "persist loop started"
+    );
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Skip immediate first tick; main already restored from DB.
+    ticker.tick().await;
+
     loop {
-        interval.tick().await;
-        let store = Arc::clone(&store);
-        let db = Arc::clone(&db);
-        let res = tokio::task::spawn_blocking(move || db.save_from(&store)).await;
-        match res {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!(error = %e, "sqlite save failed"),
-            Err(e) => warn!(error = %e, "sqlite save task join failed"),
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                info!("persist loop received shutdown");
+                break;
+            }
+            _ = ticker.tick() => {
+                let store = Arc::clone(&store);
+                let db = Arc::clone(&db);
+                let res = tokio::task::spawn_blocking(move || db.save_from(&store)).await;
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!(error = %e, "sqlite save failed"),
+                    Err(e) => warn!(error = %e, "sqlite save task join failed"),
+                }
+            }
         }
     }
 }

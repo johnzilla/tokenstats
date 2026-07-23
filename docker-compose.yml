@@ -1,0 +1,45 @@
+# tokenstats on a DigitalOcean Droplet (or any Docker host).
+#
+#   docker compose up -d --build
+#   open http://<droplet-ip>:8080/
+#
+# Optional: put secrets/overrides in a `.env` next to this file.
+
+services:
+  tokenstats:
+    build: .
+    image: tokenstats:local
+    container_name: tokenstats
+    restart: unless-stopped
+    ports:
+      - "${TOKENSTATS_PUBLISH_PORT:-8080}:8080"
+    environment:
+      TOKENSTATS_BIND: "0.0.0.0:8080"
+      TOKENSTATS_DB: "/data/tokenstats.db"
+      TOKENSTATS_LOG_JSON: "true"
+      # Comma-separated Nostr relays (optional override)
+      # TOKENSTATS_RELAYS: "wss://relay.damus.io,wss://nos.lol"
+      # Seed Routstr nodes (optional)
+      # TOKENSTATS_NODES: "https://your-node.example.com"
+      # Intervals (seconds)
+      TOKENSTATS_POLL_INTERVAL_SECS: "${TOKENSTATS_POLL_INTERVAL_SECS:-60}"
+      TOKENSTATS_BTC_INTERVAL_SECS: "${TOKENSTATS_BTC_INTERVAL_SECS:-60}"
+      TOKENSTATS_PERSIST_INTERVAL_SECS: "${TOKENSTATS_PERSIST_INTERVAL_SECS:-30}"
+      # Disable pieces if desired: set to "true"
+      # TOKENSTATS_NO_NOSTR: "true"
+      # TOKENSTATS_NO_OPENROUTER: "true"
+      RUST_LOG: "${RUST_LOG:-info,tokenstats=info,tower_http=info}"
+    volumes:
+      - tokenstats-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s
+    # Uncomment if you put a reverse proxy on the same host:
+    # networks:
+    #   - web
+
+volumes:
+  tokenstats-data:

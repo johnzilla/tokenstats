@@ -105,10 +105,35 @@ Specs: [Routstr/protocol](https://github.com/Routstr/protocol)
 - No API keys required for the public OpenRouter models list or Coinbase spot price
 - Routstr node inference still needs Cashu/API keys if you *call* endpoints — tokenstats only observes catalogs
 
+## Configuration highlights
+
+| Concern | Flag / env | Default |
+|---------|------------|---------|
+| Bind | `--bind` / `TOKENSTATS_BIND` | `127.0.0.1:8080` |
+| SQLite | `--db` / `TOKENSTATS_DB` | `data/tokenstats.db` |
+| Poll interval | `--poll-interval-secs` | `60` |
+| BTC interval | `--btc-interval-secs` | `60` |
+| Persist interval | `--persist-interval-secs` | `30` |
+| Disable Nostr | `--no-nostr` | off |
+| Disable OpenRouter | `--no-openrouter` | off |
+| JSON logs | `--log-json` / `TOKENSTATS_LOG_JSON` | off |
+
+See [docs/USAGE.md](./docs/USAGE.md) for the full list. `SIGINT` / `SIGTERM` trigger graceful shutdown (HTTP drain + final DB snapshot).
+
+## Docker (DigitalOcean Droplet)
+
+```bash
+docker compose up -d --build
+# http://<host>:8080/
+```
+
+Details: [docs/DEPLOY.md](./docs/DEPLOY.md).
+
 ## Development
 
 ```bash
 cargo check
+cargo test
 cargo run -- serve --no-nostr -v
 cargo build --release
 ```
@@ -117,6 +142,7 @@ cargo build --release
 
 - [AGENTS.md](./AGENTS.md) — conventions for coding agents
 - [docs/USAGE.md](./docs/USAGE.md) — CLI flags, env vars, API, dashboard tips
+- [docs/DEPLOY.md](./docs/DEPLOY.md) — Docker / Droplet deployment
 - [CHECKPOINT.md](./CHECKPOINT.md) — current session snapshot (work in progress)
 
 ## License

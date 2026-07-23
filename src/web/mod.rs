@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use axum::routing::get;
 use axum::Router;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 
 use crate::store::Store;
 
@@ -16,6 +17,11 @@ pub struct AppState {
 }
 
 pub fn router(state: AppState) -> Router {
+    let trace = TraceLayer::new_for_http()
+        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+        .on_response(DefaultOnResponse::new().level(Level::INFO))
+        .on_failure(DefaultOnFailure::new().level(Level::WARN));
+
     Router::new()
         .route("/", get(handlers::dashboard))
         .route("/export.csv", get(handlers::export_csv))
@@ -23,6 +29,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/nodes", get(handlers::api_nodes))
         .route("/api/summary", get(handlers::api_summary))
         .route("/health", get(handlers::health))
-        .layer(TraceLayer::new_for_http())
+        .layer(trace)
         .with_state(state)
 }

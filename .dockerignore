@@ -1,0 +1,7 @@
+target
+data
+.git
+**/*.db
+**/*.db-*
+**/.DS_Store
+CHECKPOINT.md

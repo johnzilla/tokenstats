@@ -140,3 +140,37 @@ impl CatalogModel {
             .or_else(|| self.completion_per_token.map(per_token_to_mtok))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_openrouter_style_data_array() {
+        let body = json!({
+            "data": [{
+                "id": "acme/model",
+                "name": "Acme",
+                "pricing": { "prompt": "0.000001", "completion": "0.000002" },
+                "context_length": 8192
+            }]
+        });
+        let models = parse_models_payload(&body);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "acme/model");
+        assert!((models[0].price_in_per_mtok().unwrap() - 1.0).abs() < 1e-9);
+        assert!((models[0].price_out_per_mtok().unwrap() - 2.0).abs() < 1e-9);
+        assert_eq!(models[0].context_length, Some(8192));
+    }
+
+    #[test]
+    fn parse_models_key_and_bare_array() {
+        let body = json!({ "models": [{ "id": "x", "pricing": { "prompt": "0", "completion": "0" } }] });
+        assert_eq!(parse_models_payload(&body).len(), 1);
+        let bare = json!([{ "id": "y", "input_cost": 5.0, "output_cost": 15.0 }]);
+        let m = parse_models_payload(&bare);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].price_in_per_mtok(), Some(5.0));
+    }
+}

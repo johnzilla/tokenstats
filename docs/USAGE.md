@@ -20,7 +20,29 @@ Binary after release build: `./target/release/tokenstats serve`.
 | `TOKENSTATS_RELAYS` | `--relay` | damus, nos.lol, nostr.band |
 | `TOKENSTATS_NODES` | `--node` | (none) |
 | `TOKENSTATS_DB` | `--db` | `data/tokenstats.db` |
-| `RUST_LOG` / default filter | `-v` | `info` (`debug` with `-v`) |
+| `TOKENSTATS_NO_NOSTR` | `--no-nostr` | false |
+| `TOKENSTATS_NO_POLL` | `--no-poll` | false |
+| `TOKENSTATS_NO_OPENROUTER` | `--no-openrouter` | false |
+| `TOKENSTATS_NO_ORACLE` | `--no-oracle` | false |
+| `TOKENSTATS_NO_PERSIST` | `--no-persist` | false |
+| `TOKENSTATS_POLL_INTERVAL_SECS` | `--poll-interval-secs` | `60` |
+| `TOKENSTATS_BTC_INTERVAL_SECS` | `--btc-interval-secs` | `60` |
+| `TOKENSTATS_NORMALIZE_INTERVAL_SECS` | `--normalize-interval-secs` | `15` |
+| `TOKENSTATS_PERSIST_INTERVAL_SECS` | `--persist-interval-secs` | `30` |
+| `TOKENSTATS_HTTP_TIMEOUT_SECS` | `--http-timeout-secs` | `20` |
+| `TOKENSTATS_OPENROUTER_URL` | `--openrouter-url` | OpenRouter models URL |
+| `TOKENSTATS_BTC_USD_URL` | `--btc-usd-url` | Coinbase spot URL |
+| `TOKENSTATS_LOG_JSON` | `--log-json` | false |
+| `RUST_LOG` | (overrides `-v`) | derived from `-v` |
+
+## Shutdown
+
+`Ctrl-C` (SIGINT) or `SIGTERM` (Docker stop / systemd):
+
+1. Cancel background tasks (Nostr, poller, oracle, persist)
+2. Drain HTTP (`axum` graceful shutdown)
+3. Write a **final SQLite snapshot** when persistence is enabled
+4. Exit 0 on clean stop
 
 ## Common workflows
 

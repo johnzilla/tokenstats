@@ -343,3 +343,83 @@ fn sats_to_usd(sats: f64, btc_usd: f64) -> f64 {
 pub fn normalize_endpoint(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(model: &str, out: f64) -> Quote {
+        Quote {
+            source: "t".into(),
+            provider: "p".into(),
+            provider_id: "p".into(),
+            model: model.into(),
+            price_in_usd: Some(1.0),
+            price_out_usd: Some(out),
+            price_in_sats: None,
+            price_out_sats: None,
+            prev_price_out_usd: None,
+            prev_price_in_usd: None,
+            endpoint: None,
+            region: None,
+            context_length: None,
+            observed_at: Utc::now(),
+            raw_kind: None,
+        }
+    }
+
+    #[test]
+    fn upsert_tracks_previous_price() {
+        let store = Store::new();
+        store.upsert_quotes([sample("m", 2.0)]);
+        store.upsert_quotes([sample("m", 4.0)]);
+        let q = store.list_quotes().into_iter().next().unwrap();
+        assert_eq!(q.price_out_usd, Some(4.0));
+        assert_eq!(q.prev_price_out_usd, Some(2.0));
+    }
+
+    #[test]
+    fn sats_normalization_does_not_reset_delta() {
+        let store = Store::new();
+        store.upsert_quotes([sample("m", 2.0)]);
+        store.upsert_quotes([sample("m", 4.0)]);
+        store.set_btc_usd(50_000.0);
+        store.apply_sats_normalization(50_000.0);
+        let q = store.list_quotes().into_iter().next().unwrap();
+        assert_eq!(q.prev_price_out_usd, Some(2.0));
+        assert!(q.price_out_sats.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn normalize_endpoint_strips_slash() {
+        assert_eq!(normalize_endpoint("https://x.com/v1/"), "https://x.com/v1");
+    }
+
+    #[test]
+    fn poll_reliability_window() {
+        let store = Store::new();
+        store.upsert_node(ProviderNode {
+            provider_id: "n1".into(),
+            name: "n1".into(),
+            endpoint: "https://node.example".into(),
+            onion: None,
+            mint: None,
+            version: None,
+            region: None,
+            pubkey: None,
+            discovered_via: "test".into(),
+            last_seen: Utc::now(),
+            reliability: 0.0,
+            poll_ok: 0,
+            poll_total: 0,
+            last_latency_ms: None,
+        });
+        store.record_poll("https://node.example", true, Some(12));
+        store.record_poll("https://node.example", false, None);
+        store.record_poll("https://node.example", true, Some(20));
+        let n = store.list_nodes().into_iter().next().unwrap();
+        assert_eq!(n.poll_total, 3);
+        assert_eq!(n.poll_ok, 2);
+        assert!((n.reliability - (2.0 / 3.0)).abs() < 1e-9);
+    }
+}
