@@ -585,6 +585,12 @@ pub async fn dashboard(
     a {{ color: var(--accent); }}
     .links a {{ margin-right: 0.75rem; }}
   </style>
+  <!-- Privacy-friendly analytics by Plausible -->
+  <script async src="https://plausible.io/js/pa-04Cyl_CguuqqiZxs7vLO7.js"></script>
+  <script>
+    window.plausible=window.plausible||function(){{(plausible.q=plausible.q||[]).push(arguments)}},plausible.init=plausible.init||function(i){{plausible.o=i||{{}}}};
+    plausible.init()
+  </script>
 </head>
 <body>
   <header>
