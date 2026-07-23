@@ -11,6 +11,12 @@ FROM rust:1.86-bookworm AS builder
 
 WORKDIR /app
 
+# Low-memory builds (1GB Droplets): one rustc job, no fat LTO peaks
+ENV CARGO_BUILD_JOBS=1 \
+    CARGO_PROFILE_RELEASE_LTO=false \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+    CARGO_INCREMENTAL=0
+
 # Cache dependency compilation (rebuilds only when Cargo.* change)
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src \

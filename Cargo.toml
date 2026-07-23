@@ -47,6 +47,7 @@ thiserror = "2.0"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 [profile.release]
-lto = true
-codegen-units = 1
+# thin LTO + modest CGUs: good speed without OOM on 1–2GB build hosts
+lto = "thin"
+codegen-units = 8
 strip = true

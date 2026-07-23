@@ -77,10 +77,29 @@ echo "Droplet IP: $DROPLET_IP"
 
 | Size | Monthly (approx) | When |
 |------|------------------|------|
-| `s-1vcpu-1gb` | ~$6 | Fine for MVP / light traffic |
-| `s-1vcpu-2gb` | ~$12 | Safer if Rust builds on-box feel tight |
+| `s-1vcpu-1gb` | ~$6 | Runtime is fine; **first Docker build may OOM** |
+| `s-1vcpu-2gb` | ~$12 | Safer for on-box `cargo build --release` |
 
-First `docker compose build` compiles Rust and can use ~1–2 GB RAM; if OOM, use 2 GB or build elsewhere and `docker load`.
+The Dockerfile already uses low-memory cargo settings (`CARGO_BUILD_JOBS=1`, LTO off). If the build still dies with `signal: 9, SIGKILL`, add swap **or** resize:
+
+```bash
+# Temporary 2G swap (survives until reboot unless you make fstab permanent)
+fallocate -l 2G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
+free -h
+
+cd /opt/tokenstats && docker compose --profile proxy up -d --build
+```
+
+Or resize with doctl:
+
+```bash
+doctl compute droplet-action power-off tokenstats --wait
+doctl compute droplet-action resize tokenstats --size s-1vcpu-2gb --resize-disk=false --wait
+doctl compute droplet-action power-on tokenstats --wait
+```
 
 ### Option B — Ubuntu 24.04 + install Docker yourself
 
