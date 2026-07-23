@@ -2,7 +2,7 @@
 name = "tokenstats"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.86"
 description = "Sovereign inference market observability + oracle (Routstr + providers)"
 license = "MPL-2.0"
 readme = "README.md"
