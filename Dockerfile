@@ -37,10 +37,10 @@ LABEL org.opencontainers.image.title="tokenstats" \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system --gid 10001 tokenstats \
-    && useradd --system --uid 10001 --gid tokenstats --home-dir /app --shell /usr/sbin/nologin tokenstats \
+    && groupadd --gid 10001 tokenstats \
+    && useradd --uid 10001 --gid tokenstats --home-dir /app --create-home --shell /usr/sbin/nologin tokenstats \
     && mkdir -p /data \
-    && chown tokenstats:tokenstats /data /app
+    && chown -R tokenstats:tokenstats /app /data
 
 COPY --from=builder --chown=tokenstats:tokenstats /app/target/release/tokenstats /usr/local/bin/tokenstats
 
