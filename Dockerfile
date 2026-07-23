@@ -1,32 +1,51 @@
 # syntax=docker/dockerfile:1
-# Multi-stage build for tokenstats — DigitalOcean Droplet / any Linux host.
+# Multi-stage production image for tokenstats (DigitalOcean Droplet / any Linux host).
+#
+# Build:  docker build -t tokenstats:local .
+# Run:    docker run --rm -p 8080:8080 -v tsdata:/data tokenstats:local
 
+# ---------------------------------------------------------------------------
+# Builder
+# ---------------------------------------------------------------------------
 FROM rust:1.85-bookworm AS builder
+
 WORKDIR /app
 
-# Cache dependency builds
+# Cache dependency compilation (rebuilds only when Cargo.* change)
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs \
+RUN mkdir src \
+    && echo 'fn main() { println!("cache"); }' > src/main.rs \
     && cargo build --release \
-    && rm -rf src
+    && rm -rf src target/release/deps/tokenstats* target/release/tokenstats*
 
+# Real sources
 COPY src ./src
-# Touch so cargo rebuilds the binary after real sources land
 RUN touch src/main.rs \
     && cargo build --release \
-    && strip target/release/tokenstats
+    && strip /app/target/release/tokenstats
 
+# ---------------------------------------------------------------------------
+# Runtime (minimal, non-root)
+# ---------------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
+
+LABEL org.opencontainers.image.title="tokenstats" \
+      org.opencontainers.image.description="Sovereign inference market observability" \
+      org.opencontainers.image.source="https://github.com/johnzilla/tokenstats" \
+      org.opencontainers.image.licenses="MPL-2.0"
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --create-home --uid 10001 tokenstats
+    && groupadd --system --gid 10001 tokenstats \
+    && useradd --system --uid 10001 --gid tokenstats --home-dir /app --shell /usr/sbin/nologin tokenstats \
+    && mkdir -p /data \
+    && chown tokenstats:tokenstats /data /app
 
-WORKDIR /app
-COPY --from=builder /app/target/release/tokenstats /usr/local/bin/tokenstats
+COPY --from=builder --chown=tokenstats:tokenstats /app/target/release/tokenstats /usr/local/bin/tokenstats
 
-RUN mkdir -p /data && chown tokenstats:tokenstats /data
 USER tokenstats
+WORKDIR /app
 
 ENV TOKENSTATS_BIND=0.0.0.0:8080 \
     TOKENSTATS_DB=/data/tokenstats.db \
@@ -36,7 +55,10 @@ ENV TOKENSTATS_BIND=0.0.0.0:8080 \
 EXPOSE 8080
 VOLUME ["/data"]
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+# Graceful shutdown: tokenstats handles SIGTERM (final SQLite snapshot)
+STOPSIGNAL SIGTERM
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=25s --retries=3 \
   CMD curl -fsS "http://127.0.0.1:8080/health" >/dev/null || exit 1
 
 ENTRYPOINT ["tokenstats"]

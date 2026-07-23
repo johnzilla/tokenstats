@@ -1,9 +1,13 @@
-# tokenstats on a DigitalOcean Droplet (or any Docker host).
+# tokenstats production stack (app + optional Caddy TLS).
 #
+# App only (HTTP on :8080):
 #   docker compose up -d --build
-#   open http://<droplet-ip>:8080/
 #
-# Optional: put secrets/overrides in a `.env` next to this file.
+# With Caddy (HTTPS on :80/:443 — recommended on a Droplet):
+#   # set DOMAIN in .env (see deploy/env.example)
+#   docker compose --profile proxy up -d --build
+#
+# Logs:  docker compose logs -f tokenstats
 
 services:
   tokenstats:
@@ -11,35 +15,71 @@ services:
     image: tokenstats:local
     container_name: tokenstats
     restart: unless-stopped
-    ports:
-      - "${TOKENSTATS_PUBLISH_PORT:-8080}:8080"
+    # Allow time for final SQLite snapshot on stop/restart
+    stop_grace_period: 20s
     environment:
       TOKENSTATS_BIND: "0.0.0.0:8080"
       TOKENSTATS_DB: "/data/tokenstats.db"
       TOKENSTATS_LOG_JSON: "true"
-      # Comma-separated Nostr relays (optional override)
-      # TOKENSTATS_RELAYS: "wss://relay.damus.io,wss://nos.lol"
-      # Seed Routstr nodes (optional)
-      # TOKENSTATS_NODES: "https://your-node.example.com"
-      # Intervals (seconds)
       TOKENSTATS_POLL_INTERVAL_SECS: "${TOKENSTATS_POLL_INTERVAL_SECS:-60}"
       TOKENSTATS_BTC_INTERVAL_SECS: "${TOKENSTATS_BTC_INTERVAL_SECS:-60}"
       TOKENSTATS_PERSIST_INTERVAL_SECS: "${TOKENSTATS_PERSIST_INTERVAL_SECS:-30}"
-      # Disable pieces if desired: set to "true"
+      # Optional overrides:
+      # TOKENSTATS_RELAYS: "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band"
+      # TOKENSTATS_NODES: "https://your-node.example.com"
       # TOKENSTATS_NO_NOSTR: "true"
-      # TOKENSTATS_NO_OPENROUTER: "true"
       RUST_LOG: "${RUST_LOG:-info,tokenstats=info,tower_http=info}"
     volumes:
       - tokenstats-data:/data
+    # Without the proxy profile, publish HTTP for smoke tests / IP access.
+    # With --profile proxy, only Caddy is public; tokenstats stays on the internal network.
+    ports:
+      - "${TOKENSTATS_PUBLISH_PORT:-8080}:8080"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 25s
-    # Uncomment if you put a reverse proxy on the same host:
-    # networks:
-    #   - web
+    networks:
+      - tokenstats
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  # TLS reverse proxy — enable with: docker compose --profile proxy up -d
+  caddy:
+    profiles: ["proxy"]
+    image: caddy:2.9-alpine
+    container_name: tokenstats-caddy
+    restart: unless-stopped
+    depends_on:
+      tokenstats:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      # Comma-separated hostnames OK: tokenstats.ai, www.tokenstats.ai, tokenta.pe
+      DOMAIN: "${DOMAIN:-tokenstats.ai}"
+      ACME_EMAIL: "${ACME_EMAIL:-admin@tokenstats.ai}"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - tokenstats
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   tokenstats-data:
+  caddy-data:
+  caddy-config:
+
+networks:
+  tokenstats:
+    driver: bridge

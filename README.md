@@ -123,11 +123,15 @@ See [docs/USAGE.md](./docs/USAGE.md) for the full list. `SIGINT` / `SIGTERM` tri
 ## Docker (DigitalOcean Droplet)
 
 ```bash
+# Local / IP smoke test
 docker compose up -d --build
 # http://<host>:8080/
+
+# Production with Caddy HTTPS (set DOMAIN in .env — see deploy/env.example)
+docker compose --profile proxy up -d --build
 ```
 
-Details: [docs/DEPLOY.md](./docs/DEPLOY.md).
+Full **doctl + DNS + Caddy/Nginx** guide: [docs/DEPLOY.md](./docs/DEPLOY.md).
 
 ## Development
 

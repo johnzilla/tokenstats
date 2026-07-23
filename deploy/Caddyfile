@@ -1,0 +1,34 @@
+# Caddy reverse proxy for tokenstats (docker compose --profile proxy)
+#
+# In .env next to docker-compose.yml:
+#   DOMAIN=tokenstats.ai
+#   # Or dual hosts as a comma-separated list:
+#   # DOMAIN=tokenstats.ai, www.tokenstats.ai, tokenta.pe
+#   ACME_EMAIL=you@example.com
+#
+# DNS A/AAAA records for every hostname in DOMAIN must point at the Droplet.
+
+{
+	email {$ACME_EMAIL:admin@tokenstats.ai}
+}
+
+{$DOMAIN:tokenstats.ai} {
+	encode gzip zstd
+
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		X-Frame-Options SAMEORIGIN
+		-Server
+	}
+
+	reverse_proxy tokenstats:8080 {
+		health_uri /health
+		health_interval 30s
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}
