@@ -4,9 +4,10 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use tracing::debug;
 
+use crate::pricing::CatalogHint;
 use crate::store::{ProviderNode, Quote};
 
-use super::catalog::parse_models_payload;
+use super::catalog::parse_models_payload_with_hint;
 
 pub async fn fetch_node_quotes(
     client: &reqwest::Client,
@@ -29,23 +30,24 @@ pub async fn fetch_node_quotes(
         match try_fetch(client, url).await {
             Ok(body) => {
                 let latency_ms = started.elapsed().as_millis() as u64;
-                let models = parse_models_payload(&body);
+                let models = parse_models_payload_with_hint(&body, CatalogHint::Routstr);
                 debug!(%url, n = models.len(), latency_ms, "Routstr models response");
                 let now = Utc::now();
                 let quotes = models
                     .into_iter()
                     .map(|m| {
-                        let pin = m.price_in_per_mtok();
-                        let pout = m.price_out_per_mtok();
+                        let prices = m.prices;
                         Quote {
                             source: "routstr".into(),
                             provider: node.name.clone(),
                             provider_id: node.provider_id.clone(),
                             model: m.id,
-                            price_in_usd: pin,
-                            price_out_usd: pout,
-                            price_in_sats: None,
-                            price_out_sats: None,
+                            // Dual-unit: USD from `pricing`, sats from `sats_pricing` when present.
+                            // Oracle fills any missing side via BTC/USD.
+                            price_in_usd: prices.price_in_usd,
+                            price_out_usd: prices.price_out_usd,
+                            price_in_sats: prices.price_in_sats,
+                            price_out_sats: prices.price_out_sats,
                             prev_price_out_usd: None,
                             prev_price_in_usd: None,
                             endpoint: Some(base.to_string()),

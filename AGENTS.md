@@ -190,7 +190,7 @@ Example element (illustrative):
 
 ### Semantics agents must respect
 
-1. **Units are per 1M tokens**, not per token. Do not treat raw OpenRouter string prices as the API values.
+1. **API units are per 1M tokens** in both USD and sats. Raw catalog rates are often **per token**; tokenstats normalizes before serving.
 2. **`blended_usd` is the preferred sort/score key** for “cheapest workload” unless the consumer has a different in:out mix — pass `ratio` explicitly.
 3. **Invalid / dynamic prices are `null`**, not negative. Catalog sentinels (OpenRouter `"-1"`, negative floats) are sanitized at ingest and on SQLite restore. Do not invent costs for `null` sides.
 4. **Default cheapest sort** ranks only **strictly positive** blends; free (`0`) and missing prices sort last (not first).
@@ -198,6 +198,33 @@ Example element (illustrative):
 6. **Data is latest-wins in memory** (optionally restored from SQLite). There is no historical series on this endpoint yet.
 7. **No auth** on the local/default bind. If exposing publicly, put a reverse proxy / network policy in front; do not assume API keys exist on tokenstats.
 8. **Breaking changes:** prefer additive fields. If renaming/removing fields or changing array-vs-object envelope, update this section, `docs/USAGE.md`, and call out arbstr/agent consumers.
+
+### Unit decision tree (ingest)
+
+Implementation: `src/pricing.rs` (`normalize_catalog_prices`) + `src/providers/catalog.rs`.
+
+```
+catalog model row
+  │
+  ├─ sats_pricing.prompt/completion  (Routstr dual field)
+  │     sanitize → if v < 1.0: treat as sats/token × 1e6
+  │                else:       already sats/1M
+  │     → price_in_sats / price_out_sats
+  │
+  ├─ pricing.prompt/completion  (OpenRouter-shaped USD)
+  │     sanitize → if v < 0.01: treat as USD/token × 1e6
+  │                else:        already USD/1M
+  │     → price_in_usd / price_out_usd
+  │
+  ├─ else input_cost / output_cost (admin shapes)
+  │     same USD heuristic as pricing
+  │
+  └─ missing side left null; oracle fills via BTC/USD on normalize tick
+```
+
+- OpenRouter usually has **USD only** (`primary = Usd`).
+- Routstr nodes that mirror OpenRouter often publish **both** (`primary = Both`).
+- Sats-only nodes work without USD until the oracle has a BTC rate.
 
 ### Suggested consumer pattern (arbstr)
 

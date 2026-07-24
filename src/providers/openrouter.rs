@@ -3,9 +3,10 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 
+use crate::pricing::CatalogHint;
 use crate::store::Quote;
 
-use super::catalog::parse_models_payload;
+use super::catalog::parse_models_payload_with_hint;
 
 pub async fn fetch_quotes(client: &reqwest::Client, url: &str) -> Result<Vec<Quote>> {
     let resp = client
@@ -19,23 +20,22 @@ pub async fn fetch_quotes(client: &reqwest::Client, url: &str) -> Result<Vec<Quo
         .await
         .context("OpenRouter JSON")?;
 
-    let models = parse_models_payload(&resp);
+    let models = parse_models_payload_with_hint(&resp, CatalogHint::OpenRouter);
     let now = Utc::now();
 
     let quotes = models
         .into_iter()
         .map(|m| {
-            let pin = m.price_in_per_mtok();
-            let pout = m.price_out_per_mtok();
+            let prices = m.prices;
             Quote {
                 source: "openrouter".into(),
                 provider: "OpenRouter".into(),
                 provider_id: "openrouter".into(),
                 model: m.id,
-                price_in_usd: pin,
-                price_out_usd: pout,
-                price_in_sats: None,
-                price_out_sats: None,
+                price_in_usd: prices.price_in_usd,
+                price_out_usd: prices.price_out_usd,
+                price_in_sats: prices.price_in_sats,
+                price_out_sats: prices.price_out_sats,
                 prev_price_out_usd: None,
                 prev_price_in_usd: None,
                 endpoint: Some("https://openrouter.ai/api/v1".into()),
