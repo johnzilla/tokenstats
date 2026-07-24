@@ -192,10 +192,12 @@ Example element (illustrative):
 
 1. **Units are per 1M tokens**, not per token. Do not treat raw OpenRouter string prices as the API values.
 2. **`blended_usd` is the preferred sort/score key** for “cheapest workload” unless the consumer has a different in:out mix — pass `ratio` explicitly.
-3. **`delta_*` may be null** until a second catalog poll changes a price; do not treat null as “flat”.
-4. **Data is latest-wins in memory** (optionally restored from SQLite). There is no historical series on this endpoint yet.
-5. **No auth** on the local/default bind. If exposing publicly, put a reverse proxy / network policy in front; do not assume API keys exist on tokenstats.
-6. **Breaking changes:** prefer additive fields. If renaming/removing fields or changing array-vs-object envelope, update this section, `docs/USAGE.md`, and call out arbstr/agent consumers.
+3. **Invalid / dynamic prices are `null`**, not negative. Catalog sentinels (OpenRouter `"-1"`, negative floats) are sanitized at ingest and on SQLite restore. Do not invent costs for `null` sides.
+4. **Default cheapest sort** ranks only **strictly positive** blends; free (`0`) and missing prices sort last (not first).
+5. **`delta_*` may be null** until a second catalog poll changes a price; do not treat null as “flat”.
+6. **Data is latest-wins in memory** (optionally restored from SQLite). There is no historical series on this endpoint yet.
+7. **No auth** on the local/default bind. If exposing publicly, put a reverse proxy / network policy in front; do not assume API keys exist on tokenstats.
+8. **Breaking changes:** prefer additive fields. If renaming/removing fields or changing array-vs-object envelope, update this section, `docs/USAGE.md`, and call out arbstr/agent consumers.
 
 ### Suggested consumer pattern (arbstr)
 

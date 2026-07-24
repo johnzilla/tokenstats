@@ -3,6 +3,8 @@
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::pricing::sanitize_price;
+
 /// One model entry after loose JSON parsing.
 #[derive(Debug, Clone)]
 pub struct CatalogModel {
@@ -87,19 +89,24 @@ fn parse_one(v: &Value) -> Option<CatalogModel> {
     if let Some(c) = row.input_cost {
         if prompt_per_token.is_none() && prompt_per_mtok.is_none() {
             // Heuristic: values > 1 are likely USD/1M; tiny values are per-token.
-            if c > 1.0 {
-                prompt_per_mtok = Some(c);
-            } else {
-                prompt_per_token = Some(c);
+            // Negatives/sentinels are dropped by sanitize_price.
+            if let Some(c) = sanitize_price(c) {
+                if c > 1.0 {
+                    prompt_per_mtok = Some(c);
+                } else {
+                    prompt_per_token = Some(c);
+                }
             }
         }
     }
     if let Some(c) = row.output_cost {
         if completion_per_token.is_none() && completion_per_mtok.is_none() {
-            if c > 1.0 {
-                completion_per_mtok = Some(c);
-            } else {
-                completion_per_token = Some(c);
+            if let Some(c) = sanitize_price(c) {
+                if c > 1.0 {
+                    completion_per_mtok = Some(c);
+                } else {
+                    completion_per_token = Some(c);
+                }
             }
         }
     }
@@ -116,11 +123,13 @@ fn parse_one(v: &Value) -> Option<CatalogModel> {
 }
 
 fn num_from_value(v: Option<&Value>) -> Option<f64> {
-    match v? {
-        Value::String(s) => s.parse().ok(),
-        Value::Number(n) => n.as_f64(),
-        _ => None,
-    }
+    let n = match v? {
+        Value::String(s) => s.parse().ok()?,
+        Value::Number(n) => n.as_f64()?,
+        _ => return None,
+    };
+    // Drop OpenRouter-style dynamic sentinels (-1) and other invalids early.
+    sanitize_price(n)
 }
 
 /// Convert per-token price → per-1M tokens.
@@ -130,14 +139,27 @@ pub fn per_token_to_mtok(per_token: f64) -> f64 {
 
 impl CatalogModel {
     /// Best-effort USD (or native unit) per 1M tokens.
+    /// Invalid / dynamic sentinels are returned as `None`.
     pub fn price_in_per_mtok(&self) -> Option<f64> {
         self.prompt_per_mtok
-            .or_else(|| self.prompt_per_token.map(per_token_to_mtok))
+            .and_then(sanitize_price)
+            .or_else(|| {
+                self.prompt_per_token
+                    .and_then(sanitize_price)
+                    .map(per_token_to_mtok)
+                    .and_then(sanitize_price)
+            })
     }
 
     pub fn price_out_per_mtok(&self) -> Option<f64> {
         self.completion_per_mtok
-            .or_else(|| self.completion_per_token.map(per_token_to_mtok))
+            .and_then(sanitize_price)
+            .or_else(|| {
+                self.completion_per_token
+                    .and_then(sanitize_price)
+                    .map(per_token_to_mtok)
+                    .and_then(sanitize_price)
+            })
     }
 }
 
@@ -172,5 +194,61 @@ mod tests {
         let m = parse_models_payload(&bare);
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].price_in_per_mtok(), Some(5.0));
+    }
+
+    #[test]
+    fn openrouter_dynamic_sentinel_becomes_none() {
+        // OpenRouter uses "-1" for variable-price routers (auto, etc.)
+        let body = json!({
+            "data": [{
+                "id": "openrouter/auto",
+                "pricing": { "prompt": "-1", "completion": "-1" }
+            }]
+        });
+        let m = parse_models_payload(&body);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].price_in_per_mtok(), None);
+        assert_eq!(m[0].price_out_per_mtok(), None);
+        assert_eq!(m[0].prompt_per_token, None);
+        assert_eq!(m[0].completion_per_token, None);
+    }
+
+    #[test]
+    fn negative_numeric_pricing_dropped() {
+        let body = json!({
+            "data": [{
+                "id": "auto-beta",
+                "pricing": { "prompt": -1.15, "completion": -1.15 }
+            }]
+        });
+        let m = parse_models_payload(&body);
+        assert_eq!(m[0].price_in_per_mtok(), None);
+        assert_eq!(m[0].price_out_per_mtok(), None);
+    }
+
+    #[test]
+    fn free_zero_pricing_kept() {
+        let body = json!({
+            "data": [{
+                "id": "free/model",
+                "pricing": { "prompt": "0", "completion": "0" }
+            }]
+        });
+        let m = parse_models_payload(&body);
+        assert_eq!(m[0].price_in_per_mtok(), Some(0.0));
+        assert_eq!(m[0].price_out_per_mtok(), Some(0.0));
+    }
+
+    #[test]
+    fn mixed_valid_and_sentinel_sides() {
+        let body = json!({
+            "data": [{
+                "id": "half",
+                "pricing": { "prompt": "0.000001", "completion": "-1" }
+            }]
+        });
+        let m = parse_models_payload(&body);
+        assert!((m[0].price_in_per_mtok().unwrap() - 1.0).abs() < 1e-9);
+        assert_eq!(m[0].price_out_per_mtok(), None);
     }
 }

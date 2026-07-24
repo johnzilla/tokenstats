@@ -113,11 +113,11 @@ fn cheapest_blended(quotes: &[Quote]) -> Option<(String, f64)> {
     quotes
         .iter()
         .filter_map(|q| {
-            let b = blended_usd(q.price_in_usd, q.price_out_usd, 3.0)?;
-            if b <= 0.0 {
+            let b = blended_usd(q.price_in_usd, q.price_out_usd, 3.0);
+            if !crate::pricing::is_rankable_blend(b) {
                 return None;
             }
-            Some((q.model.clone(), b))
+            Some((q.model.clone(), b.unwrap()))
         })
         .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
 }

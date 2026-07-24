@@ -5,6 +5,7 @@ mod market;
 mod nostr;
 mod oracle;
 mod persist;
+mod pricing;
 mod providers;
 mod store;
 mod web;

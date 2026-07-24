@@ -6,6 +6,8 @@ use std::sync::RwLock;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
+use crate::pricing::sanitize_opt;
+
 /// How long to keep poll samples for reliability scoring.
 const RELIABILITY_WINDOW: Duration = Duration::hours(1);
 /// Max samples retained per node (1/min * 60 ≈ 60; keep headroom).
@@ -95,22 +97,26 @@ impl Store {
     pub fn upsert_quotes(&self, quotes: impl IntoIterator<Item = Quote>) {
         if let Ok(mut map) = self.quotes.write() {
             for mut q in quotes {
+                // Drop dynamic sentinels / invalids before they can poison sorts or SQLite.
+                q = sanitize_quote(q);
                 let k = Self::quote_key(&q.source, &q.provider_id, &q.model);
                 if let Some(prev) = map.get(&k) {
                     // Preserve previous prices for delta unless caller already set them.
                     if q.prev_price_out_usd.is_none() {
-                        q.prev_price_out_usd = prev.price_out_usd;
+                        q.prev_price_out_usd = sanitize_opt(prev.price_out_usd);
                     }
                     if q.prev_price_in_usd.is_none() {
-                        q.prev_price_in_usd = prev.price_in_usd;
+                        q.prev_price_in_usd = sanitize_opt(prev.price_in_usd);
                     }
                     // If price didn't change, keep the older previous so deltas stay meaningful
                     // across multi-step normalizations (oracle re-upsert).
                     if prices_eq(q.price_out_usd, prev.price_out_usd)
                         && prices_eq(q.price_in_usd, prev.price_in_usd)
                     {
-                        q.prev_price_out_usd = prev.prev_price_out_usd.or(prev.price_out_usd);
-                        q.prev_price_in_usd = prev.prev_price_in_usd.or(prev.price_in_usd);
+                        q.prev_price_out_usd =
+                            sanitize_opt(prev.prev_price_out_usd.or(prev.price_out_usd));
+                        q.prev_price_in_usd =
+                            sanitize_opt(prev.prev_price_in_usd.or(prev.price_in_usd));
                     }
                 }
                 map.insert(k, q);
@@ -127,15 +133,23 @@ impl Store {
             return;
         };
         for q in map.values_mut() {
+            // Re-sanitize in case a legacy SQLite row loaded bad values.
+            *q = sanitize_quote(q.clone());
             if let Some(usd) = q.price_in_usd {
-                q.price_in_sats = Some(usd_to_sats(usd, btc_usd));
-            } else if let Some(sats) = q.price_in_sats {
-                q.price_in_usd = Some(sats_to_usd(sats, btc_usd));
+                q.price_in_sats = sanitize_opt(Some(usd_to_sats(usd, btc_usd)));
+            } else if let Some(sats) = sanitize_opt(q.price_in_sats) {
+                q.price_in_usd = sanitize_opt(Some(sats_to_usd(sats, btc_usd)));
+                q.price_in_sats = Some(sats);
+            } else {
+                q.price_in_sats = None;
             }
             if let Some(usd) = q.price_out_usd {
-                q.price_out_sats = Some(usd_to_sats(usd, btc_usd));
-            } else if let Some(sats) = q.price_out_sats {
-                q.price_out_usd = Some(sats_to_usd(sats, btc_usd));
+                q.price_out_sats = sanitize_opt(Some(usd_to_sats(usd, btc_usd)));
+            } else if let Some(sats) = sanitize_opt(q.price_out_sats) {
+                q.price_out_usd = sanitize_opt(Some(sats_to_usd(sats, btc_usd)));
+                q.price_out_sats = Some(sats);
+            } else {
+                q.price_out_sats = None;
             }
         }
     }
@@ -289,9 +303,11 @@ impl Store {
     }
 
     /// Load quotes bulk (startup restore) — no delta chaining.
+    /// Invalid prices from older snapshots are sanitized on load.
     pub fn load_quotes(&self, quotes: Vec<Quote>) {
         if let Ok(mut map) = self.quotes.write() {
             for q in quotes {
+                let q = sanitize_quote(q);
                 let k = Self::quote_key(&q.source, &q.provider_id, &q.model);
                 map.insert(k, q);
             }
@@ -329,6 +345,17 @@ fn prices_eq(a: Option<f64>, b: Option<f64>) -> bool {
         (None, None) => true,
         _ => false,
     }
+}
+
+/// Zero out invalid / dynamic-sentinel price fields on a quote.
+fn sanitize_quote(mut q: Quote) -> Quote {
+    q.price_in_usd = sanitize_opt(q.price_in_usd);
+    q.price_out_usd = sanitize_opt(q.price_out_usd);
+    q.price_in_sats = sanitize_opt(q.price_in_sats);
+    q.price_out_sats = sanitize_opt(q.price_out_sats);
+    q.prev_price_in_usd = sanitize_opt(q.prev_price_in_usd);
+    q.prev_price_out_usd = sanitize_opt(q.prev_price_out_usd);
+    q
 }
 
 fn usd_to_sats(usd: f64, btc_usd: f64) -> f64 {
@@ -376,6 +403,33 @@ mod tests {
         let q = store.list_quotes().into_iter().next().unwrap();
         assert_eq!(q.price_out_usd, Some(4.0));
         assert_eq!(q.prev_price_out_usd, Some(2.0));
+    }
+
+    #[test]
+    fn upsert_strips_negative_and_sentinel_prices() {
+        let store = Store::new();
+        let mut q = sample("auto", -1.0);
+        q.price_in_usd = Some(-1.0);
+        q.price_out_usd = Some(-1_000_000.0);
+        q.price_in_sats = Some(-1e9);
+        store.upsert_quotes([q]);
+        let got = store.list_quotes().into_iter().next().unwrap();
+        assert_eq!(got.price_in_usd, None);
+        assert_eq!(got.price_out_usd, None);
+        assert_eq!(got.price_in_sats, None);
+        // Model row is still present (observe the model, just no fake cost).
+        assert_eq!(got.model, "auto");
+    }
+
+    #[test]
+    fn load_quotes_sanitizes_legacy_snapshot() {
+        let store = Store::new();
+        let mut q = sample("legacy", -1150000.0);
+        q.price_in_usd = Some(-1150000.0);
+        store.load_quotes(vec![q]);
+        let got = store.list_quotes().into_iter().next().unwrap();
+        assert_eq!(got.price_out_usd, None);
+        assert_eq!(got.price_in_usd, None);
     }
 
     #[test]

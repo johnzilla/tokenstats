@@ -12,6 +12,7 @@ use super::AppState;
 use crate::market::{
     apply_preset, best_now, blended_usd, delta_pct, Preset, DEFAULT_BLEND_RATIO,
 };
+use crate::pricing::blend_sort_key;
 use crate::store::Quote;
 
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -113,9 +114,10 @@ fn resolve_view(all: Vec<Quote>, q: &QuotesQuery) -> Vec<Quote> {
     if let Some(p) = q.preset() {
         filtered = apply_preset(filtered, p);
     } else {
+        // Cheapest-first: free / missing / invalid blends sort last (not as −$1e6).
         filtered.sort_by(|a, b| {
-            let ba = blended_usd(a.price_in_usd, a.price_out_usd, ratio).unwrap_or(f64::MAX);
-            let bb = blended_usd(b.price_in_usd, b.price_out_usd, ratio).unwrap_or(f64::MAX);
+            let ba = blend_sort_key(blended_usd(a.price_in_usd, a.price_out_usd, ratio));
+            let bb = blend_sort_key(blended_usd(b.price_in_usd, b.price_out_usd, ratio));
             ba.partial_cmp(&bb)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.model.cmp(&b.model))

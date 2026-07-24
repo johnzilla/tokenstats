@@ -1,5 +1,6 @@
 //! Market helpers: popular families, blended cost, filter presets.
 
+use crate::pricing::{blend_sort_key, is_rankable_blend, sanitize_opt};
 use crate::store::Quote;
 
 /// Default output:input token ratio for blended cost (1 in : N out → ratio = N).
@@ -112,8 +113,16 @@ impl Preset {
 
 /// Weighted blended USD per 1M tokens for an input:output ratio of 1:r.
 /// `blend = (in + r * out) / (1 + r)`.
+///
+/// Invalid / negative inputs are treated as missing (see [`crate::pricing::sanitize_price`]).
 pub fn blended_usd(price_in: Option<f64>, price_out: Option<f64>, ratio: f64) -> Option<f64> {
-    let r = if ratio <= 0.0 { DEFAULT_BLEND_RATIO } else { ratio };
+    let r = if ratio <= 0.0 {
+        DEFAULT_BLEND_RATIO
+    } else {
+        ratio
+    };
+    let price_in = sanitize_opt(price_in);
+    let price_out = sanitize_opt(price_out);
     match (price_in, price_out) {
         (Some(i), Some(o)) => Some((i + r * o) / (1.0 + r)),
         (Some(i), None) => Some(i),
@@ -144,11 +153,11 @@ pub fn best_now<'a>(quotes: &'a [Quote], ratio: f64) -> Vec<BestNowRow<'a>> {
             .iter()
             .filter(|q| matches_family(&q.model, family))
             .filter_map(|q| {
-                let b = blended_usd(q.price_in_usd, q.price_out_usd, ratio)?;
-                if b <= 0.0 {
+                let b = blended_usd(q.price_in_usd, q.price_out_usd, ratio);
+                if !is_rankable_blend(b) {
                     return None;
                 }
-                Some((q, b))
+                Some((q, b.unwrap()))
             })
             .collect();
 
@@ -196,11 +205,19 @@ pub fn apply_preset(quotes: Vec<Quote>, preset: Preset) -> Vec<Quote> {
                 .filter(|q| q.price_out_usd.map(|p| p > 0.0).unwrap_or(false))
                 .collect();
             v.sort_by(|a, b| {
-                let ba = blended_usd(a.price_in_usd, a.price_out_usd, DEFAULT_BLEND_RATIO)
-                    .unwrap_or(f64::MAX);
-                let bb = blended_usd(b.price_in_usd, b.price_out_usd, DEFAULT_BLEND_RATIO)
-                    .unwrap_or(f64::MAX);
-                ba.partial_cmp(&bb).unwrap_or(std::cmp::Ordering::Equal)
+                let ba = blend_sort_key(blended_usd(
+                    a.price_in_usd,
+                    a.price_out_usd,
+                    DEFAULT_BLEND_RATIO,
+                ));
+                let bb = blend_sort_key(blended_usd(
+                    b.price_in_usd,
+                    b.price_out_usd,
+                    DEFAULT_BLEND_RATIO,
+                ));
+                ba.partial_cmp(&bb)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.model.cmp(&b.model))
             });
             v
         }
@@ -211,11 +228,19 @@ pub fn apply_preset(quotes: Vec<Quote>, preset: Preset) -> Vec<Quote> {
                 .collect();
             // Prefer cheaper flash-class models first among "fast" names.
             v.sort_by(|a, b| {
-                let ba = blended_usd(a.price_in_usd, a.price_out_usd, DEFAULT_BLEND_RATIO)
-                    .unwrap_or(f64::MAX);
-                let bb = blended_usd(b.price_in_usd, b.price_out_usd, DEFAULT_BLEND_RATIO)
-                    .unwrap_or(f64::MAX);
-                ba.partial_cmp(&bb).unwrap_or(std::cmp::Ordering::Equal)
+                let ba = blend_sort_key(blended_usd(
+                    a.price_in_usd,
+                    a.price_out_usd,
+                    DEFAULT_BLEND_RATIO,
+                ));
+                let bb = blend_sort_key(blended_usd(
+                    b.price_in_usd,
+                    b.price_out_usd,
+                    DEFAULT_BLEND_RATIO,
+                ));
+                ba.partial_cmp(&bb)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.model.cmp(&b.model))
             });
             v
         }
@@ -236,11 +261,19 @@ pub fn apply_preset(quotes: Vec<Quote>, preset: Preset) -> Vec<Quote> {
                 let sa = privacy_rank(a);
                 let sb = privacy_rank(b);
                 sa.cmp(&sb).then_with(|| {
-                    let ba = blended_usd(a.price_in_usd, a.price_out_usd, DEFAULT_BLEND_RATIO)
-                        .unwrap_or(f64::MAX);
-                    let bb = blended_usd(b.price_in_usd, b.price_out_usd, DEFAULT_BLEND_RATIO)
-                        .unwrap_or(f64::MAX);
-                    ba.partial_cmp(&bb).unwrap_or(std::cmp::Ordering::Equal)
+                    let ba = blend_sort_key(blended_usd(
+                        a.price_in_usd,
+                        a.price_out_usd,
+                        DEFAULT_BLEND_RATIO,
+                    ));
+                    let bb = blend_sort_key(blended_usd(
+                        b.price_in_usd,
+                        b.price_out_usd,
+                        DEFAULT_BLEND_RATIO,
+                    ));
+                    ba.partial_cmp(&bb)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.model.cmp(&b.model))
                 })
             });
             v
@@ -329,6 +362,39 @@ mod tests {
         let b = blended_usd(Some(1.0), Some(3.0), 3.0).unwrap();
         // (1 + 3*3) / 4 = 2.5
         assert!((b - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn blend_drops_negative_inputs() {
+        // Would have been −$1e6 after bad sentinel scaling; must not rank.
+        assert_eq!(blended_usd(Some(-1.0), Some(-1.0), 3.0), None);
+        assert_eq!(blended_usd(Some(-1e6), Some(3.0), 3.0), Some(3.0)); // only out used
+        assert_eq!(blended_usd(Some(1.0), Some(-1.0), 3.0), Some(1.0)); // only in used
+    }
+
+    #[test]
+    fn best_now_ignores_negative_and_free() {
+        let quotes = vec![
+            q("openai/gpt-4o", -1.0, -1.0),
+            q("openai/gpt-4o-mini", 0.0, 0.0),
+            q("openai/gpt-4o", 1.0, 3.0),
+        ];
+        let best = best_now(&quotes, 3.0);
+        let gpt = best.iter().find(|b| b.family == "GPT-4o").unwrap();
+        assert!((gpt.blended_usd - 2.5).abs() < 1e-9);
+        assert_eq!(gpt.quote.price_out_usd, Some(3.0));
+    }
+
+    #[test]
+    fn cheapest_frontier_sorts_positives_first() {
+        let quotes = vec![
+            q("openrouter/auto", -1e6, -1e6),
+            q("openai/gpt-4o", 5.0, 15.0),
+            q("anthropic/claude-sonnet-4", 1.0, 3.0),
+        ];
+        let sorted = apply_preset(quotes, Preset::CheapestFrontier);
+        // First rankable row should be the cheap sonnet, not the −1e6 auto.
+        assert_eq!(sorted[0].model, "anthropic/claude-sonnet-4");
     }
 
     #[test]
