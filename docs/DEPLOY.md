@@ -39,10 +39,10 @@ Note your SSH key **ID** (or fingerprint) from the list. Examples below use plac
 | Graceful stop | `STOPSIGNAL SIGTERM` + compose `stop_grace_period: 20s` (final SQLite snapshot) |
 | Data dir | Volume `/data` → `TOKENSTATS_DB=/data/tokenstats.db` |
 
-Rebuild after code changes:
+CI builds this image and publishes it to GHCR on every green `main` push, so the Droplet normally pulls it (§6). Build locally only for development or a fork:
 
 ```bash
-docker compose build --no-cache tokenstats   # on the Droplet, in the repo
+docker compose build --no-cache tokenstats
 ```
 
 ---
@@ -77,10 +77,10 @@ echo "Droplet IP: $DROPLET_IP"
 
 | Size | Monthly (approx) | When |
 |------|------------------|------|
-| `s-1vcpu-1gb` | ~$6 | Runtime is fine; **first Docker build may OOM** |
-| `s-1vcpu-2gb` | ~$12 | Safer for on-box `cargo build --release` |
+| `s-1vcpu-1gb` | ~$6 | Fine when pulling the CI-built image (the default) |
+| `s-1vcpu-2gb` | ~$12 | Only if you build on the box (`--build`) |
 
-The Dockerfile already uses low-memory cargo settings (`CARGO_BUILD_JOBS=1`, LTO off). If the build still dies with `signal: 9, SIGKILL`, add swap **or** resize:
+Only relevant when building on the Droplet: the Dockerfile already uses low-memory cargo settings (`CARGO_BUILD_JOBS=1`, LTO off). If the build still dies with `signal: 9, SIGKILL`, add swap **or** resize:
 
 ```bash
 # Temporary 2G swap (survives until reboot unless you make fstab permanent)
@@ -225,8 +225,9 @@ nano .env
 ```bash
 cd /opt/tokenstats
 
-# Build + start app + Caddy
-docker compose --profile proxy up -d --build
+# Pull the CI-built image + start app and Caddy
+docker compose --profile proxy pull
+docker compose --profile proxy up -d
 
 docker compose ps
 docker compose logs -f tokenstats
@@ -304,27 +305,27 @@ certbot --nginx -d tokenstats.ai -d www.tokenstats.ai
 
 ## 6. Updates (redeploy)
 
-There is no CI deploy: the Droplet pulls the public repo and builds the image itself.
+CI builds, smoke-tests and publishes the image for every green push to `main`: `ghcr.io/johnzilla/tokenstats:latest` and `:sha-<short>` (single-arch amd64). The Droplet only **pulls**. CI never touches the server, and you decide when to deploy.
 
 ```bash
 ssh root@"$DROPLET_IP"
 cd /opt/tokenstats
 
 # 1. Note what's running (your rollback point)
-git log --oneline -1
+docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' tokenstats
 
 # 2. Back up the SQLite DB (WAL mode: copy all three files)
 mkdir -p /root/ts-backup
 for f in tokenstats.db tokenstats.db-wal tokenstats.db-shm; do docker cp tokenstats:/data/$f /root/ts-backup/ 2>/dev/null; done
 
-# 3. Make sure swap exists: a Cargo.lock change recompiles every dependency
-free -h
-
-# 4. Pull + rebuild (old container serves until the new one is up)
+# 3. Update compose/Caddy config, pull the image, restart (seconds, little RAM)
 git pull origin main
-docker compose --profile proxy up -d --build
+docker compose --profile proxy pull
+docker compose --profile proxy up -d
 docker compose logs -f tokenstats     # wait for "poll cycle complete", Ctrl-C
 ```
+
+Check the CI run for the commit you're deploying is green first (the image only exists once the `docker` job passed). The run summary names the published tags.
 
 Verify from anywhere:
 
@@ -334,7 +335,11 @@ curl -s https://tokenstats.ai/health | jq '{status, reasons: .feed.reasons, quot
 
 `status` should reach `ok` within a minute or two; `degraded` lists its `reasons`.
 
-**Rollback:** `git checkout <sha from step 1> && docker compose --profile proxy up -d --build`. Schema changes are additive (new columns/tables are created on open and ignored by older builds), so the DB doesn't need restoring. Restore `/root/ts-backup` into the volume only if the data itself is bad.
+**Rollback / pinning:** set `TOKENSTATS_TAG=sha-<short>` in `.env` (the first 7 characters of the revision from step 1), then `docker compose --profile proxy pull && docker compose --profile proxy up -d`. Remove the line to follow `latest` again. Schema changes are additive (new columns/tables are created on open and ignored by older builds), so the DB doesn't need restoring. Restore `/root/ts-backup` into the volume only if the data itself is bad.
+
+**One-time: make the package public.** GHCR packages can start out private even for a public repo. After the first publish, open **github.com/users/johnzilla/packages/container/tokenstats → Package settings → Change visibility → Public**, so the Droplet pulls without logging in. (Alternatively, keep it private and `docker login ghcr.io` on the Droplet with a read-only `read:packages` token.)
+
+**Build on the Droplet instead** (a fork, or CI unavailable): `docker compose --profile proxy up -d --build`. That compiles Rust on the box: make sure swap exists (`free -h`), since a `Cargo.lock` change recompiles every dependency.
 
 **Expect the board to shrink after upgrading from a pre-#1 build** (before Oct 2026): quotes from delisted models and long-dead nodes are dropped on the first cycle (`--quote-ttl-secs`, default 24h). On tokenstats.ai this went from ~11k to ~8k quotes.
 
@@ -400,9 +405,11 @@ App CLI/env details: [USAGE.md](./USAGE.md).
 |---------|--------|
 | ACME / TLS fail | DNS A record, ports 80/443 open, `docker compose logs caddy` |
 | Empty dashboard | `docker compose logs tokenstats` — OpenRouter/outbound HTTPS? |
-| OOM on build | Use `s-1vcpu-2gb` or build on a larger machine and `docker save` / `load` |
+| OOM on build | Don't build on the box: pull the CI image (§6). If you must build, add swap or use `s-1vcpu-2gb` |
+| `pull` → `denied` / `unauthorized` | The GHCR package is still private: make it public (§6) or `docker login ghcr.io` |
+| `pull` → `manifest unknown` for a `sha-` tag | That commit's CI `docker` job didn't publish (failed, or a PR build); pick a green `main` commit |
 | Permission on `/data` | Volume should be owned by uid 10001 inside container (image sets this) |
-| Stale binary | `docker compose build --no-cache tokenstats && docker compose --profile proxy up -d` |
+| Stale binary | `docker compose --profile proxy pull && docker compose --profile proxy up -d`; check the running revision with the `docker inspect` line in §6 |
 | `:8080` reachable from the internet | Docker bypasses UFW: set `TOKENSTATS_PUBLISH_PORT=127.0.0.1:8080` in `.env`, `docker compose --profile proxy up -d`, and add the cloud firewall (§2) |
 | `doctl … firewall create` → 403 | Token lacks firewall write scope; see §2 |
 | `/health` `status` not `ok` | Read `.feed.reasons`; `down` = no catalog fetched recently (outbound HTTPS / DNS?) |
@@ -424,7 +431,7 @@ curl -fsS https://$DOMAIN/api/quotes?limit=1 | jq
 4. DNS A → Droplet IP  
 5. `git clone` → `/opt/tokenstats`  
 6. `.env` with `DOMAIN` (e.g. `tokenstats.ai` or `tokenta.pe`) + `ACME_EMAIL` + `TOKENSTATS_PUBLISH_PORT=127.0.0.1:8080`
-7. `docker compose --profile proxy up -d --build`  
+7. `docker compose --profile proxy pull && docker compose --profile proxy up -d` (make the GHCR package public after the first CI publish)  
 8. `curl https://$DOMAIN/health` (expect `"status":"ok"`) and confirm `http://$DROPLET_IP:8080` is **not** reachable  
 
 That’s it — dashboard live with HTTPS, data on a Docker volume, redeploy with `git pull` + compose build.

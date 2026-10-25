@@ -132,13 +132,14 @@ See [docs/USAGE.md](./docs/USAGE.md) for the full list. `SIGINT` / `SIGTERM` tri
 
 ## Docker (DigitalOcean Droplet)
 
-```bash
-# Local / IP smoke test
-docker compose up -d --build
-# http://<host>:8080/
+CI publishes `ghcr.io/johnzilla/tokenstats` (`:latest`, `:sha-<short>`) for every green `main`; production pulls it.
 
+```bash
 # Production with Caddy HTTPS (set DOMAIN in .env — see deploy/env.example)
-docker compose --profile proxy up -d --build
+docker compose --profile proxy pull && docker compose --profile proxy up -d
+
+# Local build instead (dev / forks); app on 127.0.0.1:8080
+docker compose up -d --build
 ```
 
 Full **doctl + DNS + Caddy/Nginx** guide: [docs/DEPLOY.md](./docs/DEPLOY.md).

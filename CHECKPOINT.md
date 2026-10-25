@@ -4,7 +4,7 @@ _Last updated: 2026-10-25 · Feed quality, OrcaRouter, probes, CI, security revi
 
 ## Where I am
 
-Live on tokenstats.ai (DigitalOcean Droplet, manual pull-and-build deploy, `docs/DEPLOY.md` §6). Since July:
+Live on tokenstats.ai (DigitalOcean Droplet, pulls the CI-built GHCR image, `docs/DEPLOY.md` §6). Since July:
 
 - **Feed freshness/health** (#1, #2): concurrent node polling, pruning of delisted models, quote TTL; `kind`, `age_secs`, `stale`, `outlier`, quality filters; `/health` `status` + `feed`
 - **Sources** (#5): OrcaRouter alongside OpenRouter and Routstr; explicit per-1M prices win over unit heuristics (#12)
@@ -18,11 +18,10 @@ Live on tokenstats.ai (DigitalOcean Droplet, manual pull-and-build deploy, `docs
 - tokenstats observes, arbstr executes: keep them decoupled; probes stay free ("observe, don't pay")
 - Additive API changes only; `AGENTS.md` holds the `/api/quotes` contract
 - Analytics off unless `TOKENSTATS_PLAUSIBLE_SCRIPT` is set; no inline scripts (CSP)
-- Deploys stay manual for now (no GHCR / release pipeline yet)
+- Deploys are manual and pull-based: CI publishes `ghcr.io/johnzilla/tokenstats` on green `main`, the Droplet pulls it
 
 ## Open questions
 
-- Publish images to GHCR and pull on the Droplet instead of building there?
 - `.github/dependabot.yml` for weekly version PRs (only security updates arrive today)
 
 ## Next step
