@@ -8,6 +8,9 @@ use serde::Serialize;
 
 use crate::pricing::sanitize_opt;
 
+mod history;
+pub use history::{EndpointStats, HourBucket, HISTORY_HOURS};
+
 /// How long to keep poll samples for reliability scoring.
 const RELIABILITY_WINDOW: Duration = Duration::hours(1);
 /// Max samples retained per node (1/min * 60 ≈ 60; keep headroom).
@@ -111,6 +114,8 @@ pub struct Store {
     nodes: RwLock<HashMap<String, ProviderNode>>,
     /// Poll history per endpoint for reliability.
     poll_history: RwLock<HashMap<String, VecDeque<PollSample>>>,
+    /// Hourly buckets per endpoint (7 days) for 24h/7d reliability + latency.
+    hourly: RwLock<HashMap<String, VecDeque<HourBucket>>>,
     /// Last known BTC/USD rate for sats conversion.
     btc_usd: RwLock<Option<f64>>,
     /// Latest fetch outcome per `{source}|{endpoint}`.
@@ -357,6 +362,14 @@ impl Store {
                 q.pop_front();
             }
         }
+        if let Ok(mut hourly) = self.hourly.write() {
+            history::record(
+                hourly.entry(key.clone()).or_default(),
+                history::hour_of(now),
+                ok,
+                latency_ms,
+            );
+        }
         // Touch node last_seen / latency if present.
         if let Ok(mut map) = self.nodes.write() {
             if let Some(n) = map.get_mut(&key) {
@@ -388,18 +401,63 @@ impl Store {
         (rel, ok, total, lat)
     }
 
-    /// Success rate over the reliability window per normalized endpoint
-    /// (only endpoints with samples).
-    pub fn reliability_by_endpoint(&self) -> HashMap<String, f64> {
-        let Ok(hist) = self.poll_history.read() else {
+    /// Reliability (1h/24h/7d) and latency per normalized endpoint, for every
+    /// endpoint with any poll history.
+    pub fn endpoint_stats(&self) -> HashMap<String, EndpointStats> {
+        let now_hour = history::hour_of(Utc::now());
+        let raw = self.poll_history.read().ok();
+        let Ok(hourly) = self.hourly.read() else {
             return HashMap::new();
         };
-        hist.iter()
-            .filter_map(|(k, samples)| {
-                let (rel, _, total, _) = reliability_from_samples(Some(samples));
-                (total > 0).then(|| (k.clone(), rel))
+        let mut keys: HashSet<&String> = hourly.keys().collect();
+        if let Some(raw) = raw.as_ref() {
+            keys.extend(raw.keys());
+        }
+        keys.into_iter()
+            .map(|k| {
+                let rel_1h = raw.as_ref().and_then(|r| {
+                    let (rel, _, total, _) = reliability_from_samples(r.get(k));
+                    (total > 0).then_some(rel)
+                });
+                let stats = EndpointStats::from_buckets(hourly.get(k), rel_1h, now_hour);
+                (k.clone(), stats)
             })
             .collect()
+    }
+
+    /// Hourly buckets at or after `since_hour` (all when `None`), for persistence.
+    pub fn hourly_snapshot(&self, since_hour: Option<i64>) -> Vec<(String, HourBucket)> {
+        let Ok(hourly) = self.hourly.read() else {
+            return Vec::new();
+        };
+        hourly
+            .iter()
+            .flat_map(|(k, buckets)| {
+                buckets
+                    .iter()
+                    .filter(move |b| since_hour.is_none_or(|h| b.hour >= h))
+                    .map(move |b| (k.clone(), b.clone()))
+            })
+            .collect()
+    }
+
+    /// Restore hourly buckets (startup); expired hours are dropped.
+    pub fn load_hourly(&self, rows: Vec<(String, HourBucket)>) {
+        let now_hour = history::hour_of(Utc::now());
+        let Ok(mut hourly) = self.hourly.write() else {
+            return;
+        };
+        for (endpoint, bucket) in rows {
+            hourly
+                .entry(normalize_endpoint(&endpoint))
+                .or_default()
+                .push_back(bucket);
+        }
+        for buckets in hourly.values_mut() {
+            buckets.make_contiguous().sort_by_key(|b| b.hour);
+            history::prune(buckets, now_hour);
+        }
+        hourly.retain(|_, b| !b.is_empty());
     }
 
     /// Record a catalog fetch outcome (`Ok(models)` or `Err(message)`).
@@ -728,6 +786,28 @@ mod tests {
             .unwrap();
         assert_eq!(got.price_in_usd, None);
         assert_eq!(got.price_in_sats, None);
+    }
+
+    #[test]
+    fn endpoint_stats_from_polls_and_restore() {
+        let store = Store::new();
+        store.record_poll("https://n1/", true, Some(120));
+        store.record_poll("https://n1", true, Some(130));
+        store.record_poll("https://n1", false, None);
+        let st = store.endpoint_stats()["https://n1"].clone();
+        assert!((st.reliability_1h.unwrap() - 2.0 / 3.0).abs() < 1e-9);
+        assert_eq!(st.reliability_24h, st.reliability_1h);
+        assert_eq!(st.latency_p50_ms, Some(125));
+        assert_eq!(st.latency_p95_ms, Some(160));
+        assert_eq!(st.polls_24h, 3);
+
+        // Buckets survive a restart; raw 1h samples do not.
+        let restored = Store::new();
+        restored.load_hourly(store.hourly_snapshot(None));
+        let st2 = restored.endpoint_stats()["https://n1"].clone();
+        assert_eq!(st2.reliability_1h, None);
+        assert_eq!(st2.reliability_24h, st.reliability_24h);
+        assert_eq!(st2.latency_p50_ms, Some(125));
     }
 
     #[test]

@@ -12,7 +12,7 @@ use super::feed::feed_status;
 use super::AppState;
 use crate::market::{apply_preset, best_now, blended_usd, delta_pct, Preset, DEFAULT_BLEND_RATIO};
 use crate::pricing::{blend_sort_key, is_rankable_blend};
-use crate::store::{normalize_endpoint, Quote};
+use crate::store::{normalize_endpoint, EndpointStats, Quote};
 
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let quotes = state.store.list_quotes();
@@ -51,6 +51,11 @@ pub struct QuotesQuery {
     pub min_reliability: Option<f64>,
     /// Model kind(s), comma-separated: chat | embedding | image | audio | rerank | other
     pub kind: Option<String>,
+    /// Like `min_reliability` over the last 24h (hourly buckets, persisted).
+    pub min_reliability_24h: Option<f64>,
+    /// Only quotes whose endpoint's 24h p50 response time is at most this.
+    /// Quotes with no latency samples are excluded.
+    pub max_latency_ms: Option<u64>,
     /// `1`/`true` hides quotes older than the stale threshold.
     pub exclude_stale: Option<String>,
     /// `1`/`true` hides quotes priced >10× off the cross-source median.
@@ -107,6 +112,10 @@ impl QuotesQuery {
         let min_rel = self.min_reliability.map(|v| v.to_string());
         set("max_age_secs", max_age.as_deref());
         set("min_reliability", min_rel.as_deref());
+        let min_rel_24h = self.min_reliability_24h.map(|v| v.to_string());
+        let max_lat = self.max_latency_ms.map(|v| v.to_string());
+        set("min_reliability_24h", min_rel_24h.as_deref());
+        set("max_latency_ms", max_lat.as_deref());
         set("kind", self.kind.as_deref());
         set("exclude_stale", self.exclude_stale.as_deref());
         set("exclude_outliers", self.exclude_outliers.as_deref());
@@ -172,14 +181,20 @@ pub async fn api_nodes(State(state): State<AppState>) -> impl IntoResponse {
         .filter(|f| f.source == "routstr")
         .map(|f| (f.endpoint.clone(), f))
         .collect();
+    let stats = state.store.endpoint_stats();
     let nodes: Vec<_> = state
         .store
         .list_nodes()
         .into_iter()
         .map(|n| {
-            let fetch = fetches.get(&normalize_endpoint(&n.endpoint));
+            let key = normalize_endpoint(&n.endpoint);
+            let fetch = fetches.get(&key);
             let mut v = serde_json::to_value(&n).unwrap_or_default();
             if let Some(obj) = v.as_object_mut() {
+                let st = stats.get(&key).cloned().unwrap_or_default();
+                if let Ok(serde_json::Value::Object(fields)) = serde_json::to_value(st) {
+                    obj.extend(fields);
+                }
                 obj.insert(
                     "last_success_at".into(),
                     serde_json::json!(fetch.and_then(|f| f.last_success_at)),
@@ -248,13 +263,14 @@ pub async fn export_csv(State(state): State<AppState>, Query(q): Query<QuotesQue
     let mut csv = String::from(
         "source,provider,provider_id,model,price_in_usd,price_out_usd,blended_usd,blend_ratio,\
          price_in_sats,price_out_sats,delta_out_pct,endpoint,region,context_length,observed_at,\
-         kind,age_secs,stale,reliability_1h,outlier\n",
+         kind,age_secs,stale,reliability_1h,outlier,reliability_24h,reliability_7d,\
+         latency_p50_ms,latency_p95_ms\n",
     );
     for quote in quotes.into_iter().take(limit) {
         let blend = blended_usd(quote.price_in_usd, quote.price_out_usd, ratio);
         let d = delta_pct(quote.price_out_usd, quote.prev_price_out_usd);
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             csv_cell(&quote.source),
             csv_cell(&quote.provider),
             csv_cell(&quote.provider_id),
@@ -278,6 +294,10 @@ pub async fn export_csv(State(state): State<AppState>, Query(q): Query<QuotesQue
             ctx.is_stale(&quote),
             opt_f(ctx.reliability(&quote)),
             ctx.is_outlier(&quote),
+            opt_f(ctx.stats(&quote).and_then(|s| s.reliability_24h)),
+            opt_f(ctx.stats(&quote).and_then(|s| s.reliability_7d)),
+            opt_u(ctx.stats(&quote).and_then(|s| s.latency_p50_ms)),
+            opt_u(ctx.stats(&quote).and_then(|s| s.latency_p95_ms)),
         ));
     }
 
@@ -369,6 +389,7 @@ pub async fn dashboard(
             .collect()
     };
 
+    let node_stats = state.store.endpoint_stats();
     let node_rows: String = if nodes.is_empty() {
         r#"<tr><td colspan="7" class="empty">No Routstr nodes discovered yet (kind 38421)…</td></tr>"#
             .into()
@@ -376,6 +397,7 @@ pub async fn dashboard(
         nodes
             .iter()
             .map(|n| {
+                let st = node_stats.get(&normalize_endpoint(&n.endpoint));
                 let score_pct = (n.reliability * 100.0).round() as i32;
                 let bar_cls = if score_pct >= 90 {
                     "rel-good"
@@ -393,7 +415,7 @@ pub async fn dashboard(
                       <td class="muted">{endpoint}</td>
                       <td class="muted">{region}</td>
                       <td>
-                        <div class="rel {bar_cls}" title="{ok}/{total} polls last hour">
+                        <div class="rel {bar_cls}" title="{ok}/{total} polls last hour · 24h {rel_24h} · 7d {rel_7d}">
                           <span class="rel-bar" style="width:{score}%"></span>
                           <span class="rel-label">{score}%</span>
                         </div>
@@ -409,10 +431,15 @@ pub async fn dashboard(
                     total = n.poll_total,
                     score = score_pct,
                     bar_cls = bar_cls,
-                    lat = n
-                        .last_latency_ms
-                        .map(|ms| format!("{ms} ms"))
-                        .unwrap_or_else(|| "—".into()),
+                    rel_24h = fmt_pct(st.and_then(|s| s.reliability_24h)),
+                    rel_7d = fmt_pct(st.and_then(|s| s.reliability_7d)),
+                    lat = match st.and_then(|s| s.latency_p50_ms.zip(s.latency_p95_ms)) {
+                        Some((p50, p95)) => format!("p50 ≤{p50} · p95 ≤{p95} ms"),
+                        None => n
+                            .last_latency_ms
+                            .map(|ms| format!("{ms} ms"))
+                            .unwrap_or_else(|| "—".into()),
+                    },
                     via = esc(&n.discovered_via),
                 )
             })
@@ -746,7 +773,7 @@ pub async fn dashboard(
     </tbody>
   </table>
 
-  <h2>Nodes <span class="hint">reliability = successful polls / total (last hour)</span></h2>
+  <h2>Nodes <span class="hint">reliability = successful polls / total (last hour; hover for 24h / 7d) · latency = catalog fetch, 24h</span></h2>
   <table>
     <thead>
       <tr>
@@ -970,8 +997,8 @@ struct QuoteCtx {
     now: DateTime<Utc>,
     stale_after_secs: i64,
     ratio: f64,
-    /// Normalized endpoint → success rate over the reliability window.
-    reliability: HashMap<String, f64>,
+    /// Normalized endpoint → reliability windows + latency.
+    stats: HashMap<String, EndpointStats>,
     /// Lowercased model id → median rankable blend across all quotes.
     medians: HashMap<String, f64>,
 }
@@ -1006,7 +1033,7 @@ impl QuoteCtx {
             now: Utc::now(),
             stale_after_secs: state.stale_after.as_secs() as i64,
             ratio,
-            reliability: state.store.reliability_by_endpoint(),
+            stats: state.store.endpoint_stats(),
             medians,
         }
     }
@@ -1019,9 +1046,12 @@ impl QuoteCtx {
         self.age_secs(q) > self.stale_after_secs
     }
 
+    fn stats(&self, q: &Quote) -> Option<&EndpointStats> {
+        self.stats.get(&normalize_endpoint(q.endpoint.as_deref()?))
+    }
+
     fn reliability(&self, q: &Quote) -> Option<f64> {
-        let ep = normalize_endpoint(q.endpoint.as_deref()?);
-        self.reliability.get(&ep).copied()
+        self.stats(q).and_then(|s| s.reliability_1h)
     }
 
     fn is_outlier(&self, q: &Quote) -> bool {
@@ -1080,6 +1110,10 @@ fn enrich_json(q: &Quote, ctx: &QuoteCtx) -> serde_json::Value {
         "age_secs": ctx.age_secs(q),
         "stale": ctx.is_stale(q),
         "reliability_1h": ctx.reliability(q),
+        "reliability_24h": ctx.stats(q).and_then(|s| s.reliability_24h),
+        "reliability_7d": ctx.stats(q).and_then(|s| s.reliability_7d),
+        "latency_p50_ms": ctx.stats(q).and_then(|s| s.latency_p50_ms),
+        "latency_p95_ms": ctx.stats(q).and_then(|s| s.latency_p95_ms),
         "outlier": ctx.is_outlier(q),
     })
 }
@@ -1106,6 +1140,18 @@ fn filter_quotes(quotes: Vec<Quote>, q: &QuotesQuery, ctx: &QuoteCtx) -> Vec<Quo
             }
             if let Some(min) = q.min_reliability {
                 if !ctx.reliability(quote).is_some_and(|r| r >= min) {
+                    return false;
+                }
+            }
+            if let Some(min) = q.min_reliability_24h {
+                let rel = ctx.stats(quote).and_then(|s| s.reliability_24h);
+                if !rel.is_some_and(|r| r >= min) {
+                    return false;
+                }
+            }
+            if let Some(max) = q.max_latency_ms {
+                let p50 = ctx.stats(quote).and_then(|s| s.latency_p50_ms);
+                if p50.is_none_or(|ms| ms > max) {
                     return false;
                 }
             }
@@ -1168,6 +1214,15 @@ fn csv_cell(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+fn fmt_pct(v: Option<f64>) -> String {
+    v.map(|x| format!("{:.0}%", x * 100.0))
+        .unwrap_or_else(|| "—".into())
+}
+
+fn opt_u(v: Option<u64>) -> String {
+    v.map(|x| x.to_string()).unwrap_or_default()
 }
 
 fn opt_f(v: Option<f64>) -> String {
@@ -1303,6 +1358,33 @@ mod tests {
         assert_eq!(v["reliability_1h"], 1.0);
         assert_eq!(v["outlier"], false);
         assert!(v["age_secs"].as_i64().unwrap() >= 900);
+    }
+
+    #[test]
+    fn filters_on_24h_reliability_and_latency() {
+        let st = state();
+        for _ in 0..3 {
+            st.store.record_poll("https://fast", true, Some(80));
+        }
+        st.store.record_poll("https://slow", true, Some(3000));
+        st.store.record_poll("https://slow", false, None);
+        let all = vec![
+            quote("a", "https://fast", 1.0, 5, "chat"),
+            quote("b", "https://slow", 1.0, 5, "chat"),
+            quote("c", "https://none", 1.0, 5, "chat"),
+        ];
+        let ctx = QuoteCtx::new(&st, &all, 3.0);
+        let models = |qs: &str| -> Vec<String> {
+            filter_quotes(all.clone(), &query(qs), &ctx)
+                .into_iter()
+                .map(|q| q.model)
+                .collect()
+        };
+        assert_eq!(models("max_latency_ms=500"), ["a"]);
+        assert_eq!(models("min_reliability_24h=0.9"), ["a"]);
+        let v = enrich_json(&all[1], &ctx);
+        assert_eq!(v["reliability_24h"], 0.5);
+        assert_eq!(v["latency_p50_ms"], 3150);
     }
 
     #[test]
