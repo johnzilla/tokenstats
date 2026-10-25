@@ -86,6 +86,12 @@ Nostr announcements are unauthenticated, so by default tokenstats **never reques
 - Quotes older than `--stale-after-secs` (default 10 min) are kept but flagged `stale: true`; pass `exclude_stale=1` to hide them.
 - A USD price above `--max-price-usd-per-1m` (default $1000) is treated as a unit error and nulled (both USD and sats for that side).
 
+### Reliability and latency history
+
+Every catalog fetch (reference catalogs and Routstr nodes) is recorded twice: as a raw sample for `reliability_1h`, and in an hourly bucket kept for 7 days and saved to SQLite (`endpoint_hours`). From the buckets tokenstats serves `reliability_24h`, `reliability_7d`, and 24h `latency_p50_ms` / `latency_p95_ms` on quotes, nodes and CSV.
+
+Latency is the catalog-fetch response time, bucketed into ~25% bins (the value is the bin's upper edge). It measures how responsive an endpoint is, not inference speed. Filter with `min_reliability_24h=0.9` and `max_latency_ms=500`.
+
 ### Feed health
 
 `/health` and `/api/summary` include `status` (`ok` · `degraded` · `down` · `starting` · `offline`) and a `feed` object: `reasons`, `stale_quotes`, `last_cycle` (nodes ok/failed, delisted, expired, elapsed), per-source `endpoints`/`healthy`/`failing`/`models`/`last_success_at`/`last_error`, and Nostr `discovery.lag_secs`. Many dead Routstr nodes alone does not degrade the feed; zero healthy nodes does. The dashboard header shows `feed <status>` (hover for reasons).

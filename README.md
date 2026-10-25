@@ -58,7 +58,7 @@ cargo run -- serve --bind 0.0.0.0:8080 --db ./tokenstats.db
 | **Δ out** | Price change vs previous catalog snapshot |
 | **Hover → copy** | **curl** or OpenAI-compatible **config** JSON for that quote |
 | **Export CSV** | Current filtered view → `/export.csv?...` |
-| **Nodes** | Discovered RIP-02 endpoints + reliability (success rate last hour) |
+| **Nodes** | Discovered RIP-02 endpoints + reliability (last hour; 24h/7d on hover) + p50/p95 latency |
 
 Query params: `?source=openrouter&preset=frontier&ratio=4&model=deepseek`
 
@@ -68,8 +68,8 @@ Query params: `?source=openrouter&preset=frontier&ratio=4&model=deepseek`
 |------|-------------|
 | `GET /` | HTML dashboard (auto-refresh ~15s) |
 | `GET /health` | Liveness + feed `status` (`ok`/`degraded`/`down`/…) + counts + `last_updated` |
-| `GET /api/quotes` | JSON quotes (`source`, `model`, `kind`, `preset`, `ratio`, `limit`, `max_age_secs`, `min_reliability`, `exclude_stale`, `exclude_outliers`) |
-| `GET /api/nodes` | Discovered nodes + reliability + last success/error (+ `skip_reason` when not polled) |
+| `GET /api/quotes` | JSON quotes (`source`, `model`, `kind`, `preset`, `ratio`, `limit`, `max_age_secs`, `min_reliability`, `min_reliability_24h`, `max_latency_ms`, `exclude_stale`, `exclude_outliers`) |
+| `GET /api/nodes` | Discovered nodes + reliability (1h/24h/7d) + latency p50/p95 + last success/error (+ `skip_reason` when not polled) |
 | `GET /api/summary` | Aggregates + Best Now strip |
 | `GET /export.csv` | CSV of current filtered view |
 

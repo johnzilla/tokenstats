@@ -50,7 +50,7 @@ Centralized in `src/config.rs`. Prefer adding new knobs there (CLI + `TOKENSTATS
 - Quote key: `{source}:{provider_id}:{model}` (latest-wins).
 - Catalog fetches go through `replace_catalog` (drops delisted models for that source/provider/endpoint; empty fetch is a no-op). Quotes older than `--quote-ttl-secs` are expired by the poller.
 - On upsert, preserve `prev_price_*` for delta indicators; oracle sats updates must **not** clobber deltas (`apply_sats_normalization`).
-- Node reliability: poll success rate over the last hour (`record_poll`).
+- Node reliability: `record_poll` feeds raw 1h samples (`reliability_1h`) and hourly buckets with latency histograms (`src/store/history.rs`, 7 days) behind `endpoint_stats()`. Buckets persist in `endpoint_hours`; only hours touched since the last save are upserted.
 - SSRF guard (`src/providers/netguard.rs`): non-`cli` nodes (i.e. Nostr announcements) are never requested when the host is or resolves to loopback/private/CGNAT/link-local/unique-local/unspecified, unless `--allow-private-nodes`. Use the guarded client (public-only resolver + redirect checks) for any new fetch of announced URLs. Skips set `ProviderNode.skip_reason`.
 
 ### Web / dashboard
@@ -88,7 +88,7 @@ Related helpers (not substitutes for the full board):
 |----------|----------|
 | `GET /api/quotes` | **Main integration** — full filtered quote list |
 | `GET /api/summary` | Compact Best Now strip + counts + `btc_usd` + feed `status`/`feed` |
-| `GET /api/nodes` | Discovered Routstr endpoints + reliability + `last_success_at` / `last_error` / `consecutive_failures` + `skip_reason` (string \| null) when the SSRF guard refused to poll |
+| `GET /api/nodes` | Discovered Routstr endpoints + reliability (`reliability_1h/24h/7d`, `polls_24h`) + `latency_p50_ms/p95_ms` + `last_success_at` / `last_error` / `consecutive_failures` + `skip_reason` (string \| null) when the SSRF guard refused to poll |
 | `GET /health` | Liveness + feed `status` / `feed` object / quote count / `last_updated` |
 | `GET /export.csv` | Same filters as quotes, for offline analysis |
 
@@ -97,7 +97,7 @@ Default base URL locally: `http://127.0.0.1:8080`.
 ### Request
 
 ```
-GET /api/quotes?source=&model=&kind=&preset=&ratio=&limit=&max_age_secs=&min_reliability=&exclude_stale=&exclude_outliers=
+GET /api/quotes?source=&model=&kind=&preset=&ratio=&limit=&max_age_secs=&min_reliability=&min_reliability_24h=&max_latency_ms=&exclude_stale=&exclude_outliers=
 ```
 
 | Query param | Type | Default | Description |
@@ -106,6 +106,8 @@ GET /api/quotes?source=&model=&kind=&preset=&ratio=&limit=&max_age_secs=&min_rel
 | `kind` | string | (all) | Model kind(s), comma-separated: `chat`, `embedding`, `image`, `audio`, `rerank`, `other` |
 | `max_age_secs` | int | (none) | Only quotes with `age_secs` ≤ this |
 | `min_reliability` | float | (none) | Only quotes whose endpoint's 1h success rate ≥ this (0–1). Quotes with no poll history are **excluded** |
+| `min_reliability_24h` | float | (none) | Same over 24h (hourly buckets, survives restarts). Steadier than 1h for routing |
+| `max_latency_ms` | int | (none) | Only quotes whose endpoint's 24h p50 response time ≤ this. No latency samples → **excluded** |
 | `exclude_stale` | bool | off | `1`/`true` hides quotes with `stale: true` |
 | `exclude_outliers` | bool | off | `1`/`true` hides quotes with `outlier: true` |
 | `model` | string | (all) | Case-insensitive **substring** on model id (e.g. `deepseek`, `claude-sonnet`) |
@@ -159,6 +161,8 @@ Empty store / no matches → `[]`.
 | `age_secs` | number | Seconds since `observed_at` |
 | `stale` | bool | `age_secs` > `TOKENSTATS_STALE_AFTER_SECS` (default 600) |
 | `reliability_1h` | number \| null | Endpoint's catalog-fetch success rate over the last hour (reference catalogs included); null until polled since restart |
+| `reliability_24h`, `reliability_7d` | number \| null | Endpoint fetch success rate over the last 24 / 168 clock hours (current hour included), persisted in SQLite |
+| `latency_p50_ms`, `latency_p95_ms` | number \| null | Endpoint catalog-fetch response time over 24h, successful polls only. **Bucketed** (~25% bins, value = bin upper edge, max 20000). This is endpoint responsiveness, not inference speed or TTFT |
 | `outlier` | bool | Blend is >10× above or below the median for the same model id across ≥3 quotes. Low outliers often mean a unit bug on the node |
 
 #### Example
@@ -249,7 +253,7 @@ catalog model row
 
 ```
 1. GET /health          → wait for status "ok" (or "degraded" + acceptable reasons)
-2. GET /api/quotes?kind=chat&exclude_stale=1&exclude_outliers=1&min_reliability=0.5
+2. GET /api/quotes?kind=chat&exclude_stale=1&exclude_outliers=1&min_reliability_24h=0.9
                         → select candidates by blended_usd / source / model
 3. Optionally GET /api/nodes for reliability before routing to a Routstr endpoint
 4. Re-poll /api/quotes on an interval aligned with TOKENSTATS_POLL_INTERVAL_SECS (default 60s)
@@ -282,7 +286,7 @@ docker compose up -d --build
 ## Good next features (if asked)
 
 - Price history charts / multi-sample deltas beyond last snapshot
-- Latency-based “Fastest” (not only name heuristics)
+- Latency-based “Fastest” (latency data exists now; presets still use name heuristics)
 - Signed oracle publish of Best Now
 - Model compare (same model across OpenRouter vs Routstr nodes)
 - Stale TTL for nodes (quotes expire via `--quote-ttl-secs`)

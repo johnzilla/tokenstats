@@ -11,11 +11,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::providers::model_kind;
-use crate::store::{ProviderNode, Quote, Store};
+use crate::store::{HourBucket, ProviderNode, Quote, Store};
 
 pub struct Db {
     conn: Mutex<Connection>,
     path: PathBuf,
+    /// Oldest hour that may have changed since the last save (`None` = save all).
+    hourly_dirty_from: Mutex<Option<i64>>,
 }
 
 impl Db {
@@ -66,6 +68,14 @@ impl Db {
                 poll_total INTEGER NOT NULL DEFAULT 0,
                 last_latency_ms INTEGER
             );
+            CREATE TABLE IF NOT EXISTS endpoint_hours (
+                endpoint TEXT NOT NULL,
+                hour INTEGER NOT NULL,
+                ok INTEGER NOT NULL,
+                total INTEGER NOT NULL,
+                latency_hist TEXT NOT NULL,
+                PRIMARY KEY (endpoint, hour)
+            );
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -83,6 +93,7 @@ impl Db {
         Ok(Self {
             conn: Mutex::new(conn),
             path,
+            hourly_dirty_from: Mutex::new(None),
         })
     }
 
@@ -171,7 +182,31 @@ impl Db {
         let n_nodes = nodes.len();
         store.load_nodes(nodes);
 
-        info!(quotes = n_quotes, nodes = n_nodes, "restored from sqlite");
+        let mut stmt =
+            conn.prepare("SELECT endpoint, hour, ok, total, latency_hist FROM endpoint_hours")?;
+        let hours: Vec<(String, HourBucket)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    HourBucket {
+                        hour: row.get(1)?,
+                        ok: row.get::<_, i64>(2)? as u32,
+                        total: row.get::<_, i64>(3)? as u32,
+                        latency_hist: HourBucket::hist_from_str(&row.get::<_, String>(4)?),
+                    },
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        let n_hours = hours.len();
+        store.load_hourly(hours);
+
+        info!(
+            quotes = n_quotes,
+            nodes = n_nodes,
+            endpoint_hours = n_hours,
+            "restored from sqlite"
+        );
         Ok(())
     }
 
@@ -242,6 +277,33 @@ impl Db {
             }
         }
 
+        // Hourly buckets: upsert only hours touched since the last save, then
+        // expire the oldest. Past hours never change, so this stays small.
+        let now_hour = Utc::now().timestamp().div_euclid(3600);
+        let dirty_from = *self.hourly_dirty_from.lock().expect("dirty lock");
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO endpoint_hours (endpoint, hour, ok, total, latency_hist)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(endpoint, hour) DO UPDATE SET
+                    ok = excluded.ok, total = excluded.total,
+                    latency_hist = excluded.latency_hist",
+            )?;
+            for (endpoint, b) in store.hourly_snapshot(dirty_from) {
+                stmt.execute(params![
+                    endpoint,
+                    b.hour,
+                    b.ok as i64,
+                    b.total as i64,
+                    b.hist_to_string()
+                ])?;
+            }
+            tx.execute(
+                "DELETE FROM endpoint_hours WHERE hour <= ?1",
+                params![now_hour - crate::store::HISTORY_HOURS],
+            )?;
+        }
+
         if let Some(rate) = store.btc_usd() {
             tx.execute(
                 "INSERT INTO meta(key, value) VALUES('btc_usd', ?1)
@@ -251,6 +313,8 @@ impl Db {
         }
 
         tx.commit()?;
+        // Only advance after a successful commit, so a failed save retries.
+        *self.hourly_dirty_from.lock().expect("dirty lock") = Some(now_hour);
         debug!(
             quotes = store.quote_count(),
             nodes = store.node_count(),
@@ -299,6 +363,38 @@ pub async fn run_persist_loop(
                     Err(e) => warn!(error = %e, "sqlite save task join failed"),
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hourly_buckets_roundtrip_through_sqlite() {
+        let path = std::env::temp_dir().join(format!(
+            "tokenstats-test-{}-{}.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let store = Store::new();
+        store.record_poll("https://n1", true, Some(90));
+        store.record_poll("https://n1", false, None);
+        let db = Db::open(&path).unwrap();
+        db.save_from(&store).unwrap();
+        // Second save only rewrites the current hour; still one row.
+        store.record_poll("https://n1", true, Some(95));
+        db.save_from(&store).unwrap();
+
+        let restored = Store::new();
+        db.load_into(&restored).unwrap();
+        let st = &restored.endpoint_stats()["https://n1"];
+        assert_eq!(st.polls_24h, 3);
+        assert_eq!(st.latency_p50_ms, Some(100));
+        drop(db);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
         }
     }
 }
