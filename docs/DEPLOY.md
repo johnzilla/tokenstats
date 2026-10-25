@@ -33,7 +33,7 @@ Note your SSH key **ID** (or fingerprint) from the list. Examples below use plac
 
 | Concern | Status |
 |---------|--------|
-| Multi-stage build | Yes — `rust:1.85-bookworm` → `debian:bookworm-slim` |
+| Multi-stage build | Yes — `rust:1.86-bookworm` → `debian:bookworm-slim` (keep in step with `rust-version` and the CI `msrv` job) |
 | Non-root | Yes — uid `10001` `tokenstats` |
 | Healthcheck | Yes — `GET /health` |
 | Graceful stop | `STOPSIGNAL SIGTERM` + compose `stop_grace_period: 20s` (final SQLite snapshot) |
@@ -134,7 +134,19 @@ apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
 docker --version && docker compose version
 ```
 
-### Firewall (DigitalOcean cloud firewall or UFW)
+### Firewall (DigitalOcean cloud firewall **and** UFW)
+
+> [!IMPORTANT]
+> **Docker bypasses UFW.** Ports published by Docker (`ports:` in compose) get their own iptables rules, so UFW never sees that traffic. A published `8080` is reachable from the internet even though UFW doesn't allow it. Two fixes, use both:
+> 1. Bind the app to localhost: `TOKENSTATS_PUBLISH_PORT=127.0.0.1:8080` in `.env` (the default in `deploy/env.example`).
+> 2. Put a **DigitalOcean cloud firewall** in front. It filters before traffic reaches the Droplet, so Docker can't go around it.
+
+> [!WARNING]
+> The **Docker marketplace image** (`docker-20-04` / "Ubuntu Docker on Ubuntu 22.04") ships UFW rules allowing **2375/2376** (the Docker remote API) from anywhere. dockerd listens only on its local socket by default, so nothing is exposed until someone enables TCP, but delete the rules:
+>
+> ```bash
+> ufw delete allow 2375/tcp && ufw delete allow 2376/tcp && ufw status numbered
+> ```
 
 **UFW on the Droplet:**
 
@@ -143,21 +155,25 @@ ssh root@"$DROPLET_IP"
 ufw allow OpenSSH
 ufw allow 80/tcp
 ufw allow 443/tcp
-# Only if you need direct app access without proxy:
-# ufw allow 8080/tcp
+# Note: UFW does not govern Docker-published ports (see above), so there is
+# no point allowing or denying 8080 here; use TOKENSTATS_PUBLISH_PORT instead.
 ufw --force enable
 ufw status
 ```
 
-**Or create a DO cloud firewall with doctl:**
+**Plus a DO cloud firewall (recommended) with doctl:**
+
+Inbound 22, 80, 443/tcp and 443/udp (Caddy serves HTTP/3). Outbound stays fully open: tokenstats reaches catalogs, Coinbase, Nostr relays and nodes on arbitrary ports.
 
 ```bash
 doctl compute firewall create \
   --name tokenstats-fw \
   --droplet-ids "$(doctl compute droplet get "$DROPLET_NAME" --format ID --no-header)" \
-  --inbound-rules "protocol:tcp,ports:22,address:0.0.0.0/0,address:::/0 protocol:tcp,ports:80,address:0.0.0.0/0,address:::/0 protocol:tcp,ports:443,address:0.0.0.0/0,address:::/0" \
+  --inbound-rules "protocol:tcp,ports:22,address:0.0.0.0/0,address:::/0 protocol:tcp,ports:80,address:0.0.0.0/0,address:::/0 protocol:tcp,ports:443,address:0.0.0.0/0,address:::/0 protocol:udp,ports:443,address:0.0.0.0/0,address:::/0" \
   --outbound-rules "protocol:tcp,ports:all,address:0.0.0.0/0,address:::/0 protocol:udp,ports:all,address:0.0.0.0/0,address:::/0 protocol:icmp,address:0.0.0.0/0,address:::/0"
 ```
+
+A `403 Forbidden` here means the doctl token can't write firewalls (read-only or custom scopes without `firewall:create`). Create a token with firewall scopes and add it as a separate context (`doctl auth init --context firewall-admin`), or create the firewall in the console under **Networking → Firewalls**. If SSH ever breaks after a firewall change, the Droplet's web console in the DO panel still works.
 
 ---
 
@@ -220,9 +236,11 @@ curl -fsS http://127.0.0.1:8080/health
 curl -fsSI https://tokenstats.ai/health
 ```
 
-When the **proxy** profile is up, Caddy listens on 80/443 and proxies to `tokenstats:8080`. The app still publishes host `:8080` by default for debugging; lock that down if you want (see §6).
+When the **proxy** profile is up, Caddy listens on 80/443 and proxies to `tokenstats:8080` over the internal Docker network. With `TOKENSTATS_PUBLISH_PORT=127.0.0.1:8080` (the `env.example` default) the app is reachable only from the Droplet itself (`curl localhost:8080/health`), not from the internet. Check from outside: `curl -m 8 http://$DROPLET_IP:8080/health` should time out.
 
 ### 4b. App only (HTTP on :8080, no TLS yet)
+
+For a quick IP smoke test, set `TOKENSTATS_PUBLISH_PORT=8080` in `.env` (public), and switch it back to `127.0.0.1:8080` once Caddy is up.
 
 ```bash
 docker compose up -d --build
@@ -286,15 +304,39 @@ certbot --nginx -d tokenstats.ai -d www.tokenstats.ai
 
 ## 6. Updates (redeploy)
 
+There is no CI deploy: the Droplet pulls the public repo and builds the image itself.
+
 ```bash
 ssh root@"$DROPLET_IP"
 cd /opt/tokenstats
+
+# 1. Note what's running (your rollback point)
+git log --oneline -1
+
+# 2. Back up the SQLite DB (WAL mode: copy all three files)
+mkdir -p /root/ts-backup
+for f in tokenstats.db tokenstats.db-wal tokenstats.db-shm; do docker cp tokenstats:/data/$f /root/ts-backup/ 2>/dev/null; done
+
+# 3. Make sure swap exists: a Cargo.lock change recompiles every dependency
+free -h
+
+# 4. Pull + rebuild (old container serves until the new one is up)
 git pull origin main
 docker compose --profile proxy up -d --build
-# SQLite data lives in volume tokenstats-data — safe across rebuilds
-docker compose ps
-curl -fsS https://tokenstats.ai/health
+docker compose logs -f tokenstats     # wait for "poll cycle complete", Ctrl-C
 ```
+
+Verify from anywhere:
+
+```bash
+curl -s https://tokenstats.ai/health | jq '{status, reasons: .feed.reasons, quotes, sources: (.feed.sources | keys)}'
+```
+
+`status` should reach `ok` within a minute or two; `degraded` lists its `reasons`.
+
+**Rollback:** `git checkout <sha from step 1> && docker compose --profile proxy up -d --build`. Schema changes are additive (new columns/tables are created on open and ignored by older builds), so the DB doesn't need restoring. Restore `/root/ts-backup` into the volume only if the data itself is bad.
+
+**Expect the board to shrink after upgrading from a pre-#1 build** (before Oct 2026): quotes from delisted models and long-dead nodes are dropped on the first cycle (`--quote-ttl-secs`, default 24h). On tokenstats.ai this went from ~11k to ~8k quotes.
 
 Graceful restart only:
 
@@ -345,6 +387,7 @@ doctl compute droplet-action snapshot tokenstats --snapshot-name tokenstats-$(da
 | `TOKENSTATS_DB` | container | `/data/tokenstats.db` |
 | `TOKENSTATS_POLL_INTERVAL_SECS` | compose | `60` |
 | `RUST_LOG` | compose | `info,tokenstats=info,...` |
+| `TOKENSTATS_PUBLISH_PORT` | `.env` / compose | `127.0.0.1:8080` in `env.example` (compose falls back to public `8080` if unset) |
 
 App CLI/env details: [USAGE.md](./USAGE.md).
 
@@ -359,6 +402,9 @@ App CLI/env details: [USAGE.md](./USAGE.md).
 | OOM on build | Use `s-1vcpu-2gb` or build on a larger machine and `docker save` / `load` |
 | Permission on `/data` | Volume should be owned by uid 10001 inside container (image sets this) |
 | Stale binary | `docker compose build --no-cache tokenstats && docker compose --profile proxy up -d` |
+| `:8080` reachable from the internet | Docker bypasses UFW: set `TOKENSTATS_PUBLISH_PORT=127.0.0.1:8080` in `.env`, `docker compose --profile proxy up -d`, and add the cloud firewall (§2) |
+| `doctl … firewall create` → 403 | Token lacks firewall write scope; see §2 |
+| `/health` `status` not `ok` | Read `.feed.reasons`; `down` = no catalog fetched recently (outbound HTTPS / DNS?) |
 
 Health:
 
@@ -373,11 +419,11 @@ curl -fsS https://$DOMAIN/api/quotes?limit=1 | jq
 
 1. `doctl auth init` / account OK  
 2. Create droplet (`docker-20-04`, `s-1vcpu-1gb` or `2gb`)  
-3. UFW: 22, 80, 443  
+3. Firewall: UFW 22/80/443 (delete marketplace 2375/2376 rules) **and** DO cloud firewall 22, 80, 443/tcp+udp  
 4. DNS A → Droplet IP  
 5. `git clone` → `/opt/tokenstats`  
-6. `.env` with `DOMAIN` (e.g. `tokenstats.ai` or `tokenta.pe`) + `ACME_EMAIL`
+6. `.env` with `DOMAIN` (e.g. `tokenstats.ai` or `tokenta.pe`) + `ACME_EMAIL` + `TOKENSTATS_PUBLISH_PORT=127.0.0.1:8080`
 7. `docker compose --profile proxy up -d --build`  
-8. `curl https://$DOMAIN/health`  
+8. `curl https://$DOMAIN/health` (expect `"status":"ok"`) and confirm `http://$DROPLET_IP:8080` is **not** reachable  
 
 That’s it — dashboard live with HTTPS, data on a Docker volume, redeploy with `git pull` + compose build.
