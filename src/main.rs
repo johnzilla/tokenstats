@@ -51,9 +51,8 @@ fn init_tracing(verbose: u8, json: bool, show_targets: bool) {
                 "info,tokenstats={level},tower_http=info,hyper=warn,reqwest=warn,nostr_sdk=warn,nostr_relay_pool=warn",
                 level = level.as_str().to_ascii_lowercase()
             ),
-            1 => format!(
-                "debug,tokenstats=debug,tower_http=info,hyper=warn,reqwest=warn,nostr_sdk=info"
-            ),
+            1 => "debug,tokenstats=debug,tower_http=info,hyper=warn,reqwest=warn,nostr_sdk=info"
+                .into(),
             _ => "trace".into(),
         };
         EnvFilter::new(base)

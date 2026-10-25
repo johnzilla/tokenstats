@@ -307,10 +307,7 @@ pub fn apply_preset(quotes: Vec<Quote>, preset: Preset) -> Vec<Quote> {
             v
         }
         Preset::LocalFirst => {
-            let mut v: Vec<_> = quotes
-                .into_iter()
-                .filter(|q| is_local_candidate(q))
-                .collect();
+            let mut v: Vec<_> = quotes.into_iter().filter(is_local_candidate).collect();
             v.sort_by(|a, b| a.model.cmp(&b.model));
             v
         }

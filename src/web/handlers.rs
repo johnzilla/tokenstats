@@ -323,13 +323,13 @@ pub async fn dashboard(
                       <td><span class="family">{family}</span></td>
                       <td>
                         <strong class="model-id">{model}</strong>
-                        <div class="sub muted">{updated}</div>
+                        <div class="sub muted">updated {updated}</div>
                       </td>
                       <td>
                         <div class="num stack-price">{blend}</div>
                         <div class="sub node-name">{node}</div>
                       </td>
-                      <td class="num muted">{io}</td>
+                      <td class="num muted">{io_in}/{io_out}</td>
                       <td><span class="src src-{source}">{source}</span></td>
                       <td>{delta}</td>
                       <td class="actions-cell">{actions}</td>
@@ -337,14 +337,11 @@ pub async fn dashboard(
                     attrs = quote_data_attrs(b.quote),
                     family = esc(b.family),
                     model = esc(&b.quote.model),
-                    updated = format!("updated {}", b.quote.observed_at.format("%H:%M:%S UTC")),
+                    updated = b.quote.observed_at.format("%H:%M:%S UTC"),
                     blend = fmt_usd(Some(b.blended_usd)),
                     node = esc(&node_label),
-                    io = format!(
-                        "{}/{}",
-                        fmt_usd(b.quote.price_in_usd),
-                        fmt_usd(b.quote.price_out_usd)
-                    ),
+                    io_in = fmt_usd(b.quote.price_in_usd),
+                    io_out = fmt_usd(b.quote.price_out_usd),
                     source = esc(&b.quote.source),
                     delta = fmt_delta(d),
                     actions = row_actions_html(),
@@ -1131,7 +1128,7 @@ fn filter_quotes(quotes: Vec<Quote>, q: &QuotesQuery, ctx: &QuoteCtx) -> Vec<Quo
 
 fn fmt_usd(v: Option<f64>) -> String {
     match v {
-        Some(x) if x == 0.0 => "free".into(),
+        Some(0.0) => "free".into(),
         Some(x) if x < 0.01 => format!("${x:.6}"),
         Some(x) => format!("${x:.4}"),
         None => "—".into(),
@@ -1140,7 +1137,7 @@ fn fmt_usd(v: Option<f64>) -> String {
 
 fn fmt_sats(v: Option<f64>) -> String {
     match v {
-        Some(x) if x == 0.0 => "0".into(),
+        Some(0.0) => "0".into(),
         Some(x) if x < 1.0 => format!("{x:.3}"),
         Some(x) => format!("{x:.1}"),
         None => "—".into(),
