@@ -179,6 +179,7 @@ pub struct EndpointStats {
 impl EndpointStats {
     /// Reliability always comes from catalog polls (that is what keeps quotes
     /// fresh); latency prefers the lighter `/v1/info` probe.
+    #[cfg(test)]
     pub fn from_buckets(
         catalog: Option<&VecDeque<HourBucket>>,
         probe: Option<&VecDeque<HourBucket>>,
@@ -189,12 +190,24 @@ impl EndpointStats {
         let day = Window::over(catalog.unwrap_or(&empty), now_hour, 24);
         let week = Window::over(catalog.unwrap_or(&empty), now_hour, HISTORY_HOURS);
         let probe_day = Window::over(probe.unwrap_or(&empty), now_hour, 24);
+        Self::from_windows(&day, &week, &probe_day, reliability_1h)
+    }
+
+    /// Build from precomputed windows, so callers can read each history map
+    /// under its own lock. Reliability comes from catalog polls (that is what
+    /// keeps quotes fresh); latency prefers the lighter `/v1/info` probe.
+    pub fn from_windows(
+        day: &Window,
+        week: &Window,
+        probe_day: &Window,
+        reliability_1h: Option<f64>,
+    ) -> Self {
         let (lat, source) = if probe_day.percentile(0.5).is_some() {
-            (&probe_day, Some("probe"))
+            (probe_day, Some("probe"))
         } else if day.percentile(0.5).is_some() {
-            (&day, Some("catalog"))
+            (day, Some("catalog"))
         } else {
-            (&day, None)
+            (day, None)
         };
         Self {
             reliability_1h,

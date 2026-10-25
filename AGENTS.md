@@ -39,7 +39,7 @@ Do not invent parallel crates or a workspace unless asked. Keep the binary singl
 - Errors: `anyhow` at boundaries; avoid panics in request paths.
 - Logging: `tracing` with module targets; `--log-json` for containers.
 - Async: Tokio `full`; background work via `tokio::spawn` + `CancellationToken`.
-- Shared state: `Arc<Store>` with internal `RwLock`s.
+- Shared state: `Arc<Store>` with internal `RwLock`s. Never hold one `Store` lock while taking another (read, release, then lock the next); see the comment on `Store`.
 
 ### Config
 
@@ -109,8 +109,8 @@ GET /api/quotes?source=&model=&kind=&preset=&ratio=&limit=&max_age_secs=&min_rel
 |-------------|------|---------|-------------|
 | `source` | string | (all) | Exact source match (case-insensitive), comma-separated for several: `openrouter`, `orcarouter`, `routstr,nostr` |
 | `kind` | string | (all) | Model kind(s), comma-separated: `chat`, `embedding`, `image`, `audio`, `rerank`, `other` |
-| `max_age_secs` | int | (none) | Only quotes with `age_secs` ≤ this |
-| `min_reliability` | float | (none) | Only quotes whose endpoint's 1h success rate ≥ this (0–1). Quotes with no poll history are **excluded** |
+| `max_age_secs` | int | (none) | Only quotes with `age_secs` ≤ this. Negative = no filter |
+| `min_reliability` | float | (none) | Only quotes whose endpoint's 1h success rate ≥ this (0–1). Quotes with no poll history are **excluded**. ≤ 0 / NaN = no filter; > 1 clamps to 1 |
 | `min_reliability_24h` | float | (none) | Same over 24h (hourly buckets, survives restarts). Steadier than 1h for routing |
 | `max_latency_ms` | int | (none) | Only quotes whose endpoint's 24h p50 response time ≤ this. No latency samples → **excluded** |
 | `exclude_stale` | bool | off | `1`/`true` hides quotes with `stale: true` |
@@ -171,7 +171,7 @@ Empty store / no matches → `[]`.
 | `latency_source` | string \| null | `probe` \| `catalog` \| null (no samples) |
 | `identity_verified` | bool \| null | Node's `/v1/info` `npub` matches the Nostr key that announced it. `false` = mismatch or unparsable npub; null = nothing to compare (reference catalogs, `--node` seeds, not probed since restart) |
 | `onion` | string \| null | Node's onion address, from the announcement or `/v1/info` |
-| `outlier` | bool | Blend is >10× above or below the median for the same model id across ≥3 quotes. Low outliers often mean a unit bug on the node |
+| `outlier` | bool | Blend is >10× above or below the median for the same model id across ≥3 quotes. Low outliers often mean a unit bug on the node. Computed with the request's `ratio`, so the flag can change with `ratio` |
 
 #### Example
 

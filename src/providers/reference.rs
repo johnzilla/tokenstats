@@ -4,10 +4,9 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 
-use crate::pricing::CatalogHint;
 use crate::store::Quote;
 
-use super::catalog::parse_models_payload_with_hint;
+use super::catalog::parse_models_payload;
 
 /// One centralized catalog. `source` doubles as `provider_id` on its quotes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +53,7 @@ pub async fn fetch_quotes(
 
 fn quotes_from_payload(body: &serde_json::Value, cat: &ReferenceCatalog) -> Vec<Quote> {
     let now = Utc::now();
-    parse_models_payload_with_hint(body, CatalogHint::OpenRouter)
+    parse_models_payload(body)
         .into_iter()
         .map(|m| {
             let prices = m.prices;

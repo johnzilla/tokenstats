@@ -240,7 +240,7 @@ When the **proxy** profile is up, Caddy listens on 80/443 and proxies to `tokens
 
 ### 4b. App only (HTTP on :8080, no TLS yet)
 
-For a quick IP smoke test, set `TOKENSTATS_PUBLISH_PORT=8080` in `.env` (public), and switch it back to `127.0.0.1:8080` once Caddy is up.
+The app publishes on localhost only by default. For a quick IP smoke test, set `TOKENSTATS_PUBLISH_PORT=8080` in `.env` (public), and remove it once Caddy is up.
 
 ```bash
 docker compose up -d --build
@@ -388,7 +388,7 @@ doctl compute droplet-action snapshot tokenstats --snapshot-name tokenstats-$(da
 | `TOKENSTATS_POLL_INTERVAL_SECS` | compose | `60` |
 | `RUST_LOG` | compose | `info,tokenstats=info,...` |
 | `TOKENSTATS_PLAUSIBLE_SCRIPT` | `.env` / compose | unset = no analytics; set the site's `https://plausible.io/js/pa-….js` to enable |
-| `TOKENSTATS_PUBLISH_PORT` | `.env` / compose | `127.0.0.1:8080` in `env.example` (compose falls back to public `8080` if unset) |
+| `TOKENSTATS_PUBLISH_PORT` | `.env` / compose | `127.0.0.1:8080` (compose default and `env.example`); set `8080` only for a public IP smoke test |
 
 App CLI/env details: [USAGE.md](./USAGE.md).
 

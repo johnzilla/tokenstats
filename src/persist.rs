@@ -39,6 +39,7 @@ impl Db {
             "
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
+            PRAGMA busy_timeout = 5000;
             CREATE TABLE IF NOT EXISTS quotes (
                 key TEXT PRIMARY KEY,
                 source TEXT NOT NULL,

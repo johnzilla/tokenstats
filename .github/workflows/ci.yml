@@ -1,5 +1,6 @@
-# Tests every PR and push to main. Mirrors arbstr's `test` job; image
-# publishing is not set up here yet.
+# Tests every PR and push to main. Mirrors arbstr's `test` job and builds the
+# Docker image (not pushed). Image publishing / releases are not set up yet:
+# tokenstats.ai builds on the Droplet (docs/DEPLOY.md).
 name: CI
 
 on:
@@ -43,3 +44,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.86
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets --locked
+
+  # The Dockerfile is what production builds; make sure it still does.
+  docker:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: tokenstats:ci
+          cache-from: type=gha,scope=docker
+          cache-to: type=gha,mode=max,scope=docker
+      - name: Smoke test the image
+        run: |
+          docker run -d --name ts -p 127.0.0.1:8080:8080 tokenstats:ci serve --no-nostr --no-poll --no-oracle --no-persist
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8080/health && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8080/health | grep -q '"ok":true'
+          curl -fsSI http://127.0.0.1:8080/ | grep -qi '^content-security-policy:'
+          docker stop ts

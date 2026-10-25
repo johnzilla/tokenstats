@@ -97,15 +97,6 @@ impl NormalizedPrices {
     }
 }
 
-/// Hint for unit classification when a field is ambiguous.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CatalogHint {
-    /// Prefer OpenRouter USD-per-token interpretation for `pricing`.
-    OpenRouter,
-    /// Prefer dual fill: USD from `pricing`, sats from `sats_pricing`.
-    Routstr,
-}
-
 /// Threshold below which a raw `pricing.*` value is treated as **USD per token**
 /// (OpenRouter style). At/above this, treat as already **per 1M** (USD or sats).
 ///
@@ -131,7 +122,6 @@ pub fn normalize_catalog_prices(
     sats_completion: Option<f64>,
     input_cost: Option<f64>,
     output_cost: Option<f64>,
-    _hint: CatalogHint,
 ) -> NormalizedPrices {
     let pricing_prompt = sanitize_opt(pricing_prompt);
     let pricing_completion = sanitize_opt(pricing_completion);
@@ -284,15 +274,7 @@ mod tests {
 
     #[test]
     fn openrouter_usd_per_token_to_mtok() {
-        let n = normalize_catalog_prices(
-            Some(0.000001),
-            Some(0.000002),
-            None,
-            None,
-            None,
-            None,
-            CatalogHint::OpenRouter,
-        );
+        let n = normalize_catalog_prices(Some(0.000001), Some(0.000002), None, None, None, None);
         assert!((n.price_in_usd.unwrap() - 1.0).abs() < 1e-9);
         assert!((n.price_out_usd.unwrap() - 2.0).abs() < 1e-9);
         assert_eq!(n.price_in_sats, None);
@@ -309,7 +291,6 @@ mod tests {
             Some(0.0895),
             None,
             None,
-            CatalogHint::Routstr,
         );
         assert!((n.price_in_usd.unwrap() - 11.5).abs() < 1e-9);
         assert!((n.price_out_usd.unwrap() - 57.5).abs() < 1e-9);
@@ -320,15 +301,7 @@ mod tests {
 
     #[test]
     fn sats_only_catalog() {
-        let n = normalize_catalog_prices(
-            None,
-            None,
-            Some(0.001),
-            Some(0.003),
-            None,
-            None,
-            CatalogHint::Routstr,
-        );
+        let n = normalize_catalog_prices(None, None, Some(0.001), Some(0.003), None, None);
         assert_eq!(n.price_in_usd, None);
         assert!((n.price_in_sats.unwrap() - 1000.0).abs() < 1e-6);
         assert!((n.price_out_sats.unwrap() - 3000.0).abs() < 1e-6);
@@ -338,45 +311,22 @@ mod tests {
     #[test]
     fn sats_already_per_mtok() {
         // Values ≥ 1 treated as sats/1M already
-        let n = normalize_catalog_prices(
-            None,
-            None,
-            Some(1500.0),
-            Some(4500.0),
-            None,
-            None,
-            CatalogHint::Routstr,
-        );
+        let n = normalize_catalog_prices(None, None, Some(1500.0), Some(4500.0), None, None);
         assert_eq!(n.price_in_sats, Some(1500.0));
         assert_eq!(n.price_out_sats, Some(4500.0));
     }
 
     #[test]
     fn usd_already_per_mtok() {
-        let n = normalize_catalog_prices(
-            Some(3.0),
-            Some(15.0),
-            None,
-            None,
-            None,
-            None,
-            CatalogHint::OpenRouter,
-        );
+        let n = normalize_catalog_prices(Some(3.0), Some(15.0), None, None, None, None);
         assert_eq!(n.price_in_usd, Some(3.0));
         assert_eq!(n.price_out_usd, Some(15.0));
     }
 
     #[test]
     fn dynamic_sentinel_clears_both_sides() {
-        let n = normalize_catalog_prices(
-            Some(-1.0),
-            Some(-1.0),
-            Some(-1.0),
-            Some(-1.0),
-            None,
-            None,
-            CatalogHint::Routstr,
-        );
+        let n =
+            normalize_catalog_prices(Some(-1.0), Some(-1.0), Some(-1.0), Some(-1.0), None, None);
         assert_eq!(n.primary, PricePrimary::None);
         assert_eq!(n.price_in_usd, None);
         assert_eq!(n.price_in_sats, None);
@@ -384,15 +334,7 @@ mod tests {
 
     #[test]
     fn free_zero_dual() {
-        let n = normalize_catalog_prices(
-            Some(0.0),
-            Some(0.0),
-            Some(0.0),
-            Some(0.0),
-            None,
-            None,
-            CatalogHint::Routstr,
-        );
+        let n = normalize_catalog_prices(Some(0.0), Some(0.0), Some(0.0), Some(0.0), None, None);
         assert_eq!(n.price_in_usd, Some(0.0));
         assert_eq!(n.price_out_sats, Some(0.0));
         assert_eq!(n.primary, PricePrimary::Both);

@@ -44,11 +44,28 @@ fn blocked_v4(ip: Ipv4Addr) -> Option<&'static str> {
 }
 
 fn blocked_v6(ip: Ipv6Addr) -> Option<&'static str> {
-    let first = ip.segments()[0];
+    let seg = ip.segments();
+    let first = seg[0];
+    let embedded_v4 = || {
+        Ipv4Addr::new(
+            (seg[6] >> 8) as u8,
+            seg[6] as u8,
+            (seg[7] >> 8) as u8,
+            seg[7] as u8,
+        )
+    };
     if ip.is_loopback() {
         Some("loopback")
     } else if ip.is_unspecified() {
         Some("unspecified")
+    } else if seg[..6] == [0; 6] {
+        // ::a.b.c.d, IPv4-compatible (RFC 4291 §2.5.5.1, deprecated): no
+        // defined routing, so never fetch it whatever it embeds.
+        Some("IPv4-compatible IPv6 (deprecated)")
+    } else if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] && blocked_v4(embedded_v4()).is_some() {
+        // NAT64 well-known prefix (RFC 6052): a local NAT64 gateway would
+        // forward to the embedded private IPv4 address.
+        Some("NAT64 to a non-public IPv4 address")
     } else if (first & 0xfe00) == 0xfc00 {
         Some("unique-local (fc00::/7)")
     } else if (first & 0xffc0) == 0xfe80 {
@@ -194,10 +211,20 @@ mod tests {
             "ff02::1",
             "::ffff:127.0.0.1",
             "::ffff:169.254.169.254",
+            "::127.0.0.1",
+            "::10.0.0.1",
+            "::8.8.8.8",
+            "64:ff9b::7f00:1",
+            "64:ff9b::a9fe:a9fe",
         ] {
             assert!(blocked(ip), "{ip} should be blocked");
         }
-        for ip in ["2606:4700::1111", "2001:4860:4860::8888", "::ffff:8.8.8.8"] {
+        for ip in [
+            "2606:4700::1111",
+            "2001:4860:4860::8888",
+            "::ffff:8.8.8.8",
+            "64:ff9b::808:808",
+        ] {
             assert!(!blocked(ip), "{ip} should be allowed");
         }
     }

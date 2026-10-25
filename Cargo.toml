@@ -15,9 +15,8 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # Web dashboard (lightweight Axum)
-axum = { version = "0.7", features = ["macros"] }
-tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+axum = "0.7"
+tower-http = { version = "0.6", features = ["trace"] }
 
 # Nostr (Routstr discovery / RIP-02 kind 38421)
 nostr-sdk = "0.30"
@@ -41,10 +40,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Errors
 anyhow = "1.0"
-thiserror = "2.0"
 
 # Persistence
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+# Router-level tests drive the axum app as a tower Service.
+tower = "0.5"
 
 [profile.release]
 # thin LTO + modest CGUs: good speed without OOM on 1–2GB build hosts
