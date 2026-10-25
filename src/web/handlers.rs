@@ -10,9 +10,12 @@ use serde::Deserialize;
 
 use super::feed::feed_status;
 use super::AppState;
-use crate::market::{apply_preset, best_now, blended_usd, delta_pct, Preset, DEFAULT_BLEND_RATIO};
+use crate::market::{
+    apply_preset, best_now, blended_usd, delta_pct, EndpointSignals, Preset, Signals,
+    DEFAULT_BLEND_RATIO,
+};
 use crate::pricing::{blend_sort_key, is_rankable_blend};
-use crate::store::{normalize_endpoint, EndpointStats, Quote};
+use crate::store::{normalize_endpoint, EndpointStats, ProbeStatus, Quote};
 
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let quotes = state.store.list_quotes();
@@ -143,7 +146,7 @@ fn resolve_view(all: Vec<Quote>, q: &QuotesQuery, ctx: &QuoteCtx) -> Vec<Quote> 
     let ratio = q.blend_ratio();
     let mut filtered = filter_quotes(all, q, ctx);
     if let Some(p) = q.preset() {
-        filtered = apply_preset(filtered, p);
+        filtered = apply_preset(filtered, p, &ctx.signals);
     } else {
         // Cheapest-first: free / missing / invalid blends sort last (not as −$1e6).
         filtered.sort_by(|a, b| {
@@ -182,6 +185,7 @@ pub async fn api_nodes(State(state): State<AppState>) -> impl IntoResponse {
         .map(|f| (f.endpoint.clone(), f))
         .collect();
     let stats = state.store.endpoint_stats();
+    let probes = state.store.probe_statuses();
     let nodes: Vec<_> = state
         .store
         .list_nodes()
@@ -195,6 +199,23 @@ pub async fn api_nodes(State(state): State<AppState>) -> impl IntoResponse {
                 if let Ok(serde_json::Value::Object(fields)) = serde_json::to_value(st) {
                     obj.extend(fields);
                 }
+                let probe = probes.get(&key);
+                obj.insert(
+                    "identity_verified".into(),
+                    serde_json::json!(probe.and_then(|p| p.identity_verified)),
+                );
+                obj.insert(
+                    "probe".into(),
+                    serde_json::json!(probe.map(|p| serde_json::json!({
+                        "probed_at": p.probed_at,
+                        "ok": p.ok,
+                        "error": p.error,
+                    }))),
+                );
+                obj.insert(
+                    "info".into(),
+                    serde_json::json!(probe.and_then(|p| p.info.clone())),
+                );
                 obj.insert(
                     "last_success_at".into(),
                     serde_json::json!(fetch.and_then(|f| f.last_success_at)),
@@ -264,13 +285,13 @@ pub async fn export_csv(State(state): State<AppState>, Query(q): Query<QuotesQue
         "source,provider,provider_id,model,price_in_usd,price_out_usd,blended_usd,blend_ratio,\
          price_in_sats,price_out_sats,delta_out_pct,endpoint,region,context_length,observed_at,\
          kind,age_secs,stale,reliability_1h,outlier,reliability_24h,reliability_7d,\
-         latency_p50_ms,latency_p95_ms\n",
+         latency_p50_ms,latency_p95_ms,latency_source,identity_verified\n",
     );
     for quote in quotes.into_iter().take(limit) {
         let blend = blended_usd(quote.price_in_usd, quote.price_out_usd, ratio);
         let d = delta_pct(quote.price_out_usd, quote.prev_price_out_usd);
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             csv_cell(&quote.source),
             csv_cell(&quote.provider),
             csv_cell(&quote.provider_id),
@@ -298,6 +319,12 @@ pub async fn export_csv(State(state): State<AppState>, Query(q): Query<QuotesQue
             opt_f(ctx.stats(&quote).and_then(|s| s.reliability_7d)),
             opt_u(ctx.stats(&quote).and_then(|s| s.latency_p50_ms)),
             opt_u(ctx.stats(&quote).and_then(|s| s.latency_p95_ms)),
+            ctx.stats(&quote)
+                .and_then(|s| s.latency_source)
+                .unwrap_or_default(),
+            ctx.identity_verified(&quote)
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
         ));
     }
 
@@ -390,6 +417,7 @@ pub async fn dashboard(
     };
 
     let node_stats = state.store.endpoint_stats();
+    let node_probes = state.store.probe_statuses();
     let node_rows: String = if nodes.is_empty() {
         r#"<tr><td colspan="7" class="empty">No Routstr nodes discovered yet (kind 38421)…</td></tr>"#
             .into()
@@ -440,7 +468,14 @@ pub async fn dashboard(
                             .map(|ms| format!("{ms} ms"))
                             .unwrap_or_else(|| "—".into()),
                     },
-                    via = esc(&n.discovered_via),
+                    via = esc(&match node_probes
+                        .get(&normalize_endpoint(&n.endpoint))
+                        .and_then(|p| p.identity_verified)
+                    {
+                        Some(true) => format!("{} · id ✓", n.discovered_via),
+                        Some(false) => format!("{} · id ✗", n.discovered_via),
+                        None => n.discovered_via.clone(),
+                    }),
                 )
             })
             .collect()
@@ -773,7 +808,7 @@ pub async fn dashboard(
     </tbody>
   </table>
 
-  <h2>Nodes <span class="hint">reliability = successful polls / total (last hour; hover for 24h / 7d) · latency = catalog fetch, 24h</span></h2>
+  <h2>Nodes <span class="hint">reliability = successful polls / total (last hour; hover for 24h / 7d) · latency = /v1/info probe (else catalog fetch), 24h · id ✓ = /v1/info npub matches the announcing key</span></h2>
   <table>
     <thead>
       <tr>
@@ -999,6 +1034,12 @@ struct QuoteCtx {
     ratio: f64,
     /// Normalized endpoint → reliability windows + latency.
     stats: HashMap<String, EndpointStats>,
+    /// Normalized endpoint → latest `/v1/info` probe.
+    probes: HashMap<String, ProbeStatus>,
+    /// Normalized endpoint → onion address (announcement or `/v1/info`).
+    onions: HashMap<String, String>,
+    /// What presets rank on (derived from the three maps above).
+    signals: Signals,
     /// Lowercased model id → median rankable blend across all quotes.
     medians: HashMap<String, f64>,
 }
@@ -1029,11 +1070,47 @@ impl QuoteCtx {
                 (k, m)
             })
             .collect();
+        let stats = state.store.endpoint_stats();
+        let probes = state.store.probe_statuses();
+        let onions: HashMap<String, String> = state
+            .store
+            .list_nodes()
+            .into_iter()
+            .filter_map(|n| {
+                let key = normalize_endpoint(&n.endpoint);
+                let probed = probes
+                    .get(&key)
+                    .and_then(|p| p.info.as_ref())
+                    .and_then(|i| i.onion_url.clone());
+                n.onion
+                    .filter(|o| !o.is_empty())
+                    .or(probed)
+                    .map(|o| (key, o))
+            })
+            .collect();
+        let mut keys: Vec<&String> = stats.keys().chain(probes.keys()).collect();
+        keys.extend(onions.keys());
+        let signals = keys
+            .into_iter()
+            .map(|k| {
+                let st = stats.get(k);
+                let sig = EndpointSignals {
+                    latency_p50_ms: st.and_then(|s| s.latency_p50_ms),
+                    reliability_24h: st.and_then(|s| s.reliability_24h),
+                    onion: onions.contains_key(k),
+                    identity_verified: probes.get(k).and_then(|p| p.identity_verified),
+                };
+                (k.clone(), sig)
+            })
+            .collect();
         Self {
             now: Utc::now(),
             stale_after_secs: state.stale_after.as_secs() as i64,
             ratio,
-            stats: state.store.endpoint_stats(),
+            stats,
+            probes,
+            onions,
+            signals,
             medians,
         }
     }
@@ -1048,6 +1125,18 @@ impl QuoteCtx {
 
     fn stats(&self, q: &Quote) -> Option<&EndpointStats> {
         self.stats.get(&normalize_endpoint(q.endpoint.as_deref()?))
+    }
+
+    fn endpoint_key(q: &Quote) -> Option<String> {
+        q.endpoint.as_deref().map(normalize_endpoint)
+    }
+
+    fn identity_verified(&self, q: &Quote) -> Option<bool> {
+        self.probes.get(&Self::endpoint_key(q)?)?.identity_verified
+    }
+
+    fn onion(&self, q: &Quote) -> Option<&String> {
+        self.onions.get(&Self::endpoint_key(q)?)
     }
 
     fn reliability(&self, q: &Quote) -> Option<f64> {
@@ -1114,6 +1203,9 @@ fn enrich_json(q: &Quote, ctx: &QuoteCtx) -> serde_json::Value {
         "reliability_7d": ctx.stats(q).and_then(|s| s.reliability_7d),
         "latency_p50_ms": ctx.stats(q).and_then(|s| s.latency_p50_ms),
         "latency_p95_ms": ctx.stats(q).and_then(|s| s.latency_p95_ms),
+        "latency_source": ctx.stats(q).and_then(|s| s.latency_source),
+        "identity_verified": ctx.identity_verified(q),
+        "onion": ctx.onion(q),
         "outlier": ctx.is_outlier(q),
     })
 }
@@ -1385,6 +1477,8 @@ mod tests {
         let v = enrich_json(&all[1], &ctx);
         assert_eq!(v["reliability_24h"], 0.5);
         assert_eq!(v["latency_p50_ms"], 3150);
+        assert_eq!(v["latency_source"], "catalog");
+        assert_eq!(v["identity_verified"], serde_json::Value::Null);
     }
 
     #[test]

@@ -90,7 +90,11 @@ Nostr announcements are unauthenticated, so by default tokenstats **never reques
 
 Every catalog fetch (reference catalogs and Routstr nodes) is recorded twice: as a raw sample for `reliability_1h`, and in an hourly bucket kept for 7 days and saved to SQLite (`endpoint_hours`). From the buckets tokenstats serves `reliability_24h`, `reliability_7d`, and 24h `latency_p50_ms` / `latency_p95_ms` on quotes, nodes and CSV.
 
-Latency is the catalog-fetch response time, bucketed into ~25% bins (the value is the bin's upper edge). It measures how responsive an endpoint is, not inference speed. Filter with `min_reliability_24h=0.9` and `max_latency_ms=500`.
+Each cycle also sends every Routstr node a cheap `GET /v1/info` probe, in parallel with its catalog fetch and through the same private-address guard. Probe response times have their own history (`endpoint_probe_hours`) and are preferred for latency; `latency_source` says which was used (`probe` or `catalog`). Probes never count toward reliability.
+
+Latency values are bucketed into ~25% bins (the value is the bin's upper edge). They measure how responsive an endpoint is, not inference speed. Filter with `min_reliability_24h=0.9` and `max_latency_ms=500`.
+
+The probe also returns what the node says about itself (`name`, `version`, `npub`, `mints`, `onion_url`). `identity_verified` is `true` when its `npub` matches the Nostr key that announced it. Probe details and identity are kept in memory and refresh within a cycle after restart.
 
 ### Feed health
 
@@ -133,8 +137,10 @@ where \(r\) is the output:input ratio (2, 3, or 4). Default \(r = 3\) (1:3 in:ou
 | Preset | Intent |
 |--------|--------|
 | **Cheapest Frontier** | Popular frontier families, non-free, sorted by blend |
-| **Fastest** | Name heuristics (`flash`, `mini`, `turbo`, `haiku`, …) |
-| **Most Private** | Routstr/Nostr/onion/localhost endpoints |
+| **Fastest** | Fast model classes by name (`flash`, `mini`, `turbo`, `haiku`, …), ranked by measured endpoint latency (reliable ≥90% / 24h first) |
+| **Most Private** | Routstr/Nostr/onion/localhost endpoints; onion first, then identity-verified nodes; drops nodes below 50% 24h reliability |
+
+Presets run after the other filters, so combine them with `kind=chat` to keep embedding models out.
 | **Local-first** | Ollama, vLLM, localhost, free local-style rows |
 
 ### Copy curl / OpenAI config

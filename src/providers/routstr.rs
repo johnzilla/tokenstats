@@ -1,4 +1,5 @@
-//! Poll a Routstr-compatible node: GET {endpoint}/v1/models
+//! Poll a Routstr-compatible node: GET {endpoint}/v1/models, plus a cheap
+//! GET {endpoint}/v1/info probe for latency and self-reported identity.
 
 use std::time::Duration;
 
@@ -7,7 +8,7 @@ use chrono::Utc;
 use tracing::debug;
 
 use crate::pricing::CatalogHint;
-use crate::store::{ProviderNode, Quote};
+use crate::store::{NodeInfo, ProviderNode, Quote};
 
 use super::catalog::parse_models_payload_with_hint;
 use super::netguard;
@@ -42,17 +43,65 @@ impl NodeFetcher {
     }
 
     /// Fetch a node's catalog, or fail with [`Blocked`] without sending a request.
+    #[cfg(test)]
     pub async fn fetch(&self, node: &ProviderNode) -> Result<(Vec<Quote>, u64)> {
+        fetch_node_quotes(self.client_for(node).await?, node).await
+    }
+
+    /// Catalog fetch and `/v1/info` probe side by side, each within `timeout`.
+    /// [`Blocked`] means neither request was sent.
+    pub async fn poll(&self, node: &ProviderNode, timeout: Duration) -> Result<NodePoll, Blocked> {
+        let client = self.client_for(node).await?;
+        let budget = |what: &'static str| {
+            move || anyhow::anyhow!("{what} timed out after {}s", timeout.as_secs())
+        };
+        let (catalog, info) = tokio::join!(
+            tokio::time::timeout(timeout, fetch_node_quotes(client, node)),
+            tokio::time::timeout(timeout, fetch_node_info(client, node)),
+        );
+        Ok(NodePoll {
+            catalog: catalog.unwrap_or_else(|_| Err(budget("catalog")())),
+            info: info.unwrap_or_else(|_| Err(budget("info probe")())),
+        })
+    }
+
+    async fn client_for(&self, node: &ProviderNode) -> Result<&reqwest::Client, Blocked> {
         match &self.guarded {
             Some(guarded) if node.discovered_via != "cli" => {
-                if let Err(reason) = netguard::check_endpoint(&node.endpoint).await {
-                    return Err(Blocked(reason).into());
-                }
-                fetch_node_quotes(guarded, node).await
+                netguard::check_endpoint(&node.endpoint)
+                    .await
+                    .map_err(Blocked)?;
+                Ok(guarded)
             }
-            _ => fetch_node_quotes(&self.open, node).await,
+            _ => Ok(&self.open),
         }
     }
+}
+
+/// Results of one node poll: `(quotes, latency_ms)` and `(info, latency_ms)`.
+pub struct NodePoll {
+    pub catalog: Result<(Vec<Quote>, u64)>,
+    pub info: Result<(NodeInfo, u64)>,
+}
+
+async fn fetch_node_info(client: &reqwest::Client, node: &ProviderNode) -> Result<(NodeInfo, u64)> {
+    let base = node.endpoint.trim_end_matches('/');
+    let url = if base.ends_with("/v1") {
+        format!("{base}/info")
+    } else {
+        format!("{base}/v1/info")
+    };
+    let started = std::time::Instant::now();
+    let body = try_fetch(client, &url).await?;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    let mut info: NodeInfo =
+        serde_json::from_value(body).with_context(|| format!("info shape {url}"))?;
+    for field in [&mut info.npub, &mut info.onion_url, &mut info.version] {
+        if field.as_deref().is_some_and(|v| v.trim().is_empty()) {
+            *field = None;
+        }
+    }
+    Ok((info, latency_ms))
 }
 
 async fn fetch_node_quotes(
@@ -201,6 +250,38 @@ mod tests {
             assert!(hit);
             assert_eq!(res.unwrap().0.len(), 1, "{via}");
         }
+    }
+
+    #[tokio::test]
+    async fn poll_of_blocked_node_sends_nothing() {
+        let (url, listener) = listen().await;
+        let f = fetcher(false);
+        let n = node(&url, "nostr:38421");
+        let (res, hit) = tokio::join!(
+            f.poll(&n, Duration::from_secs(1)),
+            answer_once(&listener, MODELS)
+        );
+        assert!(res.is_err());
+        assert!(!hit, "guard must not connect");
+    }
+
+    #[tokio::test]
+    async fn info_probe_parses_live_shape() {
+        let body = r#"{"name":"ARoutstrNode","description":"A Routstr Node","version":"0.5.0","npub":"npub10m73mluxnyw0v3y8szph5mrdh0mehwdcpk79ked3vvv37pzrkknshfwwd3","mints":["https://mint.minibits.cash/Bitcoin"],"http_url":"https://app.chatstr.ai","onion_url":""}"#;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (url, listener) = listen().await;
+        let n = node(&url, "cli");
+        let client = reqwest::Client::new();
+        let (res, hit) = tokio::join!(fetch_node_info(&client, &n), answer_once(&listener, &resp));
+        assert!(hit);
+        let (info, _) = res.unwrap();
+        assert_eq!(info.version.as_deref(), Some("0.5.0"));
+        assert_eq!(info.mints.len(), 1);
+        assert_eq!(info.onion_url, None, "empty onion_url becomes None");
+        assert!(info.npub.unwrap().starts_with("npub1"));
     }
 
     #[tokio::test]

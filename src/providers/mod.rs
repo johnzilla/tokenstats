@@ -142,10 +142,15 @@ async fn poll_once(
         let timeout = cfg.node_timeout;
         tasks.spawn(async move {
             let _permit = sem.acquire_owned().await;
-            let res = match tokio::time::timeout(timeout, nodes.fetch(&node)).await {
-                Ok(r) => r,
-                Err(_) => Err(anyhow::anyhow!("timed out after {}s", timeout.as_secs())),
-            };
+            // poll() bounds each request; this only guards the address check.
+            let res = tokio::time::timeout(timeout * 2, nodes.poll(&node, timeout))
+                .await
+                .unwrap_or_else(|_| {
+                    Ok(routstr::NodePoll {
+                        catalog: Err(anyhow::anyhow!("timed out after {}s", timeout.as_secs())),
+                        info: Err(anyhow::anyhow!("timed out after {}s", timeout.as_secs())),
+                    })
+                });
             (node, res)
         });
     }
@@ -155,17 +160,29 @@ async fn poll_once(
         let Ok((node, res)) = joined else {
             continue;
         };
-        let blocked = res
-            .as_ref()
-            .err()
-            .and_then(|e| e.downcast_ref::<routstr::Blocked>());
-        store.set_node_skip_reason(&node.endpoint, blocked.map(|b| b.0.clone()));
-        if blocked.is_some() {
-            // Never requested: no reliability sample, no catalog change.
-            nodes_blocked += 1;
-            continue;
-        }
-        match res {
+        let poll = match res {
+            Ok(poll) => {
+                store.set_node_skip_reason(&node.endpoint, None);
+                poll
+            }
+            Err(blocked) => {
+                // Never requested: no reliability sample, no catalog change.
+                store.set_node_skip_reason(&node.endpoint, Some(blocked.0));
+                nodes_blocked += 1;
+                continue;
+            }
+        };
+        store.record_probe(
+            &node.endpoint,
+            poll.info
+                .map(|(info, ms)| {
+                    let verified =
+                        crate::nostr::same_pubkey(node.pubkey.as_deref(), info.npub.as_deref());
+                    (info, ms, verified)
+                })
+                .map_err(|e| format!("{e:#}")),
+        );
+        match poll.catalog {
             Ok((quotes, latency_ms)) => {
                 nodes_ok += 1;
                 let n = quotes.len();

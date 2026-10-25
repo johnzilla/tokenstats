@@ -73,6 +73,48 @@ pub struct ProviderNode {
     pub skip_reason: Option<String>,
 }
 
+/// Subset of a Routstr node's `GET /v1/info`, as self-reported by the node.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, serde::Deserialize)]
+pub struct NodeInfo {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub npub: Option<String>,
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub mints: Vec<String>,
+    #[serde(default)]
+    pub onion_url: Option<String>,
+}
+
+fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    use serde::Deserialize;
+    Ok(Option::<Vec<String>>::deserialize(d)?.unwrap_or_default())
+}
+
+/// Latest `/v1/info` probe of one node endpoint.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProbeStatus {
+    pub probed_at: DateTime<Utc>,
+    pub ok: bool,
+    pub error: Option<String>,
+    /// Last successful response (kept across later failures).
+    pub info: Option<NodeInfo>,
+    /// Does the node's `npub` match the Nostr key that announced it?
+    /// `None` when either side is missing (e.g. `--node` seeds).
+    pub identity_verified: Option<bool>,
+}
+
+/// Which hourly history a poll sample belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stream {
+    /// `/models` catalog fetches (reliability + fallback latency).
+    Catalog,
+    /// `/v1/info` probes (preferred latency).
+    Probe,
+}
+
 /// Outcome of the latest catalog fetch for one provider endpoint.
 #[derive(Debug, Clone, Serialize)]
 pub struct FetchStatus {
@@ -116,6 +158,10 @@ pub struct Store {
     poll_history: RwLock<HashMap<String, VecDeque<PollSample>>>,
     /// Hourly buckets per endpoint (7 days) for 24h/7d reliability + latency.
     hourly: RwLock<HashMap<String, VecDeque<HourBucket>>>,
+    /// Hourly `/v1/info` probe buckets per endpoint (latency).
+    probe_hourly: RwLock<HashMap<String, VecDeque<HourBucket>>>,
+    /// Latest probe per endpoint (not persisted; refreshed every cycle).
+    probes: RwLock<HashMap<String, ProbeStatus>>,
     /// Last known BTC/USD rate for sats conversion.
     btc_usd: RwLock<Option<f64>>,
     /// Latest fetch outcome per `{source}|{endpoint}`.
@@ -406,6 +452,7 @@ impl Store {
     pub fn endpoint_stats(&self) -> HashMap<String, EndpointStats> {
         let now_hour = history::hour_of(Utc::now());
         let raw = self.poll_history.read().ok();
+        let probe = self.probe_hourly.read().ok();
         let Ok(hourly) = self.hourly.read() else {
             return HashMap::new();
         };
@@ -413,21 +460,33 @@ impl Store {
         if let Some(raw) = raw.as_ref() {
             keys.extend(raw.keys());
         }
+        if let Some(probe) = probe.as_ref() {
+            keys.extend(probe.keys());
+        }
         keys.into_iter()
             .map(|k| {
                 let rel_1h = raw.as_ref().and_then(|r| {
                     let (rel, _, total, _) = reliability_from_samples(r.get(k));
                     (total > 0).then_some(rel)
                 });
-                let stats = EndpointStats::from_buckets(hourly.get(k), rel_1h, now_hour);
+                let stats = EndpointStats::from_buckets(
+                    hourly.get(k),
+                    probe.as_ref().and_then(|p| p.get(k)),
+                    rel_1h,
+                    now_hour,
+                );
                 (k.clone(), stats)
             })
             .collect()
     }
 
     /// Hourly buckets at or after `since_hour` (all when `None`), for persistence.
-    pub fn hourly_snapshot(&self, since_hour: Option<i64>) -> Vec<(String, HourBucket)> {
-        let Ok(hourly) = self.hourly.read() else {
+    pub fn hourly_snapshot(
+        &self,
+        stream: Stream,
+        since_hour: Option<i64>,
+    ) -> Vec<(String, HourBucket)> {
+        let Ok(hourly) = self.hourly_for(stream).read() else {
             return Vec::new();
         };
         hourly
@@ -442,9 +501,9 @@ impl Store {
     }
 
     /// Restore hourly buckets (startup); expired hours are dropped.
-    pub fn load_hourly(&self, rows: Vec<(String, HourBucket)>) {
+    pub fn load_hourly(&self, stream: Stream, rows: Vec<(String, HourBucket)>) {
         let now_hour = history::hour_of(Utc::now());
-        let Ok(mut hourly) = self.hourly.write() else {
+        let Ok(mut hourly) = self.hourly_for(stream).write() else {
             return;
         };
         for (endpoint, bucket) in rows {
@@ -458,6 +517,62 @@ impl Store {
             history::prune(buckets, now_hour);
         }
         hourly.retain(|_, b| !b.is_empty());
+    }
+
+    fn hourly_for(&self, stream: Stream) -> &RwLock<HashMap<String, VecDeque<HourBucket>>> {
+        match stream {
+            Stream::Catalog => &self.hourly,
+            Stream::Probe => &self.probe_hourly,
+        }
+    }
+
+    /// Record a `/v1/info` probe: `Ok((info, latency_ms, identity_verified))`
+    /// or `Err(message)`. Feeds probe latency history, not reliability.
+    pub fn record_probe(
+        &self,
+        endpoint: &str,
+        outcome: Result<(NodeInfo, u64, Option<bool>), String>,
+    ) {
+        let key = normalize_endpoint(endpoint);
+        let now = Utc::now();
+        let (ok, latency) = match &outcome {
+            Ok((_, ms, _)) => (true, Some(*ms)),
+            Err(_) => (false, None),
+        };
+        if let Ok(mut hourly) = self.probe_hourly.write() {
+            history::record(
+                hourly.entry(key.clone()).or_default(),
+                history::hour_of(now),
+                ok,
+                latency,
+            );
+        }
+        let Ok(mut probes) = self.probes.write() else {
+            return;
+        };
+        let prev = probes.remove(&key);
+        let status = match outcome {
+            Ok((info, _, identity_verified)) => ProbeStatus {
+                probed_at: now,
+                ok: true,
+                error: None,
+                info: Some(info),
+                identity_verified,
+            },
+            Err(e) => ProbeStatus {
+                probed_at: now,
+                ok: false,
+                error: Some(e),
+                info: prev.as_ref().and_then(|p| p.info.clone()),
+                identity_verified: prev.and_then(|p| p.identity_verified),
+            },
+        };
+        probes.insert(key, status);
+    }
+
+    /// Latest probe per normalized endpoint.
+    pub fn probe_statuses(&self) -> HashMap<String, ProbeStatus> {
+        self.probes.read().map(|p| p.clone()).unwrap_or_default()
     }
 
     /// Record a catalog fetch outcome (`Ok(models)` or `Err(message)`).
@@ -803,11 +918,43 @@ mod tests {
 
         // Buckets survive a restart; raw 1h samples do not.
         let restored = Store::new();
-        restored.load_hourly(store.hourly_snapshot(None));
+        restored.load_hourly(
+            Stream::Catalog,
+            store.hourly_snapshot(Stream::Catalog, None),
+        );
         let st2 = restored.endpoint_stats()["https://n1"].clone();
         assert_eq!(st2.reliability_1h, None);
         assert_eq!(st2.reliability_24h, st.reliability_24h);
         assert_eq!(st2.latency_p50_ms, Some(125));
+    }
+
+    #[test]
+    fn record_probe_keeps_last_info_across_failures() {
+        let store = Store::new();
+        let info = NodeInfo {
+            version: Some("0.5.0".into()),
+            ..Default::default()
+        };
+        store.record_probe("https://n1/", Ok((info.clone(), 40, Some(true))));
+        store.record_probe("https://n1", Err("timeout".into()));
+        let p = &store.probe_statuses()["https://n1"];
+        assert!(!p.ok);
+        assert_eq!(p.info.as_ref(), Some(&info));
+        assert_eq!(p.identity_verified, Some(true));
+        let st = &store.endpoint_stats()["https://n1"];
+        assert_eq!(st.latency_source, Some("probe"));
+        assert_eq!(st.latency_p50_ms, Some(40));
+        // Probes don't count as catalog polls.
+        assert_eq!(st.polls_24h, 0);
+    }
+
+    #[test]
+    fn node_info_tolerates_nulls() {
+        let info: NodeInfo = serde_json::from_value(serde_json::json!({
+            "name": "n", "npub": null, "mints": null, "onion_url": "", "extra": 1
+        }))
+        .unwrap();
+        assert!(info.mints.is_empty() && info.npub.is_none());
     }
 
     #[test]

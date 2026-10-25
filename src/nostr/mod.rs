@@ -25,6 +25,14 @@ use tracing::{debug, info, warn};
 
 use crate::store::{normalize_endpoint, ProviderNode, Store};
 
+/// Does a node's self-reported `npub` (from `/v1/info`) match the key that
+/// announced it on Nostr? `None` when there is nothing to compare; a reported
+/// key that doesn't parse counts as a mismatch.
+pub fn same_pubkey(announced: Option<&str>, reported: Option<&str>) -> Option<bool> {
+    let announced = PublicKey::parse(announced?).ok()?;
+    Some(PublicKey::parse(reported?).is_ok_and(|r| r == announced))
+}
+
 /// RIP-02 Provider Information Event kind.
 pub const ROUTSTR_PROVIDER_KIND: u16 = 38421;
 
@@ -260,4 +268,22 @@ fn parse_content_meta(content: &str) -> ContentMeta {
 
 fn short_id(s: &str) -> String {
     s.chars().take(8).collect()
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::same_pubkey;
+
+    #[test]
+    fn npub_matches_announcing_hex_key() {
+        // From a live node: npub reported by /v1/info vs. event pubkey (hex).
+        let hex = "7efd1dff86991cf6448780837a6c6dbbf79bb9b80dbc5b65b163191f0443b5a7";
+        let npub = "npub10m73mluxnyw0v3y8szph5mrdh0mehwdcpk79ked3vvv37pzrkknshfwwd3";
+        assert_eq!(same_pubkey(Some(hex), Some(npub)), Some(true));
+        let other = nostr_sdk::Keys::generate().public_key().to_hex();
+        assert_eq!(same_pubkey(Some(&other), Some(npub)), Some(false));
+        assert_eq!(same_pubkey(Some(hex), Some("not-a-key")), Some(false));
+        assert_eq!(same_pubkey(None, Some(npub)), None);
+        assert_eq!(same_pubkey(Some(hex), None), None);
+    }
 }
