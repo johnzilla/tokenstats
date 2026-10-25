@@ -66,6 +66,8 @@ pub struct ProviderNode {
     pub poll_total: u32,
     /// Last poll latency in milliseconds (if known).
     pub last_latency_ms: Option<u64>,
+    /// Why the poller refuses to fetch this node (e.g. private address); `None` = polled.
+    pub skip_reason: Option<String>,
 }
 
 /// Outcome of the latest catalog fetch for one provider endpoint.
@@ -285,8 +287,21 @@ impl Store {
                 if node.last_latency_ms.is_none() {
                     node.last_latency_ms = existing.last_latency_ms;
                 }
+                // Re-announcements keep the poller's verdict until the next cycle.
+                if node.skip_reason.is_none() {
+                    node.skip_reason = existing.skip_reason.clone();
+                }
             }
             map.insert(key, node);
+        }
+    }
+
+    /// Set (or clear) why the poller skipped a node; shown in `/api/nodes`.
+    pub fn set_node_skip_reason(&self, endpoint: &str, reason: Option<String>) {
+        if let Ok(mut map) = self.nodes.write() {
+            if let Some(n) = map.get_mut(&normalize_endpoint(endpoint)) {
+                n.skip_reason = reason;
+            }
         }
     }
 
@@ -751,6 +766,7 @@ mod tests {
             poll_ok: 0,
             poll_total: 0,
             last_latency_ms: None,
+            skip_reason: None,
         });
         store.record_poll("https://node.example", true, Some(12));
         store.record_poll("https://node.example", false, None);
@@ -759,5 +775,34 @@ mod tests {
         assert_eq!(n.poll_total, 3);
         assert_eq!(n.poll_ok, 2);
         assert!((n.reliability - (2.0 / 3.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn skip_reason_survives_reannounce() {
+        let store = Store::new();
+        let node = ProviderNode {
+            provider_id: "n1".into(),
+            name: "n1".into(),
+            endpoint: "http://127.0.0.1:18131".into(),
+            onion: None,
+            mint: None,
+            version: None,
+            region: None,
+            pubkey: None,
+            discovered_via: "nostr:38421".into(),
+            last_seen: Utc::now(),
+            reliability: 0.0,
+            poll_ok: 0,
+            poll_total: 0,
+            last_latency_ms: None,
+            skip_reason: None,
+        };
+        store.upsert_node(node.clone());
+        store.set_node_skip_reason("http://127.0.0.1:18131/", Some("loopback".into()));
+        store.upsert_node(node);
+        let n = store.list_nodes().into_iter().next().unwrap();
+        assert_eq!(n.skip_reason.as_deref(), Some("loopback"));
+        store.set_node_skip_reason("http://127.0.0.1:18131", None);
+        assert!(store.list_nodes()[0].skip_reason.is_none());
     }
 }

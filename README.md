@@ -27,6 +27,7 @@ Options:
   --bind <ADDR>       HTTP bind (default 127.0.0.1:8080)   [env: TOKENSTATS_BIND]
   --relay <URL>       Nostr relays (repeatable / comma)    [env: TOKENSTATS_RELAYS]
   --node <URL>        Seed Routstr-compatible endpoints    [env: TOKENSTATS_NODES]
+  --allow-private-nodes  Poll Nostr nodes on private IPs (trusted LAN only)
   --db <PATH>         SQLite path (default data/tokenstats.db) [env: TOKENSTATS_DB]
   --no-nostr          Skip Nostr listener
   --no-poll           Skip HTTP provider polling
@@ -68,7 +69,7 @@ Query params: `?source=openrouter&preset=frontier&ratio=4&model=deepseek`
 | `GET /` | HTML dashboard (auto-refresh ~15s) |
 | `GET /health` | Liveness + feed `status` (`ok`/`degraded`/`down`/…) + counts + `last_updated` |
 | `GET /api/quotes` | JSON quotes (`source`, `model`, `kind`, `preset`, `ratio`, `limit`, `max_age_secs`, `min_reliability`, `exclude_stale`, `exclude_outliers`) |
-| `GET /api/nodes` | Discovered nodes + reliability + last success/error |
+| `GET /api/nodes` | Discovered nodes + reliability + last success/error (+ `skip_reason` when not polled) |
 | `GET /api/summary` | Aggregates + Best Now strip |
 | `GET /export.csv` | CSV of current filtered view |
 
@@ -103,6 +104,7 @@ Specs: [Routstr/protocol](https://github.com/Routstr/protocol)
 
 - Default DB: `data/tokenstats.db` (gitignored)
 - No API keys required for the public OpenRouter models list or Coinbase spot price
+- Nostr-announced nodes on loopback/private/link-local addresses are never requested (SSRF guard); `--node` seeds are trusted
 - Routstr node inference still needs Cashu/API keys if you *call* endpoints — tokenstats only observes catalogs
 
 ## Configuration highlights
@@ -118,6 +120,7 @@ Specs: [Routstr/protocol](https://github.com/Routstr/protocol)
 | Quote expiry | `--quote-ttl-secs` | `86400` |
 | Stale flag threshold | `--stale-after-secs` | `600` |
 | Price ceiling (USD/1M) | `--max-price-usd-per-1m` | `1000` |
+| Poll private Nostr-announced nodes | `--allow-private-nodes` | off (SSRF guard) |
 | Disable Nostr | `--no-nostr` | off |
 | Disable OpenRouter | `--no-openrouter` | off |
 | JSON logs | `--log-json` / `TOKENSTATS_LOG_JSON` | off |

@@ -51,6 +51,7 @@ Centralized in `src/config.rs`. Prefer adding new knobs there (CLI + `TOKENSTATS
 - Catalog fetches go through `replace_catalog` (drops delisted models for that source/provider/endpoint; empty fetch is a no-op). Quotes older than `--quote-ttl-secs` are expired by the poller.
 - On upsert, preserve `prev_price_*` for delta indicators; oracle sats updates must **not** clobber deltas (`apply_sats_normalization`).
 - Node reliability: poll success rate over the last hour (`record_poll`).
+- SSRF guard (`src/providers/netguard.rs`): non-`cli` nodes (i.e. Nostr announcements) are never requested when the host is or resolves to loopback/private/CGNAT/link-local/unique-local/unspecified, unless `--allow-private-nodes`. Use the guarded client (public-only resolver + redirect checks) for any new fetch of announced URLs. Skips set `ProviderNode.skip_reason`.
 
 ### Web / dashboard
 
@@ -87,7 +88,7 @@ Related helpers (not substitutes for the full board):
 |----------|----------|
 | `GET /api/quotes` | **Main integration** — full filtered quote list |
 | `GET /api/summary` | Compact Best Now strip + counts + `btc_usd` + feed `status`/`feed` |
-| `GET /api/nodes` | Discovered Routstr endpoints + reliability + `last_success_at` / `last_error` / `consecutive_failures` |
+| `GET /api/nodes` | Discovered Routstr endpoints + reliability + `last_success_at` / `last_error` / `consecutive_failures` + `skip_reason` (string \| null) when the SSRF guard refused to poll |
 | `GET /health` | Liveness + feed `status` / `feed` object / quote count / `last_updated` |
 | `GET /export.csv` | Same filters as quotes, for offline analysis |
 

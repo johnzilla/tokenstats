@@ -163,6 +163,7 @@ impl Db {
                     poll_ok: row.get::<_, i64>(11)? as u32,
                     poll_total: row.get::<_, i64>(12)? as u32,
                     last_latency_ms: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
+                    skip_reason: None,
                 })
             })?
             .filter_map(|r| r.ok())
