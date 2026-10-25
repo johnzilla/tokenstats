@@ -257,7 +257,8 @@ mod tests {
 
     #[test]
     fn parse_models_key_and_bare_array() {
-        let body = json!({ "models": [{ "id": "x", "pricing": { "prompt": "0", "completion": "0" } }] });
+        let body =
+            json!({ "models": [{ "id": "x", "pricing": { "prompt": "0", "completion": "0" } }] });
         assert_eq!(parse_models_payload(&body).len(), 1);
         let bare = json!([{ "id": "y", "input_cost": 5.0, "output_cost": 15.0 }]);
         let m = parse_models_payload(&bare);

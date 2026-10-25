@@ -10,9 +10,7 @@ use serde::Deserialize;
 
 use super::feed::feed_status;
 use super::AppState;
-use crate::market::{
-    apply_preset, best_now, blended_usd, delta_pct, Preset, DEFAULT_BLEND_RATIO,
-};
+use crate::market::{apply_preset, best_now, blended_usd, delta_pct, Preset, DEFAULT_BLEND_RATIO};
 use crate::pricing::{blend_sort_key, is_rankable_blend};
 use crate::store::{normalize_endpoint, Quote};
 
@@ -241,10 +239,7 @@ pub async fn api_summary(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// Export the current filtered view as CSV.
-pub async fn export_csv(
-    State(state): State<AppState>,
-    Query(q): Query<QuotesQuery>,
-) -> Response {
+pub async fn export_csv(State(state): State<AppState>, Query(q): Query<QuotesQuery>) -> Response {
     let ratio = q.blend_ratio();
     let limit = q.limit.unwrap_or(5000).min(20_000);
     let all = state.store.list_quotes();
@@ -294,10 +289,10 @@ pub async fn export_csv(
     );
     headers.insert(
         header::CONTENT_DISPOSITION,
-        HeaderValue::from_str(&format!(
-            "attachment; filename=\"tokenstats-{stamp}.csv\""
-        ))
-        .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"tokenstats.csv\"")),
+        HeaderValue::from_str(&format!("attachment; filename=\"tokenstats-{stamp}.csv\""))
+            .unwrap_or_else(|_| {
+                HeaderValue::from_static("attachment; filename=\"tokenstats.csv\"")
+            }),
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
 
@@ -371,7 +366,10 @@ pub async fn dashboard(
     let rows: String = if filtered.is_empty() {
         r#"<tr><td colspan="11" class="empty">No quotes match this filter…</td></tr>"#.into()
     } else {
-        filtered.iter().map(|quote| quote_row(quote, ratio)).collect()
+        filtered
+            .iter()
+            .map(|quote| quote_row(quote, ratio))
+            .collect()
     };
 
     let node_rows: String = if nodes.is_empty() {

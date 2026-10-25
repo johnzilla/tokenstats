@@ -53,10 +53,7 @@ pub async fn run_listener(
 
     client.connect().await;
 
-    let kinds_u64: Vec<Kind> = kinds
-        .iter()
-        .map(|k| Kind::Custom(u64::from(*k)))
-        .collect();
+    let kinds_u64: Vec<Kind> = kinds.iter().map(|k| Kind::Custom(u64::from(*k))).collect();
     let filter = Filter::new().kinds(kinds_u64).limit(500);
     let sub_id = client.subscribe(vec![filter], None).await;
     info!(%sub_id, ?kinds, "subscribed to Routstr provider announcements");
@@ -147,10 +144,7 @@ fn handle_event(store: &Store, event: &Event) -> Result<()> {
         }
     };
 
-    let d_id = tags
-        .d
-        .clone()
-        .unwrap_or_else(|| event.pubkey.to_string());
+    let d_id = tags.d.clone().unwrap_or_else(|| event.pubkey.to_string());
     let name = content_meta
         .name
         .unwrap_or_else(|| format!("node-{}", short_id(&d_id)));
@@ -241,14 +235,8 @@ fn parse_content_meta(content: &str) -> ContentMeta {
         return meta;
     };
 
-    meta.name = v
-        .get("name")
-        .and_then(|x| x.as_str())
-        .map(str::to_string);
-    meta.region = v
-        .get("region")
-        .and_then(|x| x.as_str())
-        .map(str::to_string);
+    meta.name = v.get("name").and_then(|x| x.as_str()).map(str::to_string);
+    meta.region = v.get("region").and_then(|x| x.as_str()).map(str::to_string);
 
     if let Some(endpoints) = v.get("endpoints") {
         meta.http_endpoint = endpoints
