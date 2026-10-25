@@ -60,6 +60,8 @@ Centralized in `src/config.rs`. Prefer adding new knobs there (CLI + `TOKENSTATS
 - Query params: `source`, `model`, `preset`, `ratio`, `limit`, plus quality filters `kind`, `max_age_secs`, `min_reliability`, `exclude_stale`, `exclude_outliers` (carried through board links and CSV export by `QuotesQuery::qs`).
 - Export path: `/export.csv` must honor the same filters as the board.
 - Escape all user/network-derived strings in HTML (`esc` / `esc_attr`).
+- Hrefs built from query params go through `percent_encode` (unreserved chars only) **and** `esc_attr`. A reflected-XSS regression test guards this.
+- No inline `<script>`: the app sends a strict `Content-Security-Policy` (`src/web/mod.rs`). Put dashboard JS in `src/web/static/` and serve it from `/static/`. Third-party scripts only via config (`--plausible-script`), which adds just that origin to the CSP.
 
 ### Persistence
 

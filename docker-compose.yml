@@ -24,6 +24,8 @@ services:
       TOKENSTATS_POLL_INTERVAL_SECS: "${TOKENSTATS_POLL_INTERVAL_SECS:-60}"
       TOKENSTATS_BTC_INTERVAL_SECS: "${TOKENSTATS_BTC_INTERVAL_SECS:-60}"
       TOKENSTATS_PERSIST_INTERVAL_SECS: "${TOKENSTATS_PERSIST_INTERVAL_SECS:-30}"
+      # Plausible analytics script URL (https). Empty = no third-party script.
+      TOKENSTATS_PLAUSIBLE_SCRIPT: "${TOKENSTATS_PLAUSIBLE_SCRIPT:-}"
       # Optional overrides:
       # TOKENSTATS_RELAYS: "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band"
       # TOKENSTATS_NODES: "https://your-node.example.com"

@@ -387,6 +387,7 @@ doctl compute droplet-action snapshot tokenstats --snapshot-name tokenstats-$(da
 | `TOKENSTATS_DB` | container | `/data/tokenstats.db` |
 | `TOKENSTATS_POLL_INTERVAL_SECS` | compose | `60` |
 | `RUST_LOG` | compose | `info,tokenstats=info,...` |
+| `TOKENSTATS_PLAUSIBLE_SCRIPT` | `.env` / compose | unset = no analytics; set the site's `https://plausible.io/js/pa-….js` to enable |
 | `TOKENSTATS_PUBLISH_PORT` | `.env` / compose | `127.0.0.1:8080` in `env.example` (compose falls back to public `8080` if unset) |
 
 App CLI/env details: [USAGE.md](./USAGE.md).
