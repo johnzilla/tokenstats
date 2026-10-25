@@ -52,6 +52,7 @@ pub async fn fetch_node_quotes(
                             context_length: m.context_length,
                             observed_at: now,
                             raw_kind: None,
+                            kind: m.kind,
                         }
                     })
                     .collect();

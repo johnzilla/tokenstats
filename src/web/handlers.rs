@@ -1,6 +1,6 @@
 //! HTTP handlers: HTML dashboard + JSON API + CSV export.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -8,18 +8,23 @@ use axum::response::{Html, IntoResponse, Json, Response};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
+use super::feed::feed_status;
 use super::AppState;
 use crate::market::{
     apply_preset, best_now, blended_usd, delta_pct, Preset, DEFAULT_BLEND_RATIO,
 };
-use crate::pricing::blend_sort_key;
-use crate::store::Quote;
+use crate::pricing::{blend_sort_key, is_rankable_blend};
+use crate::store::{normalize_endpoint, Quote};
 
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let quotes = state.store.list_quotes();
     let last = freshest_ts(&quotes);
+    let feed = feed_status(&state, &quotes);
     Json(serde_json::json!({
+        // Liveness only; consult `status` / `feed` for data quality.
         "ok": true,
+        "status": feed["status"],
+        "feed": feed,
         "service": "tokenstats",
         "quotes": quotes.len(),
         "nodes": state.store.node_count(),
@@ -41,6 +46,17 @@ pub struct QuotesQuery {
     pub ratio: Option<f64>,
     /// Max rows (default 200 for API, 150 for HTML board).
     pub limit: Option<usize>,
+    /// Only quotes observed within this many seconds.
+    pub max_age_secs: Option<i64>,
+    /// Only quotes whose endpoint succeeded at least this often over the last
+    /// hour (0–1). Quotes with no poll history are excluded.
+    pub min_reliability: Option<f64>,
+    /// Model kind(s), comma-separated: chat | embedding | image | audio | rerank | other
+    pub kind: Option<String>,
+    /// `1`/`true` hides quotes older than the stale threshold.
+    pub exclude_stale: Option<String>,
+    /// `1`/`true` hides quotes priced >10× off the cross-source median.
+    pub exclude_outliers: Option<String>,
 }
 
 impl QuotesQuery {
@@ -88,6 +104,14 @@ impl QuotesQuery {
         set("model", model);
         set("preset", preset);
         set("ratio", ratio.as_deref());
+        // Data-quality filters ride along so board links and CSV export match.
+        let max_age = self.max_age_secs.map(|v| v.to_string());
+        let min_rel = self.min_reliability.map(|v| v.to_string());
+        set("max_age_secs", max_age.as_deref());
+        set("min_reliability", min_rel.as_deref());
+        set("kind", self.kind.as_deref());
+        set("exclude_stale", self.exclude_stale.as_deref());
+        set("exclude_outliers", self.exclude_outliers.as_deref());
 
         if pairs.is_empty() {
             return String::new();
@@ -107,10 +131,10 @@ fn urlencoding_minimal(s: &str) -> String {
         .replace('=', "%3D")
 }
 
-/// Apply source/model/preset filters and sort by blend (unless preset sorts itself).
-fn resolve_view(all: Vec<Quote>, q: &QuotesQuery) -> Vec<Quote> {
+/// Apply source/model/quality/preset filters and sort by blend (unless preset sorts itself).
+fn resolve_view(all: Vec<Quote>, q: &QuotesQuery, ctx: &QuoteCtx) -> Vec<Quote> {
     let ratio = q.blend_ratio();
-    let mut filtered = filter_quotes(all, q);
+    let mut filtered = filter_quotes(all, q, ctx);
     if let Some(p) = q.preset() {
         filtered = apply_preset(filtered, p);
     } else {
@@ -131,18 +155,50 @@ pub async fn api_quotes(
     Query(q): Query<QuotesQuery>,
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(200).min(2000);
-    let ratio = q.blend_ratio();
-    let quotes = resolve_view(state.store.list_quotes(), &q);
+    let all = state.store.list_quotes();
+    let ctx = QuoteCtx::new(&state, &all, q.blend_ratio());
+    let quotes = resolve_view(all, &q, &ctx);
     let enriched: Vec<_> = quotes
         .into_iter()
         .take(limit)
-        .map(|quote| enrich_json(&quote, ratio))
+        .map(|quote| enrich_json(&quote, &ctx))
         .collect();
     Json(enriched)
 }
 
 pub async fn api_nodes(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.store.list_nodes())
+    let fetches: HashMap<String, _> = state
+        .store
+        .fetch_statuses()
+        .into_iter()
+        .filter(|f| f.source == "routstr")
+        .map(|f| (f.endpoint.clone(), f))
+        .collect();
+    let nodes: Vec<_> = state
+        .store
+        .list_nodes()
+        .into_iter()
+        .map(|n| {
+            let fetch = fetches.get(&normalize_endpoint(&n.endpoint));
+            let mut v = serde_json::to_value(&n).unwrap_or_default();
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "last_success_at".into(),
+                    serde_json::json!(fetch.and_then(|f| f.last_success_at)),
+                );
+                obj.insert(
+                    "last_error".into(),
+                    serde_json::json!(fetch.and_then(|f| f.last_error.clone())),
+                );
+                obj.insert(
+                    "consecutive_failures".into(),
+                    serde_json::json!(fetch.map(|f| f.consecutive_failures).unwrap_or(0)),
+                );
+            }
+            v
+        })
+        .collect();
+    Json(nodes)
 }
 
 pub async fn api_summary(State(state): State<AppState>) -> impl IntoResponse {
@@ -155,8 +211,11 @@ pub async fn api_summary(State(state): State<AppState>) -> impl IntoResponse {
     let models: std::collections::BTreeSet<_> = quotes.iter().map(|q| q.model.as_str()).collect();
     let best = best_now(&quotes, ratio);
     let last = freshest_ts(&quotes);
+    let feed = feed_status(&state, &quotes);
 
     Json(serde_json::json!({
+        "status": feed["status"],
+        "feed": feed,
         "quotes": quotes.len(),
         "nodes": state.store.node_count(),
         "distinct_models": models.len(),
@@ -188,16 +247,19 @@ pub async fn export_csv(
 ) -> Response {
     let ratio = q.blend_ratio();
     let limit = q.limit.unwrap_or(5000).min(20_000);
-    let quotes = resolve_view(state.store.list_quotes(), &q);
+    let all = state.store.list_quotes();
+    let ctx = QuoteCtx::new(&state, &all, ratio);
+    let quotes = resolve_view(all, &q, &ctx);
     let mut csv = String::from(
         "source,provider,provider_id,model,price_in_usd,price_out_usd,blended_usd,blend_ratio,\
-         price_in_sats,price_out_sats,delta_out_pct,endpoint,region,context_length,observed_at\n",
+         price_in_sats,price_out_sats,delta_out_pct,endpoint,region,context_length,observed_at,\
+         kind,age_secs,stale,reliability_1h,outlier\n",
     );
     for quote in quotes.into_iter().take(limit) {
         let blend = blended_usd(quote.price_in_usd, quote.price_out_usd, ratio);
         let d = delta_pct(quote.price_out_usd, quote.prev_price_out_usd);
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             csv_cell(&quote.source),
             csv_cell(&quote.provider),
             csv_cell(&quote.provider_id),
@@ -216,6 +278,11 @@ pub async fn export_csv(
                 .map(|c| c.to_string())
                 .unwrap_or_default(),
             quote.observed_at.to_rfc3339(),
+            csv_cell(&quote.kind),
+            ctx.age_secs(&quote),
+            ctx.is_stale(&quote),
+            opt_f(ctx.reliability(&quote)),
+            ctx.is_outlier(&quote),
         ));
     }
 
@@ -291,7 +358,8 @@ pub async fn dashboard(
             .collect()
     };
 
-    let mut filtered = resolve_view(all.clone(), &q);
+    let ctx = QuoteCtx::new(&state, &all, ratio);
+    let mut filtered = resolve_view(all.clone(), &q, &ctx);
     let total_filtered = filtered.len();
     filtered.truncate(150);
 
@@ -410,6 +478,18 @@ pub async fn dashboard(
         None => "data —".into(),
     };
     let page_label = format!("page {}", page_generated.format("%H:%M:%S UTC"));
+    let feed = feed_status(&state, &all);
+    let feed_label = format!("feed {}", feed["status"].as_str().unwrap_or("unknown"));
+    let feed_title = feed["reasons"]
+        .as_array()
+        .map(|r| {
+            r.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| "Feed health (see /health)".into());
 
     let filter_note = format!(
         " · {shown}/{total} · blend 1:{r:.0}",
@@ -600,6 +680,7 @@ pub async fn dashboard(
     <span class="badge">LIVE</span>
     <span class="meta">{quotes} quotes · {nodes} nodes · {btc}{filter_note}</span>
     <span class="meta" title="Freshest quote observation vs page render">{last_label} · {page_label}</span>
+    <span class="meta" title="{feed_title}">{feed_label}</span>
     <span class="meta links">
       <a href="{csv_href}">Export CSV</a>
       <a href="/api/summary">/api/summary</a>
@@ -767,6 +848,8 @@ pub async fn dashboard(
         btc = btc_label,
         filter_note = filter_note,
         last_label = last_label,
+        feed_label = esc(&feed_label),
+        feed_title = esc_attr(&feed_title),
         page_label = page_label,
         all_active = all_active,
         all_href = if all_href.is_empty() {
@@ -882,7 +965,102 @@ fn freshest_ts(quotes: &[Quote]) -> Option<DateTime<Utc>> {
     quotes.iter().map(|q| q.observed_at).max()
 }
 
-fn enrich_json(q: &Quote, ratio: f64) -> serde_json::Value {
+/// A quote is an outlier when its blend is this many times off the median.
+const OUTLIER_FACTOR: f64 = 10.0;
+/// Quotes for the same model needed before outliers are judged.
+const OUTLIER_MIN_PEERS: usize = 3;
+
+/// Per-request context for freshness, reliability and outlier fields/filters.
+struct QuoteCtx {
+    now: DateTime<Utc>,
+    stale_after_secs: i64,
+    ratio: f64,
+    /// Normalized endpoint → success rate over the reliability window.
+    reliability: HashMap<String, f64>,
+    /// Lowercased model id → median rankable blend across all quotes.
+    medians: HashMap<String, f64>,
+}
+
+impl QuoteCtx {
+    fn new(state: &AppState, all: &[Quote], ratio: f64) -> Self {
+        let mut blends: HashMap<String, Vec<f64>> = HashMap::new();
+        for q in all {
+            let b = blended_usd(q.price_in_usd, q.price_out_usd, ratio);
+            if is_rankable_blend(b) {
+                blends
+                    .entry(q.model.to_ascii_lowercase())
+                    .or_default()
+                    .extend(b);
+            }
+        }
+        let medians = blends
+            .into_iter()
+            .filter(|(_, v)| v.len() >= OUTLIER_MIN_PEERS)
+            .map(|(k, mut v)| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let mid = v.len() / 2;
+                let m = if v.len() % 2 == 0 {
+                    (v[mid - 1] + v[mid]) / 2.0
+                } else {
+                    v[mid]
+                };
+                (k, m)
+            })
+            .collect();
+        Self {
+            now: Utc::now(),
+            stale_after_secs: state.stale_after.as_secs() as i64,
+            ratio,
+            reliability: state.store.reliability_by_endpoint(),
+            medians,
+        }
+    }
+
+    fn age_secs(&self, q: &Quote) -> i64 {
+        (self.now - q.observed_at).num_seconds().max(0)
+    }
+
+    fn is_stale(&self, q: &Quote) -> bool {
+        self.age_secs(q) > self.stale_after_secs
+    }
+
+    fn reliability(&self, q: &Quote) -> Option<f64> {
+        let ep = normalize_endpoint(q.endpoint.as_deref()?);
+        self.reliability.get(&ep).copied()
+    }
+
+    fn is_outlier(&self, q: &Quote) -> bool {
+        let Some(b) = blended_usd(q.price_in_usd, q.price_out_usd, self.ratio)
+            .filter(|b| is_rankable_blend(Some(*b)))
+        else {
+            return false;
+        };
+        self.medians
+            .get(&q.model.to_ascii_lowercase())
+            .is_some_and(|m| b < m / OUTLIER_FACTOR || b > m * OUTLIER_FACTOR)
+    }
+}
+
+fn truthy(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Comma-separated, case-insensitive membership (`None`/empty = match all).
+fn in_list(list: Option<&str>, value: &str) -> bool {
+    match list.map(str::trim).filter(|l| !l.is_empty()) {
+        None => true,
+        Some(l) => l
+            .split(',')
+            .map(str::trim)
+            .any(|item| item.eq_ignore_ascii_case(value)),
+    }
+}
+
+fn enrich_json(q: &Quote, ctx: &QuoteCtx) -> serde_json::Value {
+    let ratio = ctx.ratio;
     serde_json::json!({
         "source": q.source,
         "provider": q.provider,
@@ -903,17 +1081,41 @@ fn enrich_json(q: &Quote, ratio: f64) -> serde_json::Value {
         "context_length": q.context_length,
         "observed_at": q.observed_at,
         "node": node_display_name(q),
+        "kind": q.kind,
+        "age_secs": ctx.age_secs(q),
+        "stale": ctx.is_stale(q),
+        "reliability_1h": ctx.reliability(q),
+        "outlier": ctx.is_outlier(q),
     })
 }
 
-fn filter_quotes(quotes: Vec<Quote>, q: &QuotesQuery) -> Vec<Quote> {
+fn filter_quotes(quotes: Vec<Quote>, q: &QuotesQuery, ctx: &QuoteCtx) -> Vec<Quote> {
+    let exclude_stale = truthy(q.exclude_stale.as_deref());
+    let exclude_outliers = truthy(q.exclude_outliers.as_deref());
     quotes
         .into_iter()
         .filter(|quote| {
-            if let Some(ref s) = q.source {
-                if !quote.source.eq_ignore_ascii_case(s) {
+            if !in_list(q.source.as_deref(), &quote.source) {
+                return false;
+            }
+            if !in_list(q.kind.as_deref(), &quote.kind) {
+                return false;
+            }
+            if let Some(max) = q.max_age_secs {
+                if ctx.age_secs(quote) > max {
                     return false;
                 }
+            }
+            if exclude_stale && ctx.is_stale(quote) {
+                return false;
+            }
+            if let Some(min) = q.min_reliability {
+                if !ctx.reliability(quote).is_some_and(|r| r >= min) {
+                    return false;
+                }
+            }
+            if exclude_outliers && ctx.is_outlier(quote) {
+                return false;
             }
             if let Some(ref m) = q.model {
                 if !quote
@@ -994,5 +1196,126 @@ fn short(s: &str, n: usize) -> String {
         format!("{t}…")
     } else {
         t
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration as StdDuration;
+
+    use crate::store::Store;
+
+    fn quote(model: &str, endpoint: &str, out: f64, age_secs: i64, kind: &str) -> Quote {
+        Quote {
+            source: "routstr".into(),
+            provider: "p".into(),
+            provider_id: endpoint.into(),
+            model: model.into(),
+            price_in_usd: Some(out),
+            price_out_usd: Some(out),
+            price_in_sats: None,
+            price_out_sats: None,
+            prev_price_out_usd: None,
+            prev_price_in_usd: None,
+            endpoint: Some(endpoint.into()),
+            region: None,
+            context_length: None,
+            observed_at: Utc::now() - chrono::Duration::seconds(age_secs),
+            raw_kind: None,
+            kind: kind.into(),
+        }
+    }
+
+    fn state() -> AppState {
+        AppState {
+            store: Arc::new(Store::new()),
+            stale_after: StdDuration::from_secs(600),
+            polling: true,
+        }
+    }
+
+    fn query(pairs: &str) -> QuotesQuery {
+        let uri: axum::http::Uri = format!("/?{pairs}").parse().unwrap();
+        Query::<QuotesQuery>::try_from_uri(&uri).unwrap().0
+    }
+
+    #[test]
+    fn flags_low_outlier_against_cross_source_median() {
+        let all = vec![
+            quote("m", "https://a", 2.0, 0, "chat"),
+            quote("m", "https://b", 2.2, 0, "chat"),
+            quote("m", "https://c", 1.8, 0, "chat"),
+            quote("m", "https://d", 0.01, 0, "chat"),
+        ];
+        let ctx = QuoteCtx::new(&state(), &all, 3.0);
+        let flags: Vec<_> = all.iter().map(|q| ctx.is_outlier(q)).collect();
+        assert_eq!(flags, [false, false, false, true]);
+    }
+
+    #[test]
+    fn too_few_peers_never_outlier() {
+        let all = vec![
+            quote("m", "https://a", 2.0, 0, "chat"),
+            quote("m", "https://d", 0.01, 0, "chat"),
+        ];
+        let ctx = QuoteCtx::new(&state(), &all, 3.0);
+        assert!(!ctx.is_outlier(&all[1]));
+    }
+
+    #[test]
+    fn filters_kind_stale_age_source_and_reliability() {
+        let st = state();
+        st.store.record_poll("https://good", true, Some(10));
+        st.store.record_poll("https://bad", false, None);
+        let all = vec![
+            quote("fresh-chat", "https://good", 1.0, 5, "chat"),
+            quote("old-chat", "https://good", 1.0, 3600, "chat"),
+            quote("embed", "https://good", 1.0, 5, "embedding"),
+            quote("flaky", "https://bad", 1.0, 5, "chat"),
+            quote("unpolled", "https://new", 1.0, 5, "chat"),
+        ];
+        let ctx = QuoteCtx::new(&st, &all, 3.0);
+        let models = |qs: &str| -> Vec<String> {
+            let mut v: Vec<_> = filter_quotes(all.clone(), &query(qs), &ctx)
+                .into_iter()
+                .map(|q| q.model)
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(models("kind=embedding"), ["embed"]);
+        assert_eq!(models("kind=chat&exclude_stale=1").len(), 3);
+        assert!(!models("max_age_secs=60").contains(&"old-chat".to_string()));
+        assert_eq!(
+            models("kind=chat&min_reliability=0.5"),
+            ["fresh-chat", "old-chat"]
+        );
+        assert_eq!(models("source=openrouter,ROUTSTR").len(), 5);
+        assert!(models("source=openrouter").is_empty());
+    }
+
+    #[test]
+    fn enrich_json_adds_freshness_fields() {
+        let st = state();
+        st.store.record_poll("https://good", true, Some(10));
+        let q = quote("m", "https://good/", 1.0, 900, "chat");
+        let ctx = QuoteCtx::new(&st, std::slice::from_ref(&q), 3.0);
+        let v = enrich_json(&q, &ctx);
+        assert_eq!(v["kind"], "chat");
+        assert_eq!(v["stale"], true);
+        assert_eq!(v["reliability_1h"], 1.0);
+        assert_eq!(v["outlier"], false);
+        assert!(v["age_secs"].as_i64().unwrap() >= 900);
+    }
+
+    #[test]
+    fn qs_carries_quality_filters() {
+        let q = query("kind=chat&exclude_stale=1&min_reliability=0.5");
+        let qs = q.qs(&[]);
+        assert!(qs.contains("kind=chat"));
+        assert!(qs.contains("exclude_stale=1"));
+        assert!(qs.contains("min_reliability=0.5"));
     }
 }

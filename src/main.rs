@@ -77,6 +77,8 @@ async fn run_serve(cfg: Config) -> Result<()> {
     install_signal_handlers(cancel.clone())?;
 
     let store = Arc::new(Store::new());
+    // Set before restore so legacy snapshot rows are bounded too.
+    store.set_price_ceiling_usd(cfg.max_price_usd_per_1m);
     info!(version = env!("CARGO_PKG_VERSION"), "tokenstats starting");
     cfg.log_summary();
 
@@ -199,6 +201,8 @@ async fn run_serve(cfg: Config) -> Result<()> {
     // --- HTTP server with graceful shutdown ---
     let app_state = web::AppState {
         store: Arc::clone(&store),
+        stale_after: cfg.stale_after,
+        polling: cfg.enable_poll,
     };
     let app = web::router(app_state);
     let listener = tokio::net::TcpListener::bind(cfg.bind)

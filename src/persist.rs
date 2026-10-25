@@ -10,6 +10,7 @@ use rusqlite::{params, Connection};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::providers::model_kind;
 use crate::store::{ProviderNode, Quote, Store};
 
 pub struct Db {
@@ -46,7 +47,8 @@ impl Db {
                 region TEXT,
                 context_length INTEGER,
                 observed_at TEXT NOT NULL,
-                raw_kind INTEGER
+                raw_kind INTEGER,
+                kind TEXT
             );
             CREATE TABLE IF NOT EXISTS nodes (
                 endpoint TEXT PRIMARY KEY,
@@ -70,6 +72,13 @@ impl Db {
             );
             ",
         )?;
+        // Columns added after the initial schema.
+        let has_kind = conn
+            .prepare("SELECT 1 FROM pragma_table_info('quotes') WHERE name = 'kind'")?
+            .exists([])?;
+        if !has_kind {
+            conn.execute("ALTER TABLE quotes ADD COLUMN kind TEXT", [])?;
+        }
         info!(path = %path.display(), "sqlite opened");
         Ok(Self {
             conn: Mutex::new(conn),
@@ -99,16 +108,20 @@ impl Db {
             "SELECT source, provider, provider_id, model,
                     price_in_usd, price_out_usd, price_in_sats, price_out_sats,
                     prev_price_out_usd, prev_price_in_usd,
-                    endpoint, region, context_length, observed_at, raw_kind
+                    endpoint, region, context_length, observed_at, raw_kind, kind
              FROM quotes",
         )?;
         let quotes: Vec<Quote> = stmt
             .query_map([], |row| {
+                let model: String = row.get(3)?;
+                let kind = row
+                    .get::<_, Option<String>>(15)?
+                    .unwrap_or_else(|| model_kind(&model, &[]));
                 Ok(Quote {
                     source: row.get(0)?,
                     provider: row.get(1)?,
                     provider_id: row.get(2)?,
-                    model: row.get(3)?,
+                    model,
                     price_in_usd: row.get(4)?,
                     price_out_usd: row.get(5)?,
                     price_in_sats: row.get(6)?,
@@ -120,6 +133,7 @@ impl Db {
                     context_length: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
                     observed_at: parse_ts(&row.get::<_, String>(13)?),
                     raw_kind: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
+                    kind,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -173,8 +187,8 @@ impl Db {
                     key, source, provider, provider_id, model,
                     price_in_usd, price_out_usd, price_in_sats, price_out_sats,
                     prev_price_out_usd, prev_price_in_usd,
-                    endpoint, region, context_length, observed_at, raw_kind
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                    endpoint, region, context_length, observed_at, raw_kind, kind
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             )?;
             for q in store.all_quotes_raw() {
                 let key = Store::quote_key(&q.source, &q.provider_id, &q.model);
@@ -195,6 +209,7 @@ impl Db {
                     q.context_length.map(|v| v as i64),
                     q.observed_at.to_rfc3339(),
                     q.raw_kind.map(|v| v as i64),
+                    q.kind,
                 ])?;
             }
         }

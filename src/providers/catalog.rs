@@ -16,6 +16,8 @@ pub struct CatalogModel {
     /// Normalized dual-unit prices (per 1M tokens).
     pub prices: NormalizedPrices,
     pub context_length: Option<u64>,
+    /// See [`model_kind`].
+    pub kind: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +34,12 @@ struct Pricing {
 }
 
 #[derive(Debug, Deserialize)]
+struct Architecture {
+    #[serde(default)]
+    output_modalities: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ModelRow {
     id: Option<String>,
     #[serde(default)]
@@ -43,6 +51,8 @@ struct ModelRow {
     sats_pricing: Option<Pricing>,
     #[serde(default)]
     context_length: Option<u64>,
+    #[serde(default)]
+    architecture: Option<Architecture>,
     // alternate shapes
     #[serde(default)]
     input_cost: Option<f64>,
@@ -110,12 +120,54 @@ fn parse_one(v: &Value, hint: CatalogHint) -> Option<CatalogModel> {
         hint,
     );
 
+    let kind = model_kind(
+        &id,
+        row.architecture
+            .as_ref()
+            .map(|a| a.output_modalities.as_slice())
+            .unwrap_or_default(),
+    );
+
     Some(CatalogModel {
         id,
         name: row.name,
         prices,
         context_length: row.context_length,
+        kind,
     })
+}
+
+/// Classify a model by what it outputs. Uses OpenRouter-style
+/// `architecture.output_modalities` when published, else id heuristics;
+/// anything unrecognized is assumed to be `chat` (the common case).
+pub fn model_kind(id: &str, output_modalities: &[String]) -> String {
+    let has = |m: &str| output_modalities.iter().any(|o| o.eq_ignore_ascii_case(m));
+    let kind = if has("embedding") || has("embeddings") {
+        "embedding"
+    } else if has("text") {
+        "chat"
+    } else if has("image") {
+        "image"
+    } else if has("audio") {
+        "audio"
+    } else if !output_modalities.is_empty() {
+        "other"
+    } else {
+        let id = id.to_ascii_lowercase();
+        if id.contains("embed") {
+            "embedding"
+        } else if id.contains("rerank") {
+            "rerank"
+        } else if ["whisper", "tts", "transcribe"]
+            .iter()
+            .any(|k| id.contains(k))
+        {
+            "audio"
+        } else {
+            "chat"
+        }
+    };
+    kind.to_string()
 }
 
 fn num_from_value(v: Option<&Value>) -> Option<f64> {
@@ -177,6 +229,26 @@ mod tests {
         assert_eq!(models[0].price_in_sats(), None);
         assert_eq!(models[0].context_length, Some(8192));
         assert_eq!(models[0].primary(), PricePrimary::Usd);
+    }
+
+    #[test]
+    fn kind_from_output_modalities_then_id() {
+        let body = json!({ "data": [
+            { "id": "a/chat", "architecture": { "output_modalities": ["text"] } },
+            { "id": "a/vec", "architecture": { "output_modalities": ["embeddings"] } },
+            { "id": "a/pic", "architecture": { "output_modalities": ["image"] } },
+            { "id": "a/odd", "architecture": { "output_modalities": ["decisions"] } },
+            { "id": "text-embedding-bge-m3" },
+            { "id": "whisper-1" },
+            { "id": "plain-model" }
+        ]});
+        let kinds: Vec<_> = parse_models_payload_with_hint(&body, CatalogHint::Routstr)
+            .into_iter()
+            .map(|m| m.kind)
+            .collect();
+        let want = ["chat", "embedding", "image", "other", "embedding", "audio"];
+        assert_eq!(kinds[..6], want);
+        assert_eq!(kinds[6], "chat");
     }
 
     #[test]

@@ -4,6 +4,8 @@ mod catalog;
 mod openrouter;
 mod routstr;
 
+pub use catalog::model_kind;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,7 +15,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::store::Store;
+use crate::store::{PollCycle, Store};
 
 #[derive(Debug, Clone)]
 pub struct PollerConfig {
@@ -92,9 +94,13 @@ async fn poll_once(client: &reqwest::Client, store: &Store, cfg: &PollerConfig) 
     let mut delisted = 0usize;
 
     if cfg.enable_openrouter {
+        let or_started = Instant::now();
         match openrouter::fetch_quotes(client, &cfg.openrouter_url).await {
             Ok(quotes) => {
                 let n = quotes.len();
+                let latency_ms = or_started.elapsed().as_millis() as u64;
+                store.record_poll(openrouter::ENDPOINT, true, Some(latency_ms));
+                store.record_fetch("openrouter", "openrouter", openrouter::ENDPOINT, Ok(n));
                 delisted += store.replace_catalog(
                     "openrouter",
                     "openrouter",
@@ -103,7 +109,16 @@ async fn poll_once(client: &reqwest::Client, store: &Store, cfg: &PollerConfig) 
                 );
                 info!(models = n, "OpenRouter catalog updated");
             }
-            Err(e) => warn!(error = %e, "OpenRouter poll failed"),
+            Err(e) => {
+                store.record_poll(openrouter::ENDPOINT, false, None);
+                store.record_fetch(
+                    "openrouter",
+                    "openrouter",
+                    openrouter::ENDPOINT,
+                    Err(format!("{e:#}")),
+                );
+                warn!(error = %e, "OpenRouter poll failed");
+            }
         }
     }
 
@@ -137,6 +152,7 @@ async fn poll_once(client: &reqwest::Client, store: &Store, cfg: &PollerConfig) 
                 nodes_ok += 1;
                 let n = quotes.len();
                 store.record_poll(&node.endpoint, true, Some(latency_ms));
+                store.record_fetch("routstr", &node.provider_id, &node.endpoint, Ok(n));
                 delisted += store.replace_catalog(
                     "routstr",
                     &node.provider_id,
@@ -153,6 +169,12 @@ async fn poll_once(client: &reqwest::Client, store: &Store, cfg: &PollerConfig) 
             Err(e) => {
                 nodes_failed += 1;
                 store.record_poll(&node.endpoint, false, None);
+                store.record_fetch(
+                    "routstr",
+                    &node.provider_id,
+                    &node.endpoint,
+                    Err(format!("{e:#}")),
+                );
                 warn!(
                     endpoint = %node.endpoint,
                     error = %e,
@@ -168,13 +190,22 @@ async fn poll_once(client: &reqwest::Client, store: &Store, cfg: &PollerConfig) 
         .map(|ttl| store.prune_stale_quotes(ttl))
         .unwrap_or(0);
 
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    store.record_cycle(PollCycle {
+        finished_at: chrono::Utc::now(),
+        elapsed_ms,
+        nodes_ok,
+        nodes_failed,
+        delisted,
+        expired,
+    });
     info!(
         nodes_ok,
         nodes_failed,
         delisted,
         expired,
         quotes = store.quote_count(),
-        elapsed_ms = started.elapsed().as_millis() as u64,
+        elapsed_ms,
         "poll cycle complete"
     );
 
