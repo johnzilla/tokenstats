@@ -27,6 +27,15 @@ pub fn sanitize_price(p: f64) -> Option<f64> {
     }
 }
 
+/// Plausible BTC/USD bounds. A feed glitch outside them (e.g. `0.000001`)
+/// would silently corrupt every sats price, so such rates are rejected.
+pub const BTC_USD_MIN: f64 = 100.0;
+pub const BTC_USD_MAX: f64 = 10_000_000.0;
+
+pub fn sane_btc_usd(rate: f64) -> bool {
+    rate.is_finite() && (BTC_USD_MIN..=BTC_USD_MAX).contains(&rate)
+}
+
 /// Sanitize an optional price field.
 pub fn sanitize_opt(p: Option<f64>) -> Option<f64> {
     p.and_then(sanitize_price)
@@ -165,15 +174,50 @@ pub fn normalize_catalog_prices(
         }
     }
 
-    let has_usd = out.price_in_usd.is_some() || out.price_out_usd.is_some();
-    let has_sats = out.price_in_sats.is_some() || out.price_out_sats.is_some();
-    out.primary = match (has_usd, has_sats) {
-        (true, true) => PricePrimary::Both,
-        (true, false) => PricePrimary::Usd,
-        (false, true) => PricePrimary::Sats,
-        (false, false) => PricePrimary::None,
-    };
+    out.primary = out.derive_primary();
     out
+}
+
+/// Rates a catalog states explicitly per 1M tokens (e.g. OrcaRouter's
+/// `pricing.prompt_per_million`). Already in our units, so no guessing.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ExplicitPerMillion {
+    pub usd_in: Option<f64>,
+    pub usd_out: Option<f64>,
+    pub sats_in: Option<f64>,
+    pub sats_out: Option<f64>,
+}
+
+impl NormalizedPrices {
+    /// Explicit per-1M fields win over the per-token vs per-1M magnitude
+    /// heuristic for their side: a genuine price under $0.01/1M (or 1 sat/1M)
+    /// would otherwise be read as per-token and inflated 1,000,000×.
+    pub fn with_explicit_per_million(mut self, explicit: ExplicitPerMillion) -> Self {
+        let pairs = [
+            (&mut self.price_in_usd, explicit.usd_in),
+            (&mut self.price_out_usd, explicit.usd_out),
+            (&mut self.price_in_sats, explicit.sats_in),
+            (&mut self.price_out_sats, explicit.sats_out),
+        ];
+        for (side, value) in pairs {
+            if let Some(v) = sanitize_opt(value) {
+                *side = Some(v);
+            }
+        }
+        self.primary = self.derive_primary();
+        self
+    }
+
+    fn derive_primary(&self) -> PricePrimary {
+        let has_usd = self.price_in_usd.is_some() || self.price_out_usd.is_some();
+        let has_sats = self.price_in_sats.is_some() || self.price_out_sats.is_some();
+        match (has_usd, has_sats) {
+            (true, true) => PricePrimary::Both,
+            (true, false) => PricePrimary::Usd,
+            (false, true) => PricePrimary::Sats,
+            (false, false) => PricePrimary::None,
+        }
+    }
 }
 
 /// Map a USD catalog rate to USD per 1M tokens.

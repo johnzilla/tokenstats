@@ -139,6 +139,15 @@ pub enum Commands {
         #[arg(long, default_value_t = 10, env = "TOKENSTATS_NODE_TIMEOUT_SECS")]
         node_timeout_secs: u64,
 
+        /// Max Nostr-discovered nodes kept (0 = unlimited). `--node` seeds don't count.
+        #[arg(long, default_value_t = 512, env = "TOKENSTATS_MAX_NODES")]
+        max_nodes: usize,
+
+        /// Drop discovered nodes not announced or successfully polled within
+        /// this many seconds (0 = never).
+        #[arg(long, default_value_t = 604_800, env = "TOKENSTATS_NODE_TTL_SECS")]
+        node_ttl_secs: u64,
+
         /// Drop quotes not re-observed within this many seconds (0 = never).
         #[arg(long, default_value_t = 86_400, env = "TOKENSTATS_QUOTE_TTL_SECS")]
         quote_ttl_secs: u64,
@@ -201,6 +210,8 @@ pub struct Config {
     pub node_concurrency: usize,
     pub node_timeout: Duration,
     pub quote_ttl: Option<Duration>,
+    pub max_nodes: usize,
+    pub node_ttl: Option<Duration>,
     pub stale_after: Duration,
     pub max_price_usd_per_1m: Option<f64>,
     pub openrouter_url: String,
@@ -231,6 +242,8 @@ impl Config {
             node_concurrency,
             node_timeout_secs,
             quote_ttl_secs,
+            max_nodes,
+            node_ttl_secs,
             stale_after_secs,
             max_price_usd_per_1m,
             openrouter_url,
@@ -259,6 +272,8 @@ impl Config {
             node_concurrency: (*node_concurrency).max(1),
             node_timeout: Duration::from_secs((*node_timeout_secs).max(1)),
             quote_ttl: (*quote_ttl_secs > 0).then(|| Duration::from_secs(*quote_ttl_secs)),
+            max_nodes: *max_nodes,
+            node_ttl: (*node_ttl_secs > 0).then(|| Duration::from_secs(*node_ttl_secs)),
             stale_after: Duration::from_secs((*stale_after_secs).max(1)),
             max_price_usd_per_1m: Some(*max_price_usd_per_1m).filter(|m| *m > 0.0),
             openrouter_url: openrouter_url.clone(),
@@ -290,6 +305,8 @@ impl Config {
             node_concurrency = self.node_concurrency,
             node_timeout_secs = self.node_timeout.as_secs(),
             quote_ttl_secs = self.quote_ttl.map(|d| d.as_secs()).unwrap_or(0),
+            max_nodes = self.max_nodes,
+            node_ttl_secs = self.node_ttl.map(|d| d.as_secs()).unwrap_or(0),
             stale_after_secs = self.stale_after.as_secs(),
             max_price_usd_per_1m = self.max_price_usd_per_1m.unwrap_or(0.0),
             "configuration"
@@ -318,6 +335,8 @@ mod tests {
         assert_eq!(cfg.node_concurrency, 16);
         assert_eq!(cfg.node_timeout.as_secs(), 10);
         assert_eq!(cfg.quote_ttl, Some(Duration::from_secs(86_400)));
+        assert_eq!(cfg.max_nodes, 512);
+        assert_eq!(cfg.node_ttl, Some(Duration::from_secs(604_800)));
         assert_eq!(cfg.stale_after.as_secs(), 600);
         assert_eq!(cfg.max_price_usd_per_1m, Some(1000.0));
         assert!(!cfg.allow_private_nodes);

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use nostr_sdk::prelude::*;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -168,7 +168,11 @@ fn handle_event(store: &Store, event: &Event) -> Result<()> {
         region,
         pubkey: Some(event.pubkey.to_string()),
         discovered_via: format!("nostr:{kind}"),
-        last_seen: Utc::now(),
+        // When the node announced itself, not when a relay replayed it; clamped
+        // so a future-dated event can't dodge the node TTL.
+        last_seen: DateTime::from_timestamp(event.created_at.as_u64() as i64, 0)
+            .unwrap_or_else(Utc::now)
+            .min(Utc::now()),
         reliability: 0.0,
         poll_ok: 0,
         poll_total: 0,
@@ -183,7 +187,11 @@ fn handle_event(store: &Store, event: &Event) -> Result<()> {
         "discovered Routstr node"
     );
     store.record_announcement();
-    store.upsert_node(node);
+    let endpoint = node.endpoint.clone();
+    if !store.upsert_node(node) {
+        // debug, not warn: a flood would otherwise flood the logs too.
+        debug!(%endpoint, "node cap reached; ignoring announcement (see --max-nodes)");
+    }
     Ok(())
 }
 

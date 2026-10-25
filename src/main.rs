@@ -78,6 +78,7 @@ async fn run_serve(cfg: Config) -> Result<()> {
     let store = Arc::new(Store::new());
     // Set before restore so legacy snapshot rows are bounded too.
     store.set_price_ceiling_usd(cfg.max_price_usd_per_1m);
+    store.set_max_nodes(cfg.max_nodes);
     info!(version = env!("CARGO_PKG_VERSION"), "tokenstats starting");
     cfg.log_summary();
 
@@ -168,6 +169,7 @@ async fn run_serve(cfg: Config) -> Result<()> {
             node_concurrency: cfg.node_concurrency,
             node_timeout: cfg.node_timeout,
             quote_ttl: cfg.quote_ttl,
+            node_ttl: cfg.node_ttl,
             allow_private_nodes: cfg.allow_private_nodes,
         };
         tokio::spawn(async move {

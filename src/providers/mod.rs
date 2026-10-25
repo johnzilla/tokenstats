@@ -31,6 +31,8 @@ pub struct PollerConfig {
     pub node_timeout: Duration,
     /// Drop quotes not re-observed within this window (`None` = keep forever).
     pub quote_ttl: Option<Duration>,
+    /// Drop discovered nodes not seen within this window (`None` = keep forever).
+    pub node_ttl: Option<Duration>,
     /// Poll Nostr-announced nodes on private/loopback addresses (trusted LAN only).
     pub allow_private_nodes: bool,
 }
@@ -224,6 +226,15 @@ async fn poll_once(
         .and_then(|ttl| chrono::Duration::from_std(ttl).ok())
         .map(|ttl| store.prune_stale_quotes(ttl))
         .unwrap_or(0);
+
+    let nodes_expired = cfg
+        .node_ttl
+        .and_then(|ttl| chrono::Duration::from_std(ttl).ok())
+        .map(|ttl| store.prune_stale_nodes(ttl))
+        .unwrap_or(0);
+    if nodes_expired > 0 {
+        info!(nodes_expired, "expired nodes not seen within node TTL");
+    }
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
     store.record_cycle(PollCycle {

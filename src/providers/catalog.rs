@@ -3,7 +3,9 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::pricing::{normalize_catalog_prices, sanitize_price, CatalogHint, NormalizedPrices};
+use crate::pricing::{
+    normalize_catalog_prices, sanitize_price, CatalogHint, ExplicitPerMillion, NormalizedPrices,
+};
 
 /// One model entry after loose JSON parsing.
 #[derive(Debug, Clone)]
@@ -29,6 +31,11 @@ struct Pricing {
     input: Option<Value>,
     #[serde(default)]
     output: Option<Value>,
+    // Explicit per-1M rates (OrcaRouter); preferred over the magnitude heuristic.
+    #[serde(default)]
+    prompt_per_million: Option<Value>,
+    #[serde(default)]
+    completion_per_million: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,19 +96,28 @@ fn parse_one(v: &Value, hint: CatalogHint) -> Option<CatalogModel> {
     let row: ModelRow = serde_json::from_value(v.clone()).ok()?;
     let id = row.id.filter(|s| !s.is_empty())?;
 
-    let (pricing_prompt, pricing_completion) = match row.pricing {
-        Some(p) => (
-            num_from_value(p.prompt.as_ref().or(p.input.as_ref())),
-            num_from_value(p.completion.as_ref().or(p.output.as_ref())),
-        ),
+    let mut explicit = ExplicitPerMillion::default();
+    let (pricing_prompt, pricing_completion) = match &row.pricing {
+        Some(p) => {
+            explicit.usd_in = num_from_value(p.prompt_per_million.as_ref());
+            explicit.usd_out = num_from_value(p.completion_per_million.as_ref());
+            (
+                num_from_value(p.prompt.as_ref().or(p.input.as_ref())),
+                num_from_value(p.completion.as_ref().or(p.output.as_ref())),
+            )
+        }
         None => (None, None),
     };
 
-    let (sats_prompt, sats_completion) = match row.sats_pricing {
-        Some(p) => (
-            num_from_value(p.prompt.as_ref().or(p.input.as_ref())),
-            num_from_value(p.completion.as_ref().or(p.output.as_ref())),
-        ),
+    let (sats_prompt, sats_completion) = match &row.sats_pricing {
+        Some(p) => {
+            explicit.sats_in = num_from_value(p.prompt_per_million.as_ref());
+            explicit.sats_out = num_from_value(p.completion_per_million.as_ref());
+            (
+                num_from_value(p.prompt.as_ref().or(p.input.as_ref())),
+                num_from_value(p.completion.as_ref().or(p.output.as_ref())),
+            )
+        }
         None => (None, None),
     };
 
@@ -113,7 +129,8 @@ fn parse_one(v: &Value, hint: CatalogHint) -> Option<CatalogModel> {
         row.input_cost,
         row.output_cost,
         hint,
-    );
+    )
+    .with_explicit_per_million(explicit);
 
     let modalities: Vec<String> = row
         .architecture
@@ -232,6 +249,30 @@ mod tests {
         assert_eq!(models[0].price_in_sats(), None);
         assert_eq!(models[0].context_length, Some(8192));
         assert_eq!(models[0].primary(), PricePrimary::Usd);
+    }
+
+    #[test]
+    fn explicit_per_million_beats_magnitude_heuristic() {
+        // A catalog stating $0.005 / 1M: read through the heuristic alone, the
+        // `prompt` value (< 0.01) would be taken as per-token and become
+        // $5,000 / 1M. The explicit per-1M field wins.
+        let body = json!({ "data": [
+            { "id": "tiny", "pricing": {
+                "prompt": "0.005", "completion": "0.008",
+                "prompt_per_million": "0.005", "completion_per_million": "0.008"
+            } },
+            { "id": "sats", "sats_pricing": {
+                "prompt": "0.5", "prompt_per_million": "0.5"
+            } },
+            { "id": "heuristic-only", "pricing": { "prompt": "0.000002" } }
+        ]});
+        let m = parse_models_payload_with_hint(&body, CatalogHint::OpenRouter);
+        assert!((m[0].price_in_usd().unwrap() - 0.005).abs() < 1e-12);
+        assert!((m[0].price_out_usd().unwrap() - 0.008).abs() < 1e-12);
+        assert!((m[1].price_in_sats().unwrap() - 0.5).abs() < 1e-12);
+        assert_eq!(m[1].primary(), PricePrimary::Sats);
+        // No explicit field: unchanged heuristic (per-token → per-1M).
+        assert!((m[2].price_in_usd().unwrap() - 2.0).abs() < 1e-9);
     }
 
     #[test]

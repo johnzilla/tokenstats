@@ -124,8 +124,18 @@ impl Db {
                 row.get::<_, String>(0)
             })
         {
-            if let Ok(r) = rate.parse::<f64>() {
-                store.set_btc_usd(r);
+            let at = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'btc_usd_at'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|t| t.with_timezone(&Utc));
+            match rate.parse::<f64>() {
+                Ok(r) if store.set_btc_usd(r, at) => {}
+                _ => warn!(%rate, "ignoring implausible BTC/USD from sqlite"),
             }
         }
 
@@ -329,6 +339,13 @@ impl Db {
                 params![rate.to_string()],
             )?;
         }
+        if let Some(at) = store.btc_usd_at() {
+            tx.execute(
+                "INSERT INTO meta(key, value) VALUES('btc_usd_at', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![at.to_rfc3339()],
+            )?;
+        }
 
         tx.commit()?;
         // Only advance after a successful commit, so a failed save retries.
@@ -400,6 +417,8 @@ mod tests {
         store.record_poll("https://n1", true, Some(90));
         store.record_poll("https://n1", false, None);
         store.record_probe("https://n1", Ok((Default::default(), 30, None)));
+        let btc_at = Utc::now() - chrono::Duration::minutes(3);
+        store.set_btc_usd(81_000.0, Some(btc_at));
         let db = Db::open(&path).unwrap();
         db.save_from(&store).unwrap();
         // Second save only rewrites the current hour; still one row.
@@ -410,6 +429,11 @@ mod tests {
         db.load_into(&restored).unwrap();
         let st = &restored.endpoint_stats()["https://n1"];
         assert_eq!(st.polls_24h, 3);
+        assert_eq!(restored.btc_usd(), Some(81_000.0));
+        assert_eq!(
+            restored.btc_usd_at().map(|t| t.timestamp()),
+            Some(btc_at.timestamp())
+        );
         // Probe history persists too and wins for latency.
         assert_eq!(st.latency_source, Some("probe"));
         assert_eq!(st.latency_p50_ms, Some(32));

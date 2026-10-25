@@ -35,6 +35,8 @@ Binary after release build: `./target/release/tokenstats serve`.
 | `TOKENSTATS_NODE_CONCURRENCY` | `--node-concurrency` | `16` |
 | `TOKENSTATS_NODE_TIMEOUT_SECS` | `--node-timeout-secs` | `10` |
 | `TOKENSTATS_QUOTE_TTL_SECS` | `--quote-ttl-secs` | `86400` (`0` = never expire) |
+| `TOKENSTATS_MAX_NODES` | `--max-nodes` | `512` (`0` = unlimited; `--node` seeds don't count) |
+| `TOKENSTATS_NODE_TTL_SECS` | `--node-ttl-secs` | `604800` (`0` = never expire) |
 | `TOKENSTATS_STALE_AFTER_SECS` | `--stale-after-secs` | `600` |
 | `TOKENSTATS_MAX_PRICE_USD_PER_1M` | `--max-price-usd-per-1m` | `1000` (`0` = no ceiling) |
 | `TOKENSTATS_OPENROUTER_URL` | `--openrouter-url` | OpenRouter models URL |
@@ -86,6 +88,17 @@ Nostr announcements are unauthenticated, so by default tokenstats **never reques
 - Quotes not re-observed within `--quote-ttl-secs` (default 24h) are dropped, e.g. when a node stays down. Expiry runs only while polling is enabled, so `--no-poll` inspection of an old snapshot keeps everything.
 - Quotes older than `--stale-after-secs` (default 10 min) are kept but flagged `stale: true`; pass `exclude_stale=1` to hide them.
 - A USD price above `--max-price-usd-per-1m` (default $1000) is treated as a unit error and nulled (both USD and sats for that side).
+
+### Node cap and expiry
+
+Anyone who can post to a subscribed relay can announce endpoints, so discovered nodes are bounded:
+
+- **Cap** (`--max-nodes`, default 512). At the limit, a new announcement evicts the lowest-ranked discovered node, where rank = (catalog fetched in the last 24h, `last_seen`). A newcomer that ranks below every node is ignored, so a flood of fresh announcements can only displace nodes that aren't answering. `--node` seeds are never evicted.
+- **Expiry** (`--node-ttl-secs`, default 7 days). A node is dropped once it has been neither announced nor successfully polled for the TTL *while tokenstats kept trying to poll it*. `last_seen` uses the announcement's own timestamp (clamped to now), so relay replays of old events don't refresh it. The "kept trying" clock is in memory, so a restart restarts it; the cap is the hard bound.
+
+### BTC/USD rate
+
+Rates outside $100–$10M are rejected (the previous rate is kept and a warning logged), so a feed glitch can't corrupt every sats price. `/health` and `/api/summary` report `btc_usd_at` and `btc_usd_age_secs` (also persisted), and the feed goes `degraded` when the rate is older than `--stale-after-secs` or its age is unknown.
 
 ### Reliability and latency history
 

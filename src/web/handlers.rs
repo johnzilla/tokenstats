@@ -30,6 +30,8 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "quotes": quotes.len(),
         "nodes": state.store.node_count(),
         "btc_usd": state.store.btc_usd(),
+        "btc_usd_at": state.store.btc_usd_at(),
+        "btc_usd_age_secs": btc_age_secs(&state),
         "last_updated": last.map(|t| t.to_rfc3339()),
         "ts": Utc::now().to_rfc3339(),
     }))
@@ -264,6 +266,8 @@ pub async fn api_summary(State(state): State<AppState>) -> impl IntoResponse {
         "distinct_models": models.len(),
         "by_source": by_source,
         "btc_usd": state.store.btc_usd(),
+        "btc_usd_at": state.store.btc_usd_at(),
+        "btc_usd_age_secs": btc_age_secs(&state),
         "blend_ratio": ratio,
         "last_updated": last.map(|t| t.to_rfc3339()),
         "best_now": best.iter().map(|b| serde_json::json!({
@@ -988,6 +992,13 @@ fn host_from_url(url: &str) -> Option<String> {
     } else {
         Some(host.to_string())
     }
+}
+
+fn btc_age_secs(state: &AppState) -> Option<i64> {
+    state
+        .store
+        .btc_usd_at()
+        .map(|t| (Utc::now() - t).num_seconds().max(0))
 }
 
 fn freshest_ts(quotes: &[Quote]) -> Option<DateTime<Utc>> {

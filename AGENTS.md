@@ -50,6 +50,8 @@ Centralized in `src/config.rs`. Prefer adding new knobs there (CLI + `TOKENSTATS
 - Quote key: `{source}:{provider_id}:{model}` (latest-wins).
 - Catalog fetches go through `replace_catalog` (drops delisted models for that source/provider/endpoint; empty fetch is a no-op). Quotes older than `--quote-ttl-secs` are expired by the poller.
 - On upsert, preserve `prev_price_*` for delta indicators; oracle sats updates must **not** clobber deltas (`apply_sats_normalization`).
+- Nodes are bounded: `upsert_node` enforces `--max-nodes` (evicts the lowest (fetched-in-24h, last_seen) discovered node, refuses newcomers that rank below everyone) and `prune_stale_nodes` expires nodes not announced/polled OK for `--node-ttl-secs` after a full TTL of attempts. Nostr `last_seen` = event `created_at` (clamped), never "now".
+- BTC/USD: `Store::set_btc_usd(rate, at)` rejects rates outside `pricing::BTC_USD_MIN..=MAX`; `btc_usd_at` is persisted in `meta` and drives feed staleness.
 - Node reliability: `record_poll` feeds raw 1h samples (`reliability_1h`) and hourly buckets with latency histograms (`src/store/history.rs`, 7 days) behind `endpoint_stats()`. Buckets persist in `endpoint_hours`; only hours touched since the last save are upserted.
 - SSRF guard (`src/providers/netguard.rs`): non-`cli` nodes (i.e. Nostr announcements) are never requested when the host is or resolves to loopback/private/CGNAT/link-local/unique-local/unspecified, unless `--allow-private-nodes`. Use the guarded client (public-only resolver + redirect checks) for any new fetch of announced URLs. Skips set `ProviderNode.skip_reason`.
 - Node probes: each cycle `NodeFetcher::poll` runs the catalog fetch and a `GET /v1/info` side by side (same guard). Probes feed `record_probe` (latency history in `endpoint_probe_hours` + latest `ProbeStatus`, not persisted), never reliability. Identity = `nostr::same_pubkey(announced pubkey, info.npub)`.
@@ -92,7 +94,7 @@ Related helpers (not substitutes for the full board):
 | `GET /api/quotes` | **Main integration** — full filtered quote list |
 | `GET /api/summary` | Compact Best Now strip + counts + `btc_usd` + feed `status`/`feed` |
 | `GET /api/nodes` | Discovered Routstr endpoints + reliability (`reliability_1h/24h/7d`, `polls_24h`) + `latency_p50_ms/p95_ms`/`latency_source` + `identity_verified` + `probe` (`probed_at`, `ok`, `error`) + `info` (self-reported `/v1/info`: `name`, `version`, `npub`, `mints`, `onion_url`) + `last_success_at` / `last_error` / `consecutive_failures` + `skip_reason` (string \| null) when the SSRF guard refused to poll |
-| `GET /health` | Liveness + feed `status` / `feed` object / quote count / `last_updated` |
+| `GET /health` | Liveness + feed `status` / `feed` object / quote count / `btc_usd` + `btc_usd_at` / `btc_usd_age_secs` / `last_updated` |
 | `GET /export.csv` | Same filters as quotes, for offline analysis |
 
 Default base URL locally: `http://127.0.0.1:8080`.
@@ -238,6 +240,9 @@ catalog model row
   │     sanitize → if v < 1.0: treat as sats/token × 1e6
   │                else:       already sats/1M
   │     → price_in_sats / price_out_sats
+  │
+  ├─ pricing/sats_pricing .prompt_per_million / .completion_per_million
+  │     explicit per-1M (OrcaRouter) → used as-is, overrides the heuristics below
   │
   ├─ pricing.prompt/completion  (OpenRouter-shaped USD)
   │     sanitize → if v < 0.01: treat as USD/token × 1e6
