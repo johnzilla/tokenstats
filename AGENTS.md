@@ -71,6 +71,11 @@ Centralized in `src/config.rs`. Prefer adding new knobs there (CLI + `TOKENSTATS
 - Snapshot on interval + final snapshot on graceful shutdown.
 - Use `spawn_blocking` for rusqlite.
 
+### Images / deploy
+
+- CI's `docker` job builds and smoke-tests the image on every PR; on green `main` it pushes that same image to `ghcr.io/johnzilla/tokenstats` (`:latest`, `:sha-<short>`). Never push from PR builds.
+- `docker-compose.yml` pulls the image (`TOKENSTATS_TAG`, default `latest`) and keeps `build: .` as a fallback. Production deploys are pull-based: `docs/DEPLOY.md` §6.
+
 ### Git
 
 - Commits pushed to GitHub must be **SSH-signed** (`commit.gpgsign=true`, `gpg.format=ssh`).

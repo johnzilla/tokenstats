@@ -1,18 +1,20 @@
 # tokenstats production stack (app + optional Caddy TLS).
 #
-# App only (HTTP on :8080):
-#   docker compose up -d --build
+# The app image is built and published by CI (ghcr.io/johnzilla/tokenstats),
+# so deploys pull instead of compiling on the host:
+#   docker compose --profile proxy pull && docker compose --profile proxy up -d
+# Pin a build with TOKENSTATS_TAG=sha-<short> in .env (default: latest).
+# Build locally instead (dev, or a fork): add --build to `up`.
 #
-# With Caddy (HTTPS on :80/:443 — recommended on a Droplet):
-#   # set DOMAIN in .env (see deploy/env.example)
-#   docker compose --profile proxy up -d --build
+# With Caddy (HTTPS on :80/:443 — recommended on a Droplet): set DOMAIN in
+# .env (see deploy/env.example) and use --profile proxy as above.
 #
 # Logs:  docker compose logs -f tokenstats
 
 services:
   tokenstats:
+    image: ghcr.io/johnzilla/tokenstats:${TOKENSTATS_TAG:-latest}
     build: .
-    image: tokenstats:local
     container_name: tokenstats
     restart: unless-stopped
     # Allow time for final SQLite snapshot on stop/restart
