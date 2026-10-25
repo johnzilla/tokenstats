@@ -18,6 +18,7 @@ pub const DEFAULT_RELAYS: &[&str] = &[
 
 pub const DEFAULT_DB: &str = "data/tokenstats.db";
 pub const DEFAULT_OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/models";
+pub const DEFAULT_ORCAROUTER_URL: &str = "https://api.orcarouter.ai/v1/models";
 pub const DEFAULT_BTC_USD_URL: &str = "https://api.coinbase.com/v2/prices/BTC-USD/spot";
 
 #[derive(Debug, Parser)]
@@ -74,6 +75,10 @@ pub enum Commands {
         /// Disable OpenRouter catalog (still poll discovered Routstr nodes if poll enabled).
         #[arg(long, default_value_t = false, env = "TOKENSTATS_NO_OPENROUTER")]
         no_openrouter: bool,
+
+        /// Disable OrcaRouter catalog.
+        #[arg(long, default_value_t = false, env = "TOKENSTATS_NO_ORCAROUTER")]
+        no_orcarouter: bool,
 
         /// Disable BTC/USD oracle loop (sats fields stay empty unless restored).
         #[arg(long, default_value_t = false, env = "TOKENSTATS_NO_ORACLE")]
@@ -145,6 +150,10 @@ pub enum Commands {
         #[arg(long, default_value = DEFAULT_OPENROUTER_URL, env = "TOKENSTATS_OPENROUTER_URL")]
         openrouter_url: String,
 
+        /// OrcaRouter models catalog URL.
+        #[arg(long, default_value = DEFAULT_ORCAROUTER_URL, env = "TOKENSTATS_ORCAROUTER_URL")]
+        orcarouter_url: String,
+
         /// BTC/USD spot price URL (JSON with data.amount).
         #[arg(long, default_value = DEFAULT_BTC_USD_URL, env = "TOKENSTATS_BTC_USD_URL")]
         btc_usd_url: String,
@@ -167,6 +176,7 @@ pub struct Config {
     pub enable_nostr: bool,
     pub enable_poll: bool,
     pub enable_openrouter: bool,
+    pub enable_orcarouter: bool,
     pub enable_oracle: bool,
     pub poll_interval: Duration,
     pub btc_rate_interval: Duration,
@@ -179,6 +189,7 @@ pub struct Config {
     pub stale_after: Duration,
     pub max_price_usd_per_1m: Option<f64>,
     pub openrouter_url: String,
+    pub orcarouter_url: String,
     pub btc_usd_url: String,
 }
 
@@ -190,6 +201,7 @@ impl Config {
             no_nostr,
             no_poll,
             no_openrouter,
+            no_orcarouter,
             no_oracle,
             node,
             allow_private_nodes,
@@ -206,6 +218,7 @@ impl Config {
             stale_after_secs,
             max_price_usd_per_1m,
             openrouter_url,
+            orcarouter_url,
             btc_usd_url,
         } = &cli.command;
 
@@ -219,6 +232,7 @@ impl Config {
             enable_nostr: !no_nostr,
             enable_poll: !no_poll,
             enable_openrouter: !no_openrouter,
+            enable_orcarouter: !no_orcarouter,
             enable_oracle: !no_oracle,
             poll_interval: Duration::from_secs((*poll_interval_secs).max(5)),
             btc_rate_interval: Duration::from_secs((*btc_interval_secs).max(5)),
@@ -231,6 +245,7 @@ impl Config {
             stale_after: Duration::from_secs((*stale_after_secs).max(1)),
             max_price_usd_per_1m: Some(*max_price_usd_per_1m).filter(|m| *m > 0.0),
             openrouter_url: openrouter_url.clone(),
+            orcarouter_url: orcarouter_url.clone(),
             btc_usd_url: btc_usd_url.clone(),
         }
     }
@@ -244,6 +259,7 @@ impl Config {
             enable_nostr = self.enable_nostr,
             enable_poll = self.enable_poll,
             enable_openrouter = self.enable_openrouter,
+            enable_orcarouter = self.enable_orcarouter,
             enable_oracle = self.enable_oracle,
             relays = self.relays.len(),
             seed_nodes = self.seed_nodes.len(),
@@ -276,6 +292,7 @@ mod tests {
         assert!(cfg.enable_nostr);
         assert!(cfg.enable_poll);
         assert!(cfg.enable_openrouter);
+        assert!(cfg.enable_orcarouter);
         assert_eq!(cfg.poll_interval.as_secs(), 60);
         assert_eq!(cfg.relays.len(), 3);
         assert_eq!(cfg.node_concurrency, 16);
@@ -307,6 +324,7 @@ mod tests {
             "serve",
             "--no-nostr",
             "--no-openrouter",
+            "--no-orcarouter",
             "--no-persist",
             "--poll-interval-secs",
             "10",
@@ -315,6 +333,7 @@ mod tests {
         let cfg = Config::from_cli(&cli);
         assert!(!cfg.enable_nostr);
         assert!(!cfg.enable_openrouter);
+        assert!(!cfg.enable_orcarouter);
         assert!(!cfg.persist);
         assert_eq!(cfg.poll_interval.as_secs(), 10);
     }

@@ -36,7 +36,7 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct QuotesQuery {
-    /// Filter by source: openrouter | routstr | nostr
+    /// Filter by source(s), comma-separated: openrouter | orcarouter | routstr | nostr
     pub source: Option<String>,
     /// Case-insensitive model id substring.
     pub model: Option<String>,
@@ -612,7 +612,7 @@ pub async fn dashboard(
       display: inline-block; padding: 0.1rem 0.4rem; border-radius: 4px;
       font-size: 0.68rem; border: 1px solid var(--border);
     }}
-    .src-openrouter {{ color: var(--blue); }}
+    .src-openrouter, .src-orcarouter {{ color: var(--blue); }}
     .src-routstr {{ color: var(--accent); }}
     .src-nostr {{ color: var(--warn); }}
     .family {{

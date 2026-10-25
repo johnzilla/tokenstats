@@ -24,6 +24,7 @@ Binary after release build: `./target/release/tokenstats serve`.
 | `TOKENSTATS_NO_NOSTR` | `--no-nostr` | false |
 | `TOKENSTATS_NO_POLL` | `--no-poll` | false |
 | `TOKENSTATS_NO_OPENROUTER` | `--no-openrouter` | false |
+| `TOKENSTATS_NO_ORCAROUTER` | `--no-orcarouter` | false |
 | `TOKENSTATS_NO_ORACLE` | `--no-oracle` | false |
 | `TOKENSTATS_NO_PERSIST` | `--no-persist` | false |
 | `TOKENSTATS_POLL_INTERVAL_SECS` | `--poll-interval-secs` | `60` |
@@ -37,6 +38,7 @@ Binary after release build: `./target/release/tokenstats serve`.
 | `TOKENSTATS_STALE_AFTER_SECS` | `--stale-after-secs` | `600` |
 | `TOKENSTATS_MAX_PRICE_USD_PER_1M` | `--max-price-usd-per-1m` | `1000` (`0` = no ceiling) |
 | `TOKENSTATS_OPENROUTER_URL` | `--openrouter-url` | OpenRouter models URL |
+| `TOKENSTATS_ORCAROUTER_URL` | `--orcarouter-url` | `https://api.orcarouter.ai/v1/models` |
 | `TOKENSTATS_BTC_USD_URL` | `--btc-usd-url` | Coinbase spot URL |
 | `TOKENSTATS_LOG_JSON` | `--log-json` | false |
 | `RUST_LOG` | (overrides `-v`) | derived from `-v` |
@@ -52,13 +54,14 @@ Binary after release build: `./target/release/tokenstats serve`.
 
 ## Common workflows
 
-### Observe OpenRouter only
+### Observe centralized catalogs only
 
 ```bash
-tokenstats serve --no-nostr
+tokenstats serve --no-nostr                  # OpenRouter + OrcaRouter
+tokenstats serve --no-nostr --no-orcarouter  # OpenRouter only
 ```
 
-Useful on restricted networks or when you only need a centralized reference catalog.
+Useful on restricted networks or when you only need centralized reference catalogs.
 
 ### Watch a specific Routstr node
 
@@ -144,6 +147,7 @@ Click **Export CSV** or:
 ```bash
 curl -OJ 'http://127.0.0.1:8080/export.csv?preset=frontier&ratio=3'
 curl -OJ 'http://127.0.0.1:8080/export.csv?source=openrouter&model=claude'
+curl -OJ 'http://127.0.0.1:8080/export.csv?source=openrouter,orcarouter&model=claude'
 ```
 
 Columns include source, provider, model, USD/sats, blended price, delta, endpoint, context, timestamps, plus `kind`, `age_secs`, `stale`, `reliability_1h`, `outlier`. Export honors the same filters as the board and API.
@@ -181,7 +185,7 @@ curl -s localhost:8080/api/nodes | jq
 
 | Symptom | What to try |
 |---------|-------------|
-| Empty board | Wait for first OpenRouter poll; check logs with `-v` |
+| Empty board | Wait for the first catalog poll; check logs with `-v` |
 | No nodes | Nostr blocked? Use `--node URL` or wait for kind 38421 events |
 | Node has `skip_reason` | Its announced endpoint is private/loopback; seed it with `--node` or use `--allow-private-nodes` on a trusted LAN |
 | Sats show `—` | BTC/USD fetch failed (Coinbase); USD columns still work |

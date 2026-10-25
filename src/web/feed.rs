@@ -4,6 +4,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
 
 use super::AppState;
+use crate::market::REFERENCE_SOURCES;
 use crate::store::{FetchStatus, Quote};
 
 /// Feed status shared by `/health` and `/api/summary`.
@@ -29,7 +30,10 @@ pub fn feed_status(state: &AppState, quotes: &[Quote]) -> Value {
         .filter(|q| now - q.observed_at > stale_after)
         .count();
 
-    let openrouter = source_summary(&fetches, "openrouter");
+    let reference: Vec<(&str, SourceSummary)> = REFERENCE_SOURCES
+        .iter()
+        .map(|s| (*s, source_summary(&fetches, s)))
+        .collect();
     let routstr = source_summary(&fetches, "routstr");
     let fresh = |t: Option<DateTime<Utc>>| t.is_some_and(|t| now - t <= stale_after);
 
@@ -48,8 +52,10 @@ pub fn feed_status(state: &AppState, quotes: &[Quote]) -> Value {
         {
             reasons.push("poll cycle has not completed recently".into());
         }
-        if openrouter.attempted && !fresh(openrouter.last_success_at) {
-            reasons.push("openrouter catalog is stale".into());
+        for (name, summary) in &reference {
+            if summary.attempted && !fresh(summary.last_success_at) {
+                reasons.push(format!("{name} catalog is stale"));
+            }
         }
         if routstr.endpoints > 0 && routstr.healthy == 0 {
             reasons.push("no Routstr node is answering".into());
@@ -64,6 +70,13 @@ pub fn feed_status(state: &AppState, quotes: &[Quote]) -> Value {
         }
     };
 
+    let mut sources: serde_json::Map<String, Value> = reference
+        .iter()
+        .filter(|(_, s)| s.attempted)
+        .map(|(name, s)| (name.to_string(), s.to_json()))
+        .collect();
+    sources.insert("routstr".into(), routstr.to_json());
+
     let last_announcement = store.last_announcement_at();
     json!({
         "status": status,
@@ -71,10 +84,7 @@ pub fn feed_status(state: &AppState, quotes: &[Quote]) -> Value {
         "stale_after_secs": stale_after.num_seconds(),
         "stale_quotes": stale_quotes,
         "last_cycle": cycle,
-        "sources": {
-            "openrouter": openrouter.to_json(),
-            "routstr": routstr.to_json(),
-        },
+        "sources": sources,
         "discovery": {
             "nodes": store.node_count(),
             "last_announcement_at": last_announcement,
