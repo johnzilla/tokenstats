@@ -48,6 +48,7 @@ Centralized in `src/config.rs`. Prefer adding new knobs there (CLI + `TOKENSTATS
 ### Store
 
 - Quote key: `{source}:{provider_id}:{model}` (latest-wins).
+- Catalog fetches go through `replace_catalog` (drops delisted models for that source/provider/endpoint; empty fetch is a no-op). Quotes older than `--quote-ttl-secs` are expired by the poller.
 - On upsert, preserve `prev_price_*` for delta indicators; oracle sats updates must **not** clobber deltas (`apply_sats_normalization`).
 - Node reliability: poll success rate over the last hour (`record_poll`).
 
@@ -195,7 +196,7 @@ Example element (illustrative):
 3. **Invalid / dynamic prices are `null`**, not negative. Catalog sentinels (OpenRouter `"-1"`, negative floats) are sanitized at ingest and on SQLite restore. Do not invent costs for `null` sides.
 4. **Default cheapest sort** ranks only **strictly positive** blends; free (`0`) and missing prices sort last (not first).
 5. **`delta_*` may be null** until a second catalog poll changes a price; do not treat null as “flat”.
-6. **Data is latest-wins in memory** (optionally restored from SQLite). There is no historical series on this endpoint yet.
+6. **Data is latest-wins in memory** (optionally restored from SQLite). There is no historical series on this endpoint yet. `observed_at` is the last successful fetch that listed the model; delisted models are removed on the next successful fetch, and quotes unseen for `TOKENSTATS_QUOTE_TTL_SECS` (default 24h) are dropped.
 7. **No auth** on the local/default bind. If exposing publicly, put a reverse proxy / network policy in front; do not assume API keys exist on tokenstats.
 8. **Breaking changes:** prefer additive fields. If renaming/removing fields or changing array-vs-object envelope, update this section, `docs/USAGE.md`, and call out arbstr/agent consumers.
 

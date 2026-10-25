@@ -114,6 +114,8 @@ Specs: [Routstr/protocol](https://github.com/Routstr/protocol)
 | Poll interval | `--poll-interval-secs` | `60` |
 | BTC interval | `--btc-interval-secs` | `60` |
 | Persist interval | `--persist-interval-secs` | `30` |
+| Node poll concurrency / timeout | `--node-concurrency` / `--node-timeout-secs` | `16` / `10` |
+| Quote expiry | `--quote-ttl-secs` | `86400` |
 | Disable Nostr | `--no-nostr` | off |
 | Disable OpenRouter | `--no-openrouter` | off |
 | JSON logs | `--log-json` / `TOKENSTATS_LOG_JSON` | off |

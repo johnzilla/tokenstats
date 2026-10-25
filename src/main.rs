@@ -149,6 +149,9 @@ async fn run_serve(cfg: Config) -> Result<()> {
             http_timeout: cfg.http_timeout,
             enable_openrouter: cfg.enable_openrouter,
             openrouter_url: cfg.openrouter_url.clone(),
+            node_concurrency: cfg.node_concurrency,
+            node_timeout: cfg.node_timeout,
+            quote_ttl: cfg.quote_ttl,
         };
         tokio::spawn(async move {
             match providers::run_poller(poll_store, poll_cfg, task_cancel).await {

@@ -8,6 +8,9 @@ use crate::store::Quote;
 
 use super::catalog::parse_models_payload_with_hint;
 
+/// OpenAI-compatible base URL advertised on OpenRouter quotes.
+pub const ENDPOINT: &str = "https://openrouter.ai/api/v1";
+
 pub async fn fetch_quotes(client: &reqwest::Client, url: &str) -> Result<Vec<Quote>> {
     let resp = client
         .get(url)
@@ -38,7 +41,7 @@ pub async fn fetch_quotes(client: &reqwest::Client, url: &str) -> Result<Vec<Quo
                 price_out_sats: prices.price_out_sats,
                 prev_price_out_usd: None,
                 prev_price_in_usd: None,
-                endpoint: Some("https://openrouter.ai/api/v1".into()),
+                endpoint: Some(ENDPOINT.into()),
                 region: None,
                 context_length: m.context_length,
                 observed_at: now,

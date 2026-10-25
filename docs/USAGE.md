@@ -30,6 +30,9 @@ Binary after release build: `./target/release/tokenstats serve`.
 | `TOKENSTATS_NORMALIZE_INTERVAL_SECS` | `--normalize-interval-secs` | `15` |
 | `TOKENSTATS_PERSIST_INTERVAL_SECS` | `--persist-interval-secs` | `30` |
 | `TOKENSTATS_HTTP_TIMEOUT_SECS` | `--http-timeout-secs` | `20` |
+| `TOKENSTATS_NODE_CONCURRENCY` | `--node-concurrency` | `16` |
+| `TOKENSTATS_NODE_TIMEOUT_SECS` | `--node-timeout-secs` | `10` |
+| `TOKENSTATS_QUOTE_TTL_SECS` | `--quote-ttl-secs` | `86400` (`0` = never expire) |
 | `TOKENSTATS_OPENROUTER_URL` | `--openrouter-url` | OpenRouter models URL |
 | `TOKENSTATS_BTC_USD_URL` | `--btc-usd-url` | Coinbase spot URL |
 | `TOKENSTATS_LOG_JSON` | `--log-json` | false |
@@ -60,7 +63,12 @@ Useful on restricted networks or when you only need a centralized reference cata
 tokenstats serve --node https://api.example.com --node https://other.example.com
 ```
 
-Nodes are polled at `/v1/models` (with a few path fallbacks). Failures count against reliability.
+Nodes are polled concurrently (`--node-concurrency`) at `/v1/models` (falling back to `/models`), each within `--node-timeout-secs`. Failures and timeouts count against reliability.
+
+### Freshness
+
+- A successful catalog fetch replaces that provider endpoint's models: models it no longer lists are removed. An empty response is ignored rather than wiping the provider.
+- Quotes not re-observed within `--quote-ttl-secs` (default 24h) are dropped, e.g. when a node stays down. Expiry runs only while polling is enabled, so `--no-poll` inspection of an old snapshot keeps everything.
 
 ### Ephemeral / CI smoke
 
