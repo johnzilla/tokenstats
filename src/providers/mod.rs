@@ -6,6 +6,38 @@ mod reference;
 mod routstr;
 
 pub use catalog::model_kind;
+
+/// Drop pooled connections idle this long. Polls run every ~60 s, longer than
+/// many servers keep idle keep-alive connections, so reusing one races the
+/// server's close ("connection closed before message completed"): OrcaRouter
+/// fetches from the Droplet failed ~17% of the time that way.
+pub const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// HTTP client for catalog / oracle polling.
+pub fn http_client(timeout: Duration) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .user_agent(concat!("tokenstats/", env!("CARGO_PKG_VERSION")))
+        .build()
+}
+
+/// GET with one retry when the request died at the connection level (not a
+/// timeout, not an HTTP status): a server closing a reused connection, a reset,
+/// a refused connect. Used for the few fixed upstreams (reference catalogs,
+/// BTC/USD) where a spurious failure costs a whole poll interval.
+pub async fn get_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+) -> reqwest::Result<reqwest::Response> {
+    match client.get(url).send().await {
+        Err(e) if !e.is_timeout() && (e.is_request() || e.is_connect()) => {
+            tracing::debug!(%url, error = %e, "connection-level failure; retrying once");
+            client.get(url).send().await
+        }
+        other => other,
+    }
+}
 pub use reference::{ReferenceCatalog, OPENROUTER, ORCAROUTER};
 
 use std::sync::Arc;
@@ -52,10 +84,7 @@ pub async fn run_poller(
         "starting provider poller"
     );
 
-    let client = reqwest::Client::builder()
-        .timeout(cfg.http_timeout)
-        .user_agent(concat!("tokenstats/", env!("CARGO_PKG_VERSION")))
-        .build()?;
+    let client = http_client(cfg.http_timeout)?;
     let nodes =
         routstr::NodeFetcher::new(client.clone(), cfg.http_timeout, cfg.allow_private_nodes)?;
 
@@ -257,4 +286,72 @@ async fn poll_once(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// First connection: read the request, then hang up without answering
+    /// (what a server closing a reused keep-alive connection looks like).
+    /// Second connection: answer 200.
+    async fn flaky_server(listener: TcpListener) {
+        let mut buf = [0u8; 1024];
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let _ = sock.read(&mut buf).await;
+            drop(sock);
+        }
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_once_after_connection_dropped_mid_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/models", listener.local_addr().unwrap());
+        let server = tokio::spawn(flaky_server(listener));
+        let client = http_client(Duration::from_secs(2)).unwrap();
+        let resp = get_with_retry(&client, &url).await.expect("retry succeeds");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "ok");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn plain_request_fails_on_the_same_drop() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/models", listener.local_addr().unwrap());
+        let server = tokio::spawn(flaky_server(listener));
+        let client = http_client(Duration::from_secs(2)).unwrap();
+        let err = client.get(&url).send().await.unwrap_err();
+        assert!(err.is_request() && !err.is_timeout(), "{err:#}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_status_errors_are_not_retried() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/models", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await;
+            // A retry would connect again; make sure nobody does.
+            tokio::time::timeout(Duration::from_millis(300), listener.accept())
+                .await
+                .is_err()
+        });
+        let client = http_client(Duration::from_secs(2)).unwrap();
+        assert_eq!(get_with_retry(&client, &url).await.unwrap().status(), 503);
+        assert!(server.await.unwrap(), "503 must not be retried");
+    }
 }

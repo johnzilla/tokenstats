@@ -29,10 +29,7 @@ pub async fn run_oracle(
         "starting oracle loop"
     );
 
-    let client = reqwest::Client::builder()
-        .timeout(cfg.http_timeout)
-        .user_agent(concat!("tokenstats/", env!("CARGO_PKG_VERSION")))
-        .build()?;
+    let client = crate::providers::http_client(cfg.http_timeout)?;
 
     if let Err(e) = refresh_btc_usd(&client, &store, &cfg.btc_usd_url).await {
         warn!(error = %e, "initial BTC/USD fetch failed");
@@ -71,9 +68,7 @@ pub async fn run_oracle(
 }
 
 async fn refresh_btc_usd(client: &reqwest::Client, store: &Store, url: &str) -> Result<()> {
-    let v: serde_json::Value = client
-        .get(url)
-        .send()
+    let v: serde_json::Value = crate::providers::get_with_retry(client, url)
         .await
         .context("btc usd request")?
         .error_for_status()

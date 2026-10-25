@@ -123,7 +123,7 @@ GET /api/quotes?source=&model=&kind=&preset=&ratio=&limit=&max_age_secs=&min_rel
 | `model` | string | (all) | Case-insensitive **substring** on model id (e.g. `deepseek`, `claude-sonnet`) |
 | `preset` | string | (none) | View preset (see below). When set, applies preset filter/sort instead of plain blend sort |
 | `ratio` | float | `3` | Output:input workload for blended cost (`1:r`). Allowed range effectively `>0` and `≤20`; invalid falls back to `3` |
-| `limit` | int | `200` | Max rows returned; capped at **2000** |
+| `limit` | int | `200` | Max rows returned; capped at **20000** (above the whole board today). Results are cheapest-first, so a low limit returns only the cheapest slice: narrow with `source` / `kind` rather than relying on it |
 
 **Presets** (`preset=`):
 
