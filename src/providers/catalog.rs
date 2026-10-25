@@ -34,12 +34,6 @@ struct Pricing {
 }
 
 #[derive(Debug, Deserialize)]
-struct Architecture {
-    #[serde(default)]
-    output_modalities: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
 struct ModelRow {
     id: Option<String>,
     #[serde(default)]
@@ -51,8 +45,10 @@ struct ModelRow {
     sats_pricing: Option<Pricing>,
     #[serde(default)]
     context_length: Option<u64>,
+    /// Kept loose: catalogs send `output_modalities: null` and other shapes,
+    /// and metadata must never cost us the price row.
     #[serde(default)]
-    architecture: Option<Architecture>,
+    architecture: Option<Value>,
     // alternate shapes
     #[serde(default)]
     input_cost: Option<f64>,
@@ -120,13 +116,18 @@ fn parse_one(v: &Value, hint: CatalogHint) -> Option<CatalogModel> {
         hint,
     );
 
-    let kind = model_kind(
-        &id,
-        row.architecture
-            .as_ref()
-            .map(|a| a.output_modalities.as_slice())
-            .unwrap_or_default(),
-    );
+    let modalities: Vec<String> = row
+        .architecture
+        .as_ref()
+        .and_then(|a| a.get("output_modalities"))
+        .and_then(Value::as_array)
+        .map(|v| {
+            v.iter()
+                .filter_map(|m| m.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let kind = model_kind(&id, &modalities);
 
     Some(CatalogModel {
         id,
@@ -238,6 +239,8 @@ mod tests {
             { "id": "a/vec", "architecture": { "output_modalities": ["embeddings"] } },
             { "id": "a/pic", "architecture": { "output_modalities": ["image"] } },
             { "id": "a/odd", "architecture": { "output_modalities": ["decisions"] } },
+            { "id": "null-mods-embed", "architecture": { "output_modalities": null } },
+            { "id": "bad-arch", "architecture": "text->text" },
             { "id": "text-embedding-bge-m3" },
             { "id": "whisper-1" },
             { "id": "plain-model" }
@@ -246,9 +249,10 @@ mod tests {
             .into_iter()
             .map(|m| m.kind)
             .collect();
-        let want = ["chat", "embedding", "image", "other", "embedding", "audio"];
+        // Null / odd `architecture` must not drop the row; falls back to id.
+        let want = ["chat", "embedding", "image", "other", "embedding", "chat"];
         assert_eq!(kinds[..6], want);
-        assert_eq!(kinds[6], "chat");
+        assert_eq!(kinds[6..], ["embedding", "audio", "chat"]);
     }
 
     #[test]
