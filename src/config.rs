@@ -111,6 +111,18 @@ pub enum Commands {
         #[arg(long, default_value_t = 20, env = "TOKENSTATS_HTTP_TIMEOUT_SECS")]
         http_timeout_secs: u64,
 
+        /// Max Routstr nodes polled concurrently per cycle.
+        #[arg(long, default_value_t = 16, env = "TOKENSTATS_NODE_CONCURRENCY")]
+        node_concurrency: usize,
+
+        /// Per-node poll budget (seconds) across all `/models` fallbacks.
+        #[arg(long, default_value_t = 10, env = "TOKENSTATS_NODE_TIMEOUT_SECS")]
+        node_timeout_secs: u64,
+
+        /// Drop quotes not re-observed within this many seconds (0 = never).
+        #[arg(long, default_value_t = 86_400, env = "TOKENSTATS_QUOTE_TTL_SECS")]
+        quote_ttl_secs: u64,
+
         /// OpenRouter models catalog URL.
         #[arg(long, default_value = DEFAULT_OPENROUTER_URL, env = "TOKENSTATS_OPENROUTER_URL")]
         openrouter_url: String,
@@ -142,6 +154,9 @@ pub struct Config {
     pub normalize_interval: Duration,
     pub persist_interval: Duration,
     pub http_timeout: Duration,
+    pub node_concurrency: usize,
+    pub node_timeout: Duration,
+    pub quote_ttl: Option<Duration>,
     pub openrouter_url: String,
     pub btc_usd_url: String,
 }
@@ -163,6 +178,9 @@ impl Config {
             normalize_interval_secs,
             persist_interval_secs,
             http_timeout_secs,
+            node_concurrency,
+            node_timeout_secs,
+            quote_ttl_secs,
             openrouter_url,
             btc_usd_url,
         } = &cli.command;
@@ -182,6 +200,9 @@ impl Config {
             normalize_interval: Duration::from_secs((*normalize_interval_secs).max(5)),
             persist_interval: Duration::from_secs((*persist_interval_secs).max(5)),
             http_timeout: Duration::from_secs((*http_timeout_secs).max(1)),
+            node_concurrency: (*node_concurrency).max(1),
+            node_timeout: Duration::from_secs((*node_timeout_secs).max(1)),
+            quote_ttl: (*quote_ttl_secs > 0).then(|| Duration::from_secs(*quote_ttl_secs)),
             openrouter_url: openrouter_url.clone(),
             btc_usd_url: btc_usd_url.clone(),
         }
@@ -203,6 +224,9 @@ impl Config {
             btc_interval_secs = self.btc_rate_interval.as_secs(),
             persist_interval_secs = self.persist_interval.as_secs(),
             http_timeout_secs = self.http_timeout.as_secs(),
+            node_concurrency = self.node_concurrency,
+            node_timeout_secs = self.node_timeout.as_secs(),
+            quote_ttl_secs = self.quote_ttl.map(|d| d.as_secs()).unwrap_or(0),
             "configuration"
         );
     }
@@ -224,6 +248,16 @@ mod tests {
         assert!(cfg.enable_openrouter);
         assert_eq!(cfg.poll_interval.as_secs(), 60);
         assert_eq!(cfg.relays.len(), 3);
+        assert_eq!(cfg.node_concurrency, 16);
+        assert_eq!(cfg.node_timeout.as_secs(), 10);
+        assert_eq!(cfg.quote_ttl, Some(Duration::from_secs(86_400)));
+    }
+
+    #[test]
+    fn zero_quote_ttl_disables_expiry() {
+        let cli =
+            Cli::try_parse_from(["tokenstats", "serve", "--quote-ttl-secs", "0"]).expect("parse");
+        assert_eq!(Config::from_cli(&cli).quote_ttl, None);
     }
 
     #[test]

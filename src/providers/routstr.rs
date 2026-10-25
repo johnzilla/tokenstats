@@ -14,15 +14,12 @@ pub async fn fetch_node_quotes(
     node: &ProviderNode,
 ) -> Result<(Vec<Quote>, u64)> {
     let base = node.endpoint.trim_end_matches('/');
-    let urls = [
-        format!("{base}/v1/models"),
-        format!("{base}/models"),
-        if base.ends_with("/v1") {
-            format!("{base}/models")
-        } else {
-            format!("{base}/v1/models")
-        },
-    ];
+    // `/v1` bases have one candidate; bare hosts try `/v1/models` then `/models`.
+    let urls = if base.ends_with("/v1") {
+        vec![format!("{base}/models")]
+    } else {
+        vec![format!("{base}/v1/models"), format!("{base}/models")]
+    };
 
     let mut last_err = None;
     for url in &urls {

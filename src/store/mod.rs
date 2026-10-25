@@ -1,6 +1,6 @@
 //! In-memory observation store for inference quotes and discovered nodes.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::RwLock;
 
 use chrono::{DateTime, Duration, Utc};
@@ -122,6 +122,52 @@ impl Store {
                 map.insert(k, q);
             }
         }
+    }
+
+    /// Apply one successful catalog fetch: upsert `quotes` and drop models that
+    /// `source`/`provider_id` at `endpoint` no longer lists. An empty fetch
+    /// changes nothing, so a bad payload can't wipe a provider.
+    /// Returns the number of delisted quotes removed.
+    pub fn replace_catalog(
+        &self,
+        source: &str,
+        provider_id: &str,
+        endpoint: Option<&str>,
+        quotes: Vec<Quote>,
+    ) -> usize {
+        if quotes.is_empty() {
+            return 0;
+        }
+        let listed: HashSet<String> = quotes
+            .iter()
+            .map(|q| Self::quote_key(&q.source, &q.provider_id, &q.model))
+            .collect();
+        self.upsert_quotes(quotes);
+
+        let endpoint = endpoint.map(normalize_endpoint);
+        let Ok(mut map) = self.quotes.write() else {
+            return 0;
+        };
+        let before = map.len();
+        map.retain(|k, q| {
+            listed.contains(k)
+                || q.source != source
+                || q.provider_id != provider_id
+                || q.endpoint.as_deref().map(normalize_endpoint) != endpoint
+        });
+        before - map.len()
+    }
+
+    /// Drop quotes not re-observed within `ttl` (provider down or gone).
+    /// Returns the number removed.
+    pub fn prune_stale_quotes(&self, ttl: Duration) -> usize {
+        let cutoff = Utc::now() - ttl;
+        let Ok(mut map) = self.quotes.write() else {
+            return 0;
+        };
+        let before = map.len();
+        map.retain(|_, q| q.observed_at >= cutoff);
+        before - map.len()
     }
 
     /// Replace sats fields without resetting price-delta baselines.
@@ -442,6 +488,50 @@ mod tests {
         let q = store.list_quotes().into_iter().next().unwrap();
         assert_eq!(q.prev_price_out_usd, Some(2.0));
         assert!(q.price_out_sats.unwrap() > 0.0);
+    }
+
+    fn at(model: &str, endpoint: &str) -> Quote {
+        let mut q = sample(model, 2.0);
+        q.endpoint = Some(endpoint.into());
+        q
+    }
+
+    #[test]
+    fn replace_catalog_drops_delisted_models() {
+        let store = Store::new();
+        store.upsert_quotes([at("a", "https://n1"), at("b", "https://n1")]);
+        let removed =
+            store.replace_catalog("t", "p", Some("https://n1/"), vec![at("a", "https://n1")]);
+        assert_eq!(removed, 1);
+        let models: Vec<_> = store.list_quotes().into_iter().map(|q| q.model).collect();
+        assert_eq!(models, vec!["a"]);
+    }
+
+    #[test]
+    fn replace_catalog_keeps_other_endpoints_and_empty_fetch() {
+        let store = Store::new();
+        let mut other = at("b", "https://n2");
+        other.provider_id = "q".into();
+        store.upsert_quotes([at("a", "https://n1"), other]);
+        // Different provider at another endpoint is untouched.
+        store.replace_catalog("t", "p", Some("https://n1"), vec![at("c", "https://n1")]);
+        assert_eq!(store.quote_count(), 2);
+        // Empty fetch never prunes.
+        assert_eq!(
+            store.replace_catalog("t", "p", Some("https://n1"), vec![]),
+            0
+        );
+        assert_eq!(store.quote_count(), 2);
+    }
+
+    #[test]
+    fn prune_stale_quotes_by_observed_at() {
+        let store = Store::new();
+        let mut old = sample("old", 2.0);
+        old.observed_at = Utc::now() - Duration::hours(25);
+        store.upsert_quotes([old, sample("new", 2.0)]);
+        assert_eq!(store.prune_stale_quotes(Duration::hours(24)), 1);
+        assert_eq!(store.list_quotes()[0].model, "new");
     }
 
     #[test]
