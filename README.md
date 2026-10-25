@@ -118,6 +118,7 @@ Specs: [Routstr/protocol](https://github.com/Routstr/protocol)
 | Persist interval | `--persist-interval-secs` | `30` |
 | Node poll concurrency / timeout | `--node-concurrency` / `--node-timeout-secs` | `16` / `10` |
 | Quote expiry | `--quote-ttl-secs` | `86400` |
+| Node cap / expiry | `--max-nodes` / `--node-ttl-secs` | `512` / `604800` |
 | Stale flag threshold | `--stale-after-secs` | `600` |
 | Price ceiling (USD/1M) | `--max-price-usd-per-1m` | `1000` |
 | Poll private Nostr-announced nodes | `--allow-private-nodes` | off (SSRF guard) |

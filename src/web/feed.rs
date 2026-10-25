@@ -60,8 +60,16 @@ pub fn feed_status(state: &AppState, quotes: &[Quote]) -> Value {
         if routstr.endpoints > 0 && routstr.healthy == 0 {
             reasons.push("no Routstr node is answering".into());
         }
-        if store.btc_usd().is_none() {
-            reasons.push("BTC/USD rate unknown; sats prices missing".into());
+        match (store.btc_usd(), store.btc_usd_at()) {
+            (None, _) => reasons.push("BTC/USD rate unknown; sats prices missing".into()),
+            (Some(_), None) => {
+                reasons.push("BTC/USD rate age unknown (restored without timestamp)".into())
+            }
+            (Some(_), Some(at)) if now - at > stale_after => reasons.push(format!(
+                "BTC/USD rate is stale ({}s old); sats prices may be off",
+                (now - at).num_seconds()
+            )),
+            _ => {}
         }
         if reasons.is_empty() {
             "ok"
@@ -147,12 +155,49 @@ mod tests {
             source: source.into(),
             provider_id: endpoint.into(),
             endpoint: endpoint.into(),
+            first_attempt_at: at,
             last_attempt_at: at,
             last_success_at: ok.then_some(at),
             last_error: (!ok).then(|| "boom".into()),
             consecutive_failures: u32::from(!ok),
             models: if ok { 5 } else { 0 },
         }
+    }
+
+    fn state_with_fresh_catalog() -> AppState {
+        let store = std::sync::Arc::new(crate::store::Store::new());
+        store.record_fetch("openrouter", "openrouter", "https://or", Ok(5));
+        store.record_cycle(crate::store::PollCycle {
+            finished_at: Utc::now(),
+            elapsed_ms: 1,
+            nodes_ok: 0,
+            nodes_failed: 0,
+            delisted: 0,
+            expired: 0,
+        });
+        AppState {
+            store,
+            stale_after: std::time::Duration::from_secs(600),
+            polling: true,
+            analytics: None,
+        }
+    }
+
+    #[test]
+    fn btc_rate_age_drives_status() {
+        let st = state_with_fresh_catalog();
+        st.store.set_btc_usd(80_000.0, Some(Utc::now()));
+        assert_eq!(feed_status(&st, &[])["status"], "ok");
+
+        st.store
+            .set_btc_usd(80_000.0, Some(Utc::now() - Duration::hours(2)));
+        let f = feed_status(&st, &[]);
+        assert_eq!(f["status"], "degraded");
+        assert!(f["reasons"][0].as_str().unwrap().contains("stale"));
+
+        st.store.set_btc_usd(80_000.0, None);
+        let f = feed_status(&st, &[]);
+        assert!(f["reasons"][0].as_str().unwrap().contains("age unknown"));
     }
 
     #[test]

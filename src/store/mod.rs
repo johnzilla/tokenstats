@@ -1,12 +1,13 @@
 //! In-memory observation store for inference quotes and discovered nodes.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::RwLock;
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
-use crate::pricing::sanitize_opt;
+use crate::pricing::{sane_btc_usd, sanitize_opt};
 
 mod history;
 pub use history::{EndpointStats, HourBucket, HISTORY_HOURS};
@@ -121,6 +122,8 @@ pub struct FetchStatus {
     pub source: String,
     pub provider_id: String,
     pub endpoint: String,
+    /// First fetch attempt by this process (not persisted).
+    pub first_attempt_at: DateTime<Utc>,
     pub last_attempt_at: DateTime<Utc>,
     pub last_success_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
@@ -164,6 +167,8 @@ pub struct Store {
     probes: RwLock<HashMap<String, ProbeStatus>>,
     /// Last known BTC/USD rate for sats conversion.
     btc_usd: RwLock<Option<f64>>,
+    /// When `btc_usd` was fetched (restored from SQLite when known).
+    btc_usd_at: RwLock<Option<DateTime<Utc>>>,
     /// Latest fetch outcome per `{source}|{endpoint}`.
     fetches: RwLock<HashMap<String, FetchStatus>>,
     last_cycle: RwLock<Option<PollCycle>>,
@@ -171,6 +176,8 @@ pub struct Store {
     last_announcement_at: RwLock<Option<DateTime<Utc>>>,
     /// USD per 1M above which a price is treated as a unit error (nulled).
     price_ceiling_usd: RwLock<Option<f64>>,
+    /// Max discovered (non-`cli`) nodes; 0 = unlimited.
+    max_nodes: AtomicUsize,
 }
 
 impl Store {
@@ -322,7 +329,18 @@ impl Store {
         self.quotes.read().map(|m| m.len()).unwrap_or(0)
     }
 
-    pub fn upsert_node(&self, mut node: ProviderNode) {
+    /// Cap discovered nodes so announcement floods can't grow the poll fan-out
+    /// without bound (`--max-nodes`; 0 = unlimited). `cli` seeds never count.
+    pub fn set_max_nodes(&self, max: usize) {
+        self.max_nodes.store(max, Ordering::Relaxed);
+    }
+
+    /// Insert or refresh a node. Returns `false` when a new node was refused by
+    /// the cap: at the limit, the lowest-ranked discovered node is evicted, where
+    /// rank = (catalog fetched in the last 24h, last_seen). A newcomer that ranks
+    /// below every existing node is dropped instead, so a flood of fresh
+    /// announcements can only displace nodes that aren't answering.
+    pub fn upsert_node(&self, mut node: ProviderNode) -> bool {
         let key = normalize_endpoint(&node.endpoint);
         // Attach current reliability stats if we already have history.
         let (rel, ok, total, lat) = self.reliability_for(&key);
@@ -332,18 +350,122 @@ impl Store {
         if node.last_latency_ms.is_none() {
             node.last_latency_ms = lat;
         }
-        if let Ok(mut map) = self.nodes.write() {
-            if let Some(existing) = map.get(&key) {
-                // Preserve last_latency if new node doesn't set it.
-                if node.last_latency_ms.is_none() {
-                    node.last_latency_ms = existing.last_latency_ms;
-                }
-                // Re-announcements keep the poller's verdict until the next cycle.
-                if node.skip_reason.is_none() {
-                    node.skip_reason = existing.skip_reason.clone();
+        let max = self.max_nodes.load(Ordering::Relaxed);
+        // Read before taking the nodes lock (record_fetch never holds both).
+        let proven = if max > 0 {
+            self.recently_fetched_endpoints(Duration::hours(24))
+        } else {
+            HashSet::new()
+        };
+        let Ok(mut map) = self.nodes.write() else {
+            return false;
+        };
+        let mut evicted = None;
+        if let Some(existing) = map.get(&key) {
+            // Preserve last_latency if new node doesn't set it.
+            if node.last_latency_ms.is_none() {
+                node.last_latency_ms = existing.last_latency_ms;
+            }
+            // Re-announcements keep the poller's verdict until the next cycle.
+            if node.skip_reason.is_none() {
+                node.skip_reason = existing.skip_reason.clone();
+            }
+            // A replayed old announcement must not make a node look fresher.
+            node.last_seen = node.last_seen.max(existing.last_seen);
+        } else if max > 0 && node.discovered_via != "cli" {
+            let discovered = map.values().filter(|n| n.discovered_via != "cli").count();
+            if discovered >= max {
+                let rank = |ep: &str, seen: DateTime<Utc>| (proven.contains(ep), seen);
+                let victim = map
+                    .iter()
+                    .filter(|(_, n)| n.discovered_via != "cli")
+                    .min_by_key(|(k, n)| rank(k.as_str(), n.last_seen))
+                    .map(|(k, n)| (k.clone(), rank(k.as_str(), n.last_seen)));
+                match victim {
+                    Some((victim_key, victim_rank)) if rank(&key, node.last_seen) > victim_rank => {
+                        map.remove(&victim_key);
+                        evicted = Some(victim_key);
+                    }
+                    _ => return false,
                 }
             }
-            map.insert(key, node);
+        }
+        map.insert(key, node);
+        drop(map);
+        if let Some(victim) = evicted {
+            self.forget_endpoints(&[victim]);
+        }
+        true
+    }
+
+    /// Drop discovered nodes that have been neither announced nor successfully
+    /// polled within `ttl` *while this process kept trying to poll them* (first
+    /// attempt older than `ttl`). Relays replay old announcements on every
+    /// reconnect, so an old `last_seen` alone proves nothing until the node has
+    /// had a full TTL of chances. Unpolled (e.g. blocked) nodes are left to the
+    /// cap. Returns how many were removed.
+    pub fn prune_stale_nodes(&self, ttl: Duration) -> usize {
+        let cutoff = Utc::now() - ttl;
+        let tried_since: HashMap<String, DateTime<Utc>> = self
+            .fetches
+            .read()
+            .map(|f| {
+                f.values()
+                    .filter(|s| s.source == "routstr")
+                    .map(|s| (s.endpoint.clone(), s.first_attempt_at))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let removed: Vec<String> = {
+            let Ok(mut map) = self.nodes.write() else {
+                return 0;
+            };
+            let stale: Vec<String> = map
+                .iter()
+                .filter(|(k, n)| {
+                    n.discovered_via != "cli"
+                        && n.last_seen < cutoff
+                        && tried_since.get(k.as_str()).is_some_and(|t| *t <= cutoff)
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in &stale {
+                map.remove(k);
+            }
+            stale
+        };
+        self.forget_endpoints(&removed);
+        removed.len()
+    }
+
+    /// Endpoints whose last successful catalog fetch is within `window`.
+    fn recently_fetched_endpoints(&self, window: Duration) -> HashSet<String> {
+        let cutoff = Utc::now() - window;
+        self.fetches
+            .read()
+            .map(|f| {
+                f.values()
+                    .filter(|s| s.last_success_at.is_some_and(|t| t >= cutoff))
+                    .map(|s| s.endpoint.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Clear live per-endpoint state for removed nodes (hourly history is
+    /// left to age out).
+    fn forget_endpoints(&self, endpoints: &[String]) {
+        if endpoints.is_empty() {
+            return;
+        }
+        if let Ok(mut f) = self.fetches.write() {
+            f.retain(|_, s| s.source != "routstr" || !endpoints.contains(&s.endpoint));
+        }
+        if let Ok(mut p) = self.probes.write() {
+            p.retain(|k, _| !endpoints.contains(k));
+        }
+        if let Ok(mut h) = self.poll_history.write() {
+            h.retain(|k, _| !endpoints.contains(k));
         }
     }
 
@@ -594,6 +716,7 @@ impl Store {
                 source: source.to_string(),
                 provider_id: provider_id.to_string(),
                 endpoint: endpoint.clone(),
+                first_attempt_at: now,
                 last_attempt_at: now,
                 last_success_at: None,
                 last_error: None,
@@ -643,14 +766,26 @@ impl Store {
         self.last_announcement_at.read().ok().and_then(|g| *g)
     }
 
-    pub fn set_btc_usd(&self, rate: f64) {
-        if let Ok(mut g) = self.btc_usd.write() {
-            *g = Some(rate);
+    /// Store a BTC/USD rate observed at `at` (`None` = unknown, e.g. a legacy
+    /// snapshot). Rates outside [`crate::pricing::BTC_USD_MIN`]..=`MAX` are
+    /// rejected and the previous rate kept; returns whether it was accepted.
+    pub fn set_btc_usd(&self, rate: f64, at: Option<DateTime<Utc>>) -> bool {
+        if !sane_btc_usd(rate) {
+            return false;
         }
+        if let (Ok(mut r), Ok(mut t)) = (self.btc_usd.write(), self.btc_usd_at.write()) {
+            *r = Some(rate);
+            *t = at;
+        }
+        true
     }
 
     pub fn btc_usd(&self) -> Option<f64> {
         self.btc_usd.read().ok().and_then(|g| *g)
+    }
+
+    pub fn btc_usd_at(&self) -> Option<DateTime<Utc>> {
+        self.btc_usd_at.read().ok().and_then(|g| *g)
     }
 
     /// Snapshot all quotes for persistence.
@@ -825,7 +960,7 @@ mod tests {
         let store = Store::new();
         store.upsert_quotes([sample("m", 2.0)]);
         store.upsert_quotes([sample("m", 4.0)]);
-        store.set_btc_usd(50_000.0);
+        store.set_btc_usd(50_000.0, Some(Utc::now()));
         store.apply_sats_normalization(50_000.0);
         let q = store.list_quotes().into_iter().next().unwrap();
         assert_eq!(q.prev_price_out_usd, Some(2.0));
@@ -955,6 +1090,120 @@ mod tests {
         }))
         .unwrap();
         assert!(info.mints.is_empty() && info.npub.is_none());
+    }
+
+    fn discovered(endpoint: &str, via: &str, seen_hours_ago: i64) -> ProviderNode {
+        ProviderNode {
+            provider_id: endpoint.into(),
+            name: endpoint.into(),
+            endpoint: endpoint.into(),
+            onion: None,
+            mint: None,
+            version: None,
+            region: None,
+            pubkey: None,
+            discovered_via: via.into(),
+            last_seen: Utc::now() - Duration::hours(seen_hours_ago),
+            reliability: 0.0,
+            poll_ok: 0,
+            poll_total: 0,
+            last_latency_ms: None,
+            skip_reason: None,
+        }
+    }
+
+    fn endpoints(store: &Store) -> Vec<String> {
+        let mut v: Vec<_> = store.list_nodes().into_iter().map(|n| n.endpoint).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn node_cap_evicts_oldest_unproven_and_ignores_seeds() {
+        let store = Store::new();
+        store.set_max_nodes(2);
+        assert!(store.upsert_node(discovered("https://seed", "cli", 100)));
+        assert!(store.upsert_node(discovered("https://a", "nostr:38421", 10)));
+        assert!(store.upsert_node(discovered("https://b", "nostr:38421", 5)));
+        // At the cap: the newcomer evicts the oldest unproven node.
+        assert!(store.upsert_node(discovered("https://c", "nostr:38421", 0)));
+        assert_eq!(
+            endpoints(&store),
+            ["https://b", "https://c", "https://seed"]
+        );
+        // An older newcomer ranks below everyone and is refused.
+        assert!(!store.upsert_node(discovered("https://d", "nostr:38421", 50)));
+    }
+
+    #[test]
+    fn node_cap_never_evicts_proven_nodes_for_newcomers() {
+        let store = Store::new();
+        store.set_max_nodes(2);
+        store.upsert_node(discovered("https://a", "nostr:38421", 48));
+        store.upsert_node(discovered("https://b", "nostr:38421", 48));
+        store.record_fetch("routstr", "a", "https://a", Ok(3));
+        store.record_fetch("routstr", "b", "https://b", Ok(3));
+        // Fresh announcement, but both incumbents answered recently.
+        assert!(!store.upsert_node(discovered("https://flood", "nostr:38421", 0)));
+        assert_eq!(endpoints(&store), ["https://a", "https://b"]);
+    }
+
+    #[test]
+    fn replayed_announcement_does_not_refresh_last_seen() {
+        let store = Store::new();
+        store.upsert_node(discovered("https://a", "nostr:38421", 1));
+        store.upsert_node(discovered("https://a", "nostr:38421", 200));
+        let n = &store.list_nodes()[0];
+        assert!(Utc::now() - n.last_seen < Duration::hours(2));
+    }
+
+    #[test]
+    fn prune_stale_nodes_needs_a_full_ttl_of_failed_attempts() {
+        let store = Store::new();
+        store.upsert_node(discovered("https://seed", "cli", 24 * 30));
+        store.upsert_node(discovered("https://old", "nostr:38421", 24 * 30));
+        store.upsert_node(discovered("https://replayed", "nostr:38421", 24 * 30));
+        store.upsert_node(discovered("https://unpolled", "nostr:38421", 24 * 30));
+        store.upsert_node(discovered("https://new", "nostr:38421", 1));
+        for ep in ["https://old", "https://replayed", "https://seed"] {
+            store.record_fetch("routstr", ep, ep, Err("down".into()));
+        }
+        // An old announcement alone isn't enough: nothing has been tried for 7d yet.
+        assert_eq!(store.prune_stale_nodes(Duration::days(7)), 0);
+
+        // `old` has been failing for longer than the TTL.
+        store
+            .fetches
+            .write()
+            .unwrap()
+            .values_mut()
+            .filter(|f| f.endpoint == "https://old" || f.endpoint == "https://seed")
+            .for_each(|f| f.first_attempt_at = Utc::now() - Duration::days(8));
+        assert_eq!(store.prune_stale_nodes(Duration::days(7)), 1);
+        assert_eq!(
+            endpoints(&store),
+            [
+                "https://new",
+                "https://replayed",
+                "https://seed",
+                "https://unpolled"
+            ]
+        );
+        assert!(store
+            .fetch_statuses()
+            .iter()
+            .all(|f| f.endpoint != "https://old"));
+    }
+
+    #[test]
+    fn btc_rate_outside_sane_range_is_rejected() {
+        let store = Store::new();
+        let at = Some(Utc::now());
+        assert!(store.set_btc_usd(80_000.0, at));
+        for bad in [0.000001, 0.0, -5.0, 50.0, 2e7, f64::NAN, f64::INFINITY] {
+            assert!(!store.set_btc_usd(bad, Some(Utc::now())), "{bad}");
+        }
+        assert_eq!((store.btc_usd(), store.btc_usd_at()), (Some(80_000.0), at));
     }
 
     #[test]

@@ -89,7 +89,13 @@ async fn refresh_btc_usd(client: &reqwest::Client, store: &Store, url: &str) -> 
         .parse::<f64>()
         .context("parse BTC/USD")?;
 
-    store.set_btc_usd(amount);
+    if !store.set_btc_usd(amount, Some(chrono::Utc::now())) {
+        anyhow::bail!(
+            "BTC/USD {amount} outside sane range {}..={}; keeping previous rate",
+            crate::pricing::BTC_USD_MIN,
+            crate::pricing::BTC_USD_MAX
+        );
+    }
     info!(btc_usd = amount, "BTC/USD rate updated");
     Ok(())
 }
