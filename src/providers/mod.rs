@@ -2,10 +2,11 @@
 
 mod catalog;
 mod netguard;
-mod openrouter;
+mod reference;
 mod routstr;
 
 pub use catalog::model_kind;
+pub use reference::{ReferenceCatalog, OPENROUTER, ORCAROUTER};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,8 +23,8 @@ use crate::store::{PollCycle, Store};
 pub struct PollerConfig {
     pub interval: Duration,
     pub http_timeout: Duration,
-    pub enable_openrouter: bool,
-    pub openrouter_url: String,
+    /// Enabled centralized catalogs and the `/models` URL to fetch for each.
+    pub reference_catalogs: Vec<(ReferenceCatalog, String)>,
     /// Max Routstr nodes polled at once.
     pub node_concurrency: usize,
     /// Wall-clock budget per node (all `/models` fallbacks together).
@@ -41,7 +42,11 @@ pub async fn run_poller(
 ) -> Result<()> {
     info!(
         interval_secs = cfg.interval.as_secs(),
-        openrouter = cfg.enable_openrouter,
+        reference = ?cfg
+            .reference_catalogs
+            .iter()
+            .map(|(c, _)| c.source)
+            .collect::<Vec<_>>(),
         "starting provider poller"
     );
 
@@ -103,31 +108,27 @@ async fn poll_once(
     let started = Instant::now();
     let mut delisted = 0usize;
 
-    if cfg.enable_openrouter {
-        let or_started = Instant::now();
-        match openrouter::fetch_quotes(client, &cfg.openrouter_url).await {
+    for (cat, url) in &cfg.reference_catalogs {
+        let started = Instant::now();
+        match reference::fetch_quotes(client, url, cat).await {
             Ok(quotes) => {
                 let n = quotes.len();
-                let latency_ms = or_started.elapsed().as_millis() as u64;
-                store.record_poll(openrouter::ENDPOINT, true, Some(latency_ms));
-                store.record_fetch("openrouter", "openrouter", openrouter::ENDPOINT, Ok(n));
-                delisted += store.replace_catalog(
-                    "openrouter",
-                    "openrouter",
-                    Some(openrouter::ENDPOINT),
-                    quotes,
+                let latency_ms = started.elapsed().as_millis() as u64;
+                store.record_poll(cat.endpoint, true, Some(latency_ms));
+                store.record_fetch(cat.source, cat.source, cat.endpoint, Ok(n));
+                delisted +=
+                    store.replace_catalog(cat.source, cat.source, Some(cat.endpoint), quotes);
+                info!(
+                    source = cat.source,
+                    models = n,
+                    latency_ms,
+                    "reference catalog updated"
                 );
-                info!(models = n, "OpenRouter catalog updated");
             }
             Err(e) => {
-                store.record_poll(openrouter::ENDPOINT, false, None);
-                store.record_fetch(
-                    "openrouter",
-                    "openrouter",
-                    openrouter::ENDPOINT,
-                    Err(format!("{e:#}")),
-                );
-                warn!(error = %e, "OpenRouter poll failed");
+                store.record_poll(cat.endpoint, false, None);
+                store.record_fetch(cat.source, cat.source, cat.endpoint, Err(format!("{e:#}")));
+                warn!(source = cat.source, error = %e, "reference catalog poll failed");
             }
         }
     }

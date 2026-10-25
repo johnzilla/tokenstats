@@ -1,6 +1,6 @@
 # tokenstats
 
-**Sovereign inference market observability + oracle** for [Routstr](https://routstr.com) and centralized catalogs (OpenRouter).
+**Sovereign inference market observability + oracle** for [Routstr](https://routstr.com) and centralized catalogs (OpenRouter, OrcaRouter).
 
 Rust CLI + lightweight Axum dashboard. Listens on Nostr for provider discovery (RIP-02), polls model catalogs, normalizes prices to **USD and sats**, persists to SQLite, and serves a live price board.
 
@@ -16,7 +16,7 @@ cargo run --release -- serve
 open http://127.0.0.1:8080/
 ```
 
-First boot pulls the OpenRouter models catalog (~300+ quotes), Coinbase BTC/USD, and (unless disabled) connects to Nostr relays for Routstr kind **38421** node announcements.
+First boot pulls the OpenRouter and OrcaRouter models catalogs (~650 quotes), Coinbase BTC/USD, and (unless disabled) connects to Nostr relays for Routstr kind **38421** node announcements.
 
 ## CLI
 
@@ -78,7 +78,7 @@ Query params: `?source=openrouter&preset=frontier&ratio=4&model=deepseek`
 ```
 Nostr (kind 38421) ──► store.nodes ──► poll /v1/models ──┐
                                                          ├──► store.quotes ──► dashboard / API
-OpenRouter /api/v1/models ──────────────────────────────┘
+OpenRouter + OrcaRouter /v1/models ─────────────────────┘
 Coinbase BTC-USD ──► oracle (USD ↔ sats)
 SQLite snapshot every 30s
 ```
@@ -86,7 +86,7 @@ SQLite snapshot every 30s
 | Module | Role |
 |--------|------|
 | `src/nostr/` | RIP-02 discovery (also listens for legacy kind 40500) |
-| `src/providers/` | OpenRouter + Routstr-compatible `/v1/models` |
+| `src/providers/` | Reference catalogs (OpenRouter, OrcaRouter) + Routstr-compatible `/v1/models` |
 | `src/market/` | Popular families, blend, presets |
 | `src/oracle/` | BTC/USD + dual-unit normalization |
 | `src/store/` | In-memory quotes/nodes + poll reliability |
@@ -103,7 +103,7 @@ Specs: [Routstr/protocol](https://github.com/Routstr/protocol)
 ## Data & privacy
 
 - Default DB: `data/tokenstats.db` (gitignored)
-- No API keys required for the public OpenRouter models list or Coinbase spot price
+- No API keys required for the public OpenRouter / OrcaRouter models lists or Coinbase spot price
 - Nostr-announced nodes on loopback/private/link-local addresses are never requested (SSRF guard); `--node` seeds are trusted
 - Routstr node inference still needs Cashu/API keys if you *call* endpoints — tokenstats only observes catalogs
 
@@ -123,6 +123,7 @@ Specs: [Routstr/protocol](https://github.com/Routstr/protocol)
 | Poll private Nostr-announced nodes | `--allow-private-nodes` | off (SSRF guard) |
 | Disable Nostr | `--no-nostr` | off |
 | Disable OpenRouter | `--no-openrouter` | off |
+| Disable OrcaRouter | `--no-orcarouter` | off |
 | JSON logs | `--log-json` / `TOKENSTATS_LOG_JSON` | off |
 
 See [docs/USAGE.md](./docs/USAGE.md) for the full list. `SIGINT` / `SIGTERM` trigger graceful shutdown (HTTP drain + final DB snapshot).

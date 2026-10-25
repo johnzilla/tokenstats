@@ -6,6 +6,9 @@ use crate::store::Quote;
 /// Default output:input token ratio for blended cost (1 in : N out → ratio = N).
 pub const DEFAULT_BLEND_RATIO: f64 = 3.0;
 
+/// Centralized catalogs (not sovereign nodes): never "local" or "private".
+pub const REFERENCE_SOURCES: &[&str] = &["openrouter", "orcarouter"];
+
 /// Popular model families for the "Best Now" strip.
 pub const POPULAR_FAMILIES: &[PopularFamily] = &[
     PopularFamily {
@@ -314,7 +317,9 @@ fn is_local_candidate(q: &Quote) -> bool {
     ]
     .iter()
     .any(|k| hay.contains(k))
-        || q.price_in_usd == Some(0.0) && q.price_out_usd == Some(0.0) && q.source != "openrouter"
+        || q.price_in_usd == Some(0.0)
+            && q.price_out_usd == Some(0.0)
+            && !REFERENCE_SOURCES.contains(&q.source.as_str())
 }
 
 fn privacy_rank(q: &Quote) -> u8 {
@@ -421,5 +426,16 @@ mod tests {
         assert_eq!(Preset::from_str("frontier"), Some(Preset::CheapestFrontier));
         assert_eq!(Preset::from_str("private"), Some(Preset::MostPrivate));
         assert!(Preset::from_str("nope").is_none());
+    }
+
+    #[test]
+    fn free_reference_catalog_models_are_not_local() {
+        let mut orca = q("orcarouter/free", 0.0, 0.0);
+        orca.source = "orcarouter".into();
+        let mut node = q("some-free-model", 0.0, 0.0);
+        node.source = "routstr".into();
+        let local = apply_preset(vec![orca, node], Preset::LocalFirst);
+        let models: Vec<_> = local.iter().map(|q| q.model.as_str()).collect();
+        assert_eq!(models, ["some-free-model"]);
     }
 }

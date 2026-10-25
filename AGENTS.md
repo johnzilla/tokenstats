@@ -4,7 +4,7 @@ Guidance for coding agents working in this repository.
 
 ## Project
 
-**tokenstats** is a Rust observability layer + price oracle for sovereign inference markets (Routstr) and reference catalogs (OpenRouter). Stack: Tokio, Axum 0.7, nostr-sdk 0.30, reqwest, rusqlite, clap. License: **MPL-2.0**.
+**tokenstats** is a Rust observability layer + price oracle for sovereign inference markets (Routstr) and reference catalogs (OpenRouter, OrcaRouter). Stack: Tokio, Axum 0.7, nostr-sdk 0.30, reqwest, rusqlite, clap. License: **MPL-2.0**.
 
 ## Layout
 
@@ -14,7 +14,7 @@ src/
   config.rs         Cli + Config (flags/env/intervals/sources)
   market.rs         Popular families, blend math, presets
   nostr/            RIP-02 kind 38421 listener
-  providers/        openrouter.rs, routstr.rs, catalog.rs
+  providers/        reference.rs (OpenRouter, OrcaRouter), routstr.rs, catalog.rs
   oracle/           BTC/USD + sats normalization
   store/            In-memory quotes, nodes, poll history
   persist.rs        SQLite load/save loop
@@ -78,7 +78,7 @@ Centralized in `src/config.rs`. Prefer adding new knobs there (CLI + `TOKENSTATS
 
 Returns the current in-memory price board as a **JSON array of quote objects** after optional filters, with **blended cost** and **price deltas** computed server-side. Use it to:
 
-- Discover cheapest / frontier models across OpenRouter and Routstr nodes
+- Discover cheapest / frontier models across OpenRouter, OrcaRouter and Routstr nodes
 - Compare USD and sats pricing for routing or arbitrage
 - Feed downstream agents (e.g. **arbstr**) without re-implementing catalog polling
 
@@ -102,7 +102,7 @@ GET /api/quotes?source=&model=&kind=&preset=&ratio=&limit=&max_age_secs=&min_rel
 
 | Query param | Type | Default | Description |
 |-------------|------|---------|-------------|
-| `source` | string | (all) | Exact source match (case-insensitive), comma-separated for several: `openrouter`, `routstr,nostr` |
+| `source` | string | (all) | Exact source match (case-insensitive), comma-separated for several: `openrouter`, `orcarouter`, `routstr,nostr` |
 | `kind` | string | (all) | Model kind(s), comma-separated: `chat`, `embedding`, `image`, `audio`, `rerank`, `other` |
 | `max_age_secs` | int | (none) | Only quotes with `age_secs` ≤ this |
 | `min_reliability` | float | (none) | Only quotes whose endpoint's 1h success rate ≥ this (0–1). Quotes with no poll history are **excluded** |
@@ -136,7 +136,7 @@ Empty store / no matches → `[]`.
 
 | Field | Type | Notes |
 |-------|------|--------|
-| `source` | string | `openrouter` \| `routstr` \| … |
+| `source` | string | `openrouter` \| `orcarouter` \| `routstr` \| … |
 | `provider` | string | Human-readable provider / node name |
 | `provider_id` | string | Stable id (e.g. `openrouter`, Routstr `d` tag, seed id) |
 | `model` | string | Model id as published by the catalog |
@@ -158,7 +158,7 @@ Empty store / no matches → `[]`.
 | `kind` | string | `chat` \| `embedding` \| `image` \| `audio` \| `rerank` \| `other`, from catalog `architecture.output_modalities`, else id heuristics, else `chat` |
 | `age_secs` | number | Seconds since `observed_at` |
 | `stale` | bool | `age_secs` > `TOKENSTATS_STALE_AFTER_SECS` (default 600) |
-| `reliability_1h` | number \| null | Endpoint's catalog-fetch success rate over the last hour (OpenRouter included); null until polled since restart |
+| `reliability_1h` | number \| null | Endpoint's catalog-fetch success rate over the last hour (reference catalogs included); null until polled since restart |
 | `outlier` | bool | Blend is >10× above or below the median for the same model id across ≥3 quotes. Low outliers often mean a unit bug on the node |
 
 #### Example
@@ -240,7 +240,8 @@ catalog model row
   └─ missing side left null; oracle fills via BTC/USD on normalize tick
 ```
 
-- OpenRouter usually has **USD only** (`primary = Usd`).
+- OpenRouter and OrcaRouter usually have **USD only** (`primary = Usd`). OrcaRouter per-request (`pricing.request`) and unpriced meta-router models are kept with null prices.
+- `architecture` is read loosely: `output_modalities: null` or odd shapes must never drop a model row.
 - Routstr nodes that mirror OpenRouter often publish **both** (`primary = Both`).
 - Sats-only nodes work without USD until the oracle has a BTC rate.
 

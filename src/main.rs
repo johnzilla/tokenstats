@@ -150,8 +150,22 @@ async fn run_serve(cfg: Config) -> Result<()> {
         let poll_cfg = providers::PollerConfig {
             interval: cfg.poll_interval,
             http_timeout: cfg.http_timeout,
-            enable_openrouter: cfg.enable_openrouter,
-            openrouter_url: cfg.openrouter_url.clone(),
+            reference_catalogs: [
+                (
+                    cfg.enable_openrouter,
+                    providers::OPENROUTER,
+                    &cfg.openrouter_url,
+                ),
+                (
+                    cfg.enable_orcarouter,
+                    providers::ORCAROUTER,
+                    &cfg.orcarouter_url,
+                ),
+            ]
+            .into_iter()
+            .filter(|(on, _, _)| *on)
+            .map(|(_, cat, url)| (cat, url.clone()))
+            .collect(),
             node_concurrency: cfg.node_concurrency,
             node_timeout: cfg.node_timeout,
             quote_ttl: cfg.quote_ttl,
