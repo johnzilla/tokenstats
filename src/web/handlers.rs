@@ -10,9 +10,7 @@ use serde::Deserialize;
 
 use super::feed::feed_status;
 use super::AppState;
-use crate::market::{
-    apply_preset, best_now, blended_usd, delta_pct, Preset, DEFAULT_BLEND_RATIO,
-};
+use crate::market::{apply_preset, best_now, blended_usd, delta_pct, Preset, DEFAULT_BLEND_RATIO};
 use crate::pricing::{blend_sort_key, is_rankable_blend};
 use crate::store::{normalize_endpoint, Quote};
 
@@ -241,10 +239,7 @@ pub async fn api_summary(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// Export the current filtered view as CSV.
-pub async fn export_csv(
-    State(state): State<AppState>,
-    Query(q): Query<QuotesQuery>,
-) -> Response {
+pub async fn export_csv(State(state): State<AppState>, Query(q): Query<QuotesQuery>) -> Response {
     let ratio = q.blend_ratio();
     let limit = q.limit.unwrap_or(5000).min(20_000);
     let all = state.store.list_quotes();
@@ -294,10 +289,10 @@ pub async fn export_csv(
     );
     headers.insert(
         header::CONTENT_DISPOSITION,
-        HeaderValue::from_str(&format!(
-            "attachment; filename=\"tokenstats-{stamp}.csv\""
-        ))
-        .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"tokenstats.csv\"")),
+        HeaderValue::from_str(&format!("attachment; filename=\"tokenstats-{stamp}.csv\""))
+            .unwrap_or_else(|_| {
+                HeaderValue::from_static("attachment; filename=\"tokenstats.csv\"")
+            }),
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
 
@@ -328,13 +323,13 @@ pub async fn dashboard(
                       <td><span class="family">{family}</span></td>
                       <td>
                         <strong class="model-id">{model}</strong>
-                        <div class="sub muted">{updated}</div>
+                        <div class="sub muted">updated {updated}</div>
                       </td>
                       <td>
                         <div class="num stack-price">{blend}</div>
                         <div class="sub node-name">{node}</div>
                       </td>
-                      <td class="num muted">{io}</td>
+                      <td class="num muted">{io_in}/{io_out}</td>
                       <td><span class="src src-{source}">{source}</span></td>
                       <td>{delta}</td>
                       <td class="actions-cell">{actions}</td>
@@ -342,14 +337,11 @@ pub async fn dashboard(
                     attrs = quote_data_attrs(b.quote),
                     family = esc(b.family),
                     model = esc(&b.quote.model),
-                    updated = format!("updated {}", b.quote.observed_at.format("%H:%M:%S UTC")),
+                    updated = b.quote.observed_at.format("%H:%M:%S UTC"),
                     blend = fmt_usd(Some(b.blended_usd)),
                     node = esc(&node_label),
-                    io = format!(
-                        "{}/{}",
-                        fmt_usd(b.quote.price_in_usd),
-                        fmt_usd(b.quote.price_out_usd)
-                    ),
+                    io_in = fmt_usd(b.quote.price_in_usd),
+                    io_out = fmt_usd(b.quote.price_out_usd),
                     source = esc(&b.quote.source),
                     delta = fmt_delta(d),
                     actions = row_actions_html(),
@@ -371,7 +363,10 @@ pub async fn dashboard(
     let rows: String = if filtered.is_empty() {
         r#"<tr><td colspan="11" class="empty">No quotes match this filter…</td></tr>"#.into()
     } else {
-        filtered.iter().map(|quote| quote_row(quote, ratio)).collect()
+        filtered
+            .iter()
+            .map(|quote| quote_row(quote, ratio))
+            .collect()
     };
 
     let node_rows: String = if nodes.is_empty() {
@@ -1133,7 +1128,7 @@ fn filter_quotes(quotes: Vec<Quote>, q: &QuotesQuery, ctx: &QuoteCtx) -> Vec<Quo
 
 fn fmt_usd(v: Option<f64>) -> String {
     match v {
-        Some(x) if x == 0.0 => "free".into(),
+        Some(0.0) => "free".into(),
         Some(x) if x < 0.01 => format!("${x:.6}"),
         Some(x) => format!("${x:.4}"),
         None => "—".into(),
@@ -1142,7 +1137,7 @@ fn fmt_usd(v: Option<f64>) -> String {
 
 fn fmt_sats(v: Option<f64>) -> String {
     match v {
-        Some(x) if x == 0.0 => "0".into(),
+        Some(0.0) => "0".into(),
         Some(x) if x < 1.0 => format!("{x:.3}"),
         Some(x) => format!("{x:.1}"),
         None => "—".into(),

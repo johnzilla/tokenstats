@@ -9,7 +9,7 @@ Rust CLI + lightweight Axum dashboard. Listens on Nostr for provider discovery (
 ## Quick start
 
 ```bash
-# Requires Rust 1.75+
+# Requires Rust 1.86+
 cargo run --release -- serve
 
 # Dashboard
@@ -144,11 +144,14 @@ Full **doctl + DNS + Caddy/Nginx** guide: [docs/DEPLOY.md](./docs/DEPLOY.md).
 ## Development
 
 ```bash
-cargo check
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 cargo test
 cargo run -- serve --no-nostr -v
 cargo build --release
 ```
+
+CI runs fmt, clippy (warnings denied) and tests on Rust 1.99.1, plus `cargo check` on the 1.86 MSRV, for every PR and push to `main`.
 
 ## Related docs
 

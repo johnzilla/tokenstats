@@ -25,8 +25,8 @@ impl Db {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create db dir {}", parent.display()))?;
         }
-        let conn = Connection::open(&path)
-            .with_context(|| format!("open sqlite {}", path.display()))?;
+        let conn =
+            Connection::open(&path).with_context(|| format!("open sqlite {}", path.display()))?;
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
@@ -94,11 +94,11 @@ impl Db {
         let conn = self.conn.lock().expect("db lock");
 
         // BTC rate
-        if let Ok(rate) = conn.query_row(
-            "SELECT value FROM meta WHERE key = 'btc_usd'",
-            [],
-            |row| row.get::<_, String>(0),
-        ) {
+        if let Ok(rate) =
+            conn.query_row("SELECT value FROM meta WHERE key = 'btc_usd'", [], |row| {
+                row.get::<_, String>(0)
+            })
+        {
             if let Ok(r) = rate.parse::<f64>() {
                 store.set_btc_usd(r);
             }

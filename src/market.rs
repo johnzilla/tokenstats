@@ -13,7 +13,13 @@ pub const REFERENCE_SOURCES: &[&str] = &["openrouter", "orcarouter"];
 pub const POPULAR_FAMILIES: &[PopularFamily] = &[
     PopularFamily {
         label: "Claude Sonnet",
-        patterns: &["claude-sonnet", "claude-3.5-sonnet", "claude-3.7-sonnet", "sonnet-4", "sonnet-3.5"],
+        patterns: &[
+            "claude-sonnet",
+            "claude-3.5-sonnet",
+            "claude-3.7-sonnet",
+            "sonnet-4",
+            "sonnet-3.5",
+        ],
     },
     PopularFamily {
         label: "Claude Opus",
@@ -45,11 +51,21 @@ pub const POPULAR_FAMILIES: &[PopularFamily] = &[
     },
     PopularFamily {
         label: "Gemini Flash",
-        patterns: &["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash", "gemini-3"],
+        patterns: &[
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-flash",
+            "gemini-3",
+        ],
     },
     PopularFamily {
         label: "Gemini Pro",
-        patterns: &["gemini-2.5-pro", "gemini-2.0-pro", "gemini-pro", "gemini-1.5-pro"],
+        patterns: &[
+            "gemini-2.5-pro",
+            "gemini-2.0-pro",
+            "gemini-pro",
+            "gemini-1.5-pro",
+        ],
     },
     PopularFamily {
         label: "Llama 70B+",
@@ -144,7 +160,10 @@ pub fn delta_pct(current: Option<f64>, previous: Option<f64>) -> Option<f64> {
 
 pub fn matches_family(model: &str, family: &PopularFamily) -> bool {
     let m = model.to_ascii_lowercase();
-    family.patterns.iter().any(|p| m.contains(&p.to_ascii_lowercase()))
+    family
+        .patterns
+        .iter()
+        .any(|p| m.contains(&p.to_ascii_lowercase()))
 }
 
 /// Best (cheapest non-zero blended) quote per popular family.
@@ -188,9 +207,11 @@ pub fn best_now<'a>(quotes: &'a [Quote], ratio: f64) -> Vec<BestNowRow<'a>> {
 
 fn is_derivative_model(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    ["-mini", "mini-", "-nano", "nano-", "-lite", "lite-", "-tiny", "tiny-"]
-        .iter()
-        .any(|k| m.contains(k))
+    [
+        "-mini", "mini-", "-nano", "nano-", "-lite", "lite-", "-tiny", "tiny-",
+    ]
+    .iter()
+    .any(|k| m.contains(k))
 }
 
 pub struct BestNowRow<'a> {
@@ -255,7 +276,11 @@ pub fn apply_preset(quotes: Vec<Quote>, preset: Preset) -> Vec<Quote> {
                         || q.source == "nostr"
                         || q.endpoint
                             .as_deref()
-                            .map(|e| e.contains(".onion") || e.contains("localhost") || e.contains("127.0.0.1"))
+                            .map(|e| {
+                                e.contains(".onion")
+                                    || e.contains("localhost")
+                                    || e.contains("127.0.0.1")
+                            })
                             .unwrap_or(false)
                 })
                 .collect();
@@ -282,7 +307,7 @@ pub fn apply_preset(quotes: Vec<Quote>, preset: Preset) -> Vec<Quote> {
             v
         }
         Preset::LocalFirst => {
-            let mut v: Vec<_> = quotes.into_iter().filter(|q| is_local_candidate(q)).collect();
+            let mut v: Vec<_> = quotes.into_iter().filter(is_local_candidate).collect();
             v.sort_by(|a, b| a.model.cmp(&b.model));
             v
         }
@@ -291,9 +316,11 @@ pub fn apply_preset(quotes: Vec<Quote>, preset: Preset) -> Vec<Quote> {
 
 fn is_fast_model(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    ["flash", "mini", "turbo", "haiku", "nano", "lite", "fast", "small", "instant"]
-        .iter()
-        .any(|k| m.contains(k))
+    [
+        "flash", "mini", "turbo", "haiku", "nano", "lite", "fast", "small", "instant",
+    ]
+    .iter()
+    .any(|k| m.contains(k))
 }
 
 fn is_local_candidate(q: &Quote) -> bool {

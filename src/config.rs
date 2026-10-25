@@ -36,11 +36,21 @@ pub struct Cli {
     pub verbose: u8,
 
     /// Emit JSON logs (better for containers / log aggregators).
-    #[arg(long, global = true, env = "TOKENSTATS_LOG_JSON", default_value_t = false)]
+    #[arg(
+        long,
+        global = true,
+        env = "TOKENSTATS_LOG_JSON",
+        default_value_t = false
+    )]
     pub log_json: bool,
 
     /// Include module targets in log lines.
-    #[arg(long, global = true, env = "TOKENSTATS_LOG_TARGETS", default_value_t = true)]
+    #[arg(
+        long,
+        global = true,
+        env = "TOKENSTATS_LOG_TARGETS",
+        default_value_t = true
+    )]
     pub log_targets: bool,
 
     #[command(subcommand)]

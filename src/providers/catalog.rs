@@ -3,9 +3,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::pricing::{
-    normalize_catalog_prices, sanitize_price, CatalogHint, NormalizedPrices, PricePrimary,
-};
+use crate::pricing::{normalize_catalog_prices, sanitize_price, CatalogHint, NormalizedPrices};
 
 /// One model entry after loose JSON parsing.
 #[derive(Debug, Clone)]
@@ -61,6 +59,7 @@ struct ModelRow {
 ///
 /// Unit interpretation uses [`CatalogHint::Routstr`] (safe for dual-fill; OpenRouter
 /// simply has no `sats_pricing`).
+#[cfg(test)]
 pub fn parse_models_payload(body: &Value) -> Vec<CatalogModel> {
     parse_models_payload_with_hint(body, CatalogHint::Routstr)
 }
@@ -181,6 +180,8 @@ fn num_from_value(v: Option<&Value>) -> Option<f64> {
     sanitize_price(n)
 }
 
+/// Accessors used by tests; production code reads `prices` directly.
+#[cfg(test)]
 impl CatalogModel {
     /// USD per 1M input tokens (if known).
     pub fn price_in_usd(&self) -> Option<f64> {
@@ -202,7 +203,7 @@ impl CatalogModel {
         self.prices.price_out_sats
     }
 
-    pub fn primary(&self) -> PricePrimary {
+    pub fn primary(&self) -> crate::pricing::PricePrimary {
         self.prices.primary
     }
 }
@@ -210,6 +211,7 @@ impl CatalogModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pricing::PricePrimary;
     use serde_json::json;
 
     #[test]
@@ -257,7 +259,8 @@ mod tests {
 
     #[test]
     fn parse_models_key_and_bare_array() {
-        let body = json!({ "models": [{ "id": "x", "pricing": { "prompt": "0", "completion": "0" } }] });
+        let body =
+            json!({ "models": [{ "id": "x", "pricing": { "prompt": "0", "completion": "0" } }] });
         assert_eq!(parse_models_payload(&body).len(), 1);
         let bare = json!([{ "id": "y", "input_cost": 5.0, "output_cost": 15.0 }]);
         let m = parse_models_payload(&bare);
