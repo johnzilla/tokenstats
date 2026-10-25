@@ -35,7 +35,7 @@ Do not invent parallel crates or a workspace unless asked. Keep the binary singl
 
 ### Rust
 
-- Edition 2021, MSRV 1.75.
+- Edition 2021, MSRV 1.86 (`Cargo.toml` `rust-version`, `Dockerfile` builder and the CI `msrv` job move together).
 - Errors: `anyhow` at boundaries; avoid panics in request paths.
 - Logging: `tracing` with module targets; `--log-json` for containers.
 - Async: Tokio `full`; background work via `tokio::spawn` + `CancellationToken`.
@@ -257,7 +257,11 @@ catalog model row
 
 ## Commands agents should use
 
+CI (`.github/workflows/ci.yml`) runs on every PR and on pushes to `main`. It must stay green, so run the same checks locally before pushing:
+
 ```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 cargo check
 cargo test
 cargo run -- serve --no-nostr -v
