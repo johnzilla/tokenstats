@@ -218,6 +218,11 @@ async fn run_serve(cfg: Config) -> Result<()> {
         store: Arc::clone(&store),
         stale_after: cfg.stale_after,
         polling: cfg.enable_poll,
+        analytics: cfg
+            .plausible_script
+            .as_deref()
+            .map(web::Analytics::parse)
+            .transpose()?,
     };
     let app = web::router(app_state);
     let listener = tokio::net::TcpListener::bind(cfg.bind)

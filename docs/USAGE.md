@@ -39,6 +39,7 @@ Binary after release build: `./target/release/tokenstats serve`.
 | `TOKENSTATS_MAX_PRICE_USD_PER_1M` | `--max-price-usd-per-1m` | `1000` (`0` = no ceiling) |
 | `TOKENSTATS_OPENROUTER_URL` | `--openrouter-url` | OpenRouter models URL |
 | `TOKENSTATS_ORCAROUTER_URL` | `--orcarouter-url` | `https://api.orcarouter.ai/v1/models` |
+| `TOKENSTATS_PLAUSIBLE_SCRIPT` | `--plausible-script` | (none: no analytics) |
 | `TOKENSTATS_BTC_USD_URL` | `--btc-usd-url` | Coinbase spot URL |
 | `TOKENSTATS_LOG_JSON` | `--log-json` | false |
 | `RUST_LOG` | (overrides `-v`) | derived from `-v` |
@@ -95,6 +96,10 @@ Each cycle also sends every Routstr node a cheap `GET /v1/info` probe, in parall
 Latency values are bucketed into ~25% bins (the value is the bin's upper edge). They measure how responsive an endpoint is, not inference speed. Filter with `min_reliability_24h=0.9` and `max_latency_ms=500`.
 
 The probe also returns what the node says about itself (`name`, `version`, `npub`, `mints`, `onion_url`). `identity_verified` is `true` when its `npub` matches the Nostr key that announced it. Probe details and identity are kept in memory and refresh within a cycle after restart.
+
+### Security headers
+
+Every response carries `X-Content-Type-Options: nosniff` and a `Content-Security-Policy`: no inline scripts (the dashboard JS is `/static/app.js`), scripts and connections only from this origin, inline styles allowed, no framing. Setting `--plausible-script` (https only) adds that one origin to `script-src`/`connect-src` and loads `/static/plausible-init.js`. Without it, the dashboard loads no third-party code.
 
 ### Feed health
 

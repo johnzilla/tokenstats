@@ -124,6 +124,7 @@ Specs: [Routstr/protocol](https://github.com/Routstr/protocol)
 | Disable Nostr | `--no-nostr` | off |
 | Disable OpenRouter | `--no-openrouter` | off |
 | Disable OrcaRouter | `--no-orcarouter` | off |
+| Plausible analytics | `--plausible-script` / `TOKENSTATS_PLAUSIBLE_SCRIPT` | off (no third-party JS) |
 | JSON logs | `--log-json` / `TOKENSTATS_LOG_JSON` | off |
 
 See [docs/USAGE.md](./docs/USAGE.md) for the full list. `SIGINT` / `SIGTERM` trigger graceful shutdown (HTTP drain + final DB snapshot).

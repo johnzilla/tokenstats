@@ -128,17 +128,26 @@ impl QuotesQuery {
         }
         let body = pairs
             .iter()
-            .map(|(k, v)| format!("{k}={}", urlencoding_minimal(v)))
+            .map(|(k, v)| format!("{k}={}", percent_encode(v)))
             .collect::<Vec<_>>()
             .join("&");
         format!("?{body}")
     }
 }
 
-fn urlencoding_minimal(s: &str) -> String {
-    s.replace(' ', "%20")
-        .replace('&', "%26")
-        .replace('=', "%3D")
+/// Percent-encode a query value: only RFC 3986 unreserved characters (plus `,`
+/// for list params) pass through, so the result can never close an HTML
+/// attribute or start a tag. Hrefs are still passed through `esc_attr`.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b',') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// Apply source/model/quality/preset filters and sort by blend (unless preset sorts itself).
@@ -272,6 +281,31 @@ pub async fn api_summary(State(state): State<AppState>) -> impl IntoResponse {
         })).collect::<Vec<_>>(),
         "ts": Utc::now().to_rfc3339(),
     }))
+}
+
+const APP_JS: &str = include_str!("static/app.js");
+const PLAUSIBLE_INIT_JS: &str = include_str!("static/plausible-init.js");
+
+fn js(body: &'static str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=300"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+pub async fn app_js() -> Response {
+    js(APP_JS)
+}
+
+pub async fn plausible_init_js(State(state): State<AppState>) -> Response {
+    match state.analytics {
+        Some(_) => js(PLAUSIBLE_INIT_JS),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Export the current filtered view as CSV.
@@ -492,7 +526,7 @@ pub async fn dashboard(
                 s = esc(s),
                 n = n,
                 cls = cls,
-                href = href,
+                href = esc_attr(&href),
             )
         })
         .collect::<Vec<_>>()
@@ -508,7 +542,7 @@ pub async fn dashboard(
                 r#"<a class="{cls}" href="{href}">{label}</a>"#,
                 label = esc(p.label()),
                 cls = cls,
-                href = href,
+                href = esc_attr(&href),
             )
         })
         .collect::<Vec<_>>()
@@ -520,7 +554,7 @@ pub async fn dashboard(
             let active = (ratio - *r).abs() < 0.01;
             let cls = if active { "pill active" } else { "pill" };
             let label = format!("1:{r:.0}");
-            let href = q.qs(&[("ratio", Some(&format!("{r}")))]);
+            let href = esc_attr(&q.qs(&[("ratio", Some(&format!("{r}")))]));
             format!(r#"<a class="{cls}" href="{href}">{label}</a>"#)
         })
         .collect::<Vec<_>>()
@@ -725,11 +759,7 @@ pub async fn dashboard(
     .links a {{ margin-right: 0.75rem; }}
   </style>
   <!-- Privacy-friendly analytics by Plausible -->
-  <script async src="https://plausible.io/js/pa-04Cyl_CguuqqiZxs7vLO7.js"></script>
-  <script>
-    window.plausible=window.plausible||function(){{(plausible.q=plausible.q||[]).push(arguments)}},plausible.init=plausible.init||function(i){{plausible.o=i||{{}}}};
-    plausible.init()
-  </script>
+{analytics}
 </head>
 <body>
   <header>
@@ -831,73 +861,7 @@ pub async fn dashboard(
     · auto-refresh 15s · last data {last_label}
   </footer>
   <div id="toast" class="toast" role="status"></div>
-  <script>
-    function showToast(msg) {{
-      const t = document.getElementById('toast');
-      t.textContent = msg;
-      t.classList.add('show');
-      clearTimeout(window.__toastTimer);
-      window.__toastTimer = setTimeout(() => t.classList.remove('show'), 1800);
-    }}
-    function baseUrl(row) {{
-      let ep = row.dataset.endpoint || '';
-      if (!ep) {{
-        if (row.dataset.source === 'openrouter') ep = 'https://openrouter.ai/api/v1';
-        else ep = 'https://api.openai.com/v1';
-      }}
-      ep = ep.replace(/\/$/, '');
-      if (!/\/v1$/i.test(ep)) ep = ep + '/v1';
-      return ep;
-    }}
-    function curlFor(row) {{
-      const base = baseUrl(row);
-      const model = row.dataset.model || '';
-      const body = JSON.stringify({{
-        model,
-        messages: [{{ role: 'user', content: 'hello' }}]
-      }});
-      return `curl -sS "${{base}}/chat/completions" \\
-  -H "Authorization: Bearer $API_KEY" \\
-  -H "Content-Type: application/json" \\
-  -d '${{body.replace(/'/g, "'\\''")}}'`;
-    }}
-    function openaiConfigFor(row) {{
-      const base = baseUrl(row);
-      const model = row.dataset.model || '';
-      const provider = row.dataset.provider || '';
-      return JSON.stringify({{
-        provider,
-        model,
-        base_url: base,
-        api_key_env: 'API_KEY',
-        openai_python: `from openai import OpenAI\\nclient = OpenAI(base_url="${{base}}", api_key=os.environ["API_KEY"])\\nr = client.chat.completions.create(model="${{model}}", messages=[{{"role":"user","content":"hello"}}])`
-      }}, null, 2);
-    }}
-    async function copyText(text, label) {{
-      try {{
-        await navigator.clipboard.writeText(text);
-        showToast('Copied ' + label);
-      }} catch (e) {{
-        // fallback
-        const ta = document.createElement('textarea');
-        ta.value = text;
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand('copy');
-        document.body.removeChild(ta);
-        showToast('Copied ' + label);
-      }}
-    }}
-    document.addEventListener('click', (ev) => {{
-      const btn = ev.target.closest('[data-copy]');
-      if (!btn) return;
-      const row = btn.closest('tr.quote-row');
-      if (!row) return;
-      const kind = btn.getAttribute('data-copy');
-      if (kind === 'curl') copyText(curlFor(row), 'curl');
-      else if (kind === 'openai') copyText(openaiConfigFor(row), 'OpenAI config');
-    }});
-  </script>
+  <script src="/static/app.js"></script>
 </body>
 </html>"#,
         quotes = all.len(),
@@ -905,6 +869,14 @@ pub async fn dashboard(
         btc = btc_label,
         filter_note = filter_note,
         last_label = last_label,
+        analytics = match &state.analytics {
+            Some(a) => format!(
+                r#"<script async src="{}"></script>
+  <script src="/static/plausible-init.js"></script>"#,
+                esc_attr(&a.script)
+            ),
+            None => String::new(),
+        },
         feed_label = esc(&feed_label),
         feed_title = esc_attr(&feed_title),
         page_label = page_label,
@@ -912,9 +884,9 @@ pub async fn dashboard(
         all_href = if all_href.is_empty() {
             "/".into()
         } else {
-            all_href
+            esc_attr(&all_href)
         },
-        csv_href = csv_href,
+        csv_href = esc_attr(&csv_href),
         source_pills = source_pills,
         preset_pills = preset_pills,
         ratio_pills = ratio_pills,
@@ -1375,6 +1347,7 @@ mod tests {
             store: Arc::new(Store::new()),
             stale_after: StdDuration::from_secs(600),
             polling: true,
+            analytics: None,
         }
     }
 
@@ -1479,6 +1452,33 @@ mod tests {
         assert_eq!(v["latency_p50_ms"], 3150);
         assert_eq!(v["latency_source"], "catalog");
         assert_eq!(v["identity_verified"], serde_json::Value::Null);
+    }
+
+    const XSS: &str = "model=%22%3E%3Cscript%3Ealert(document.domain)%3C/script%3E&kind=%3Cb%3E";
+
+    #[test]
+    fn qs_percent_encodes_markup() {
+        let qs = query(XSS).qs(&[("preset", Some("frontier"))]);
+        assert!(!qs.contains(['"', '<', '>', '\'', ' ']), "{qs}");
+        assert!(qs.contains("model=%22%3E%3Cscript%3Ealert%28document.domain%29"));
+        assert_eq!(percent_encode("chat,embedding"), "chat,embedding");
+        assert_eq!(percent_encode("a b&c=d/é"), "a%20b%26c%3Dd%2F%C3%A9");
+    }
+
+    #[tokio::test]
+    async fn dashboard_does_not_reflect_script_payload() {
+        let resp = dashboard(State(state()), Query(query(XSS)))
+            .await
+            .into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!html.contains("<script>alert"), "payload reflected raw");
+        assert!(!html.contains("\"><script>"), "attribute broken out of");
+        assert!(!html.contains("<b>"), "kind payload reflected raw");
+        // The filter is still carried through links, encoded.
+        assert!(html.contains("model=%22%3E%3Cscript%3E"));
     }
 
     #[test]

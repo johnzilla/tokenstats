@@ -156,6 +156,11 @@ pub enum Commands {
         )]
         max_price_usd_per_1m: f64,
 
+        /// Plausible analytics script URL (https). Unset = no third-party script
+        /// on the dashboard and a CSP that allows only this origin's assets.
+        #[arg(long, env = "TOKENSTATS_PLAUSIBLE_SCRIPT")]
+        plausible_script: Option<String>,
+
         /// OpenRouter models catalog URL.
         #[arg(long, default_value = DEFAULT_OPENROUTER_URL, env = "TOKENSTATS_OPENROUTER_URL")]
         openrouter_url: String,
@@ -200,6 +205,7 @@ pub struct Config {
     pub max_price_usd_per_1m: Option<f64>,
     pub openrouter_url: String,
     pub orcarouter_url: String,
+    pub plausible_script: Option<String>,
     pub btc_usd_url: String,
 }
 
@@ -229,6 +235,7 @@ impl Config {
             max_price_usd_per_1m,
             openrouter_url,
             orcarouter_url,
+            plausible_script,
             btc_usd_url,
         } = &cli.command;
 
@@ -256,6 +263,7 @@ impl Config {
             max_price_usd_per_1m: Some(*max_price_usd_per_1m).filter(|m| *m > 0.0),
             openrouter_url: openrouter_url.clone(),
             orcarouter_url: orcarouter_url.clone(),
+            plausible_script: plausible_script.clone().filter(|s| !s.trim().is_empty()),
             btc_usd_url: btc_usd_url.clone(),
         }
     }
@@ -270,6 +278,7 @@ impl Config {
             enable_poll = self.enable_poll,
             enable_openrouter = self.enable_openrouter,
             enable_orcarouter = self.enable_orcarouter,
+            analytics = self.plausible_script.is_some(),
             enable_oracle = self.enable_oracle,
             relays = self.relays.len(),
             seed_nodes = self.seed_nodes.len(),
@@ -303,6 +312,7 @@ mod tests {
         assert!(cfg.enable_poll);
         assert!(cfg.enable_openrouter);
         assert!(cfg.enable_orcarouter);
+        assert_eq!(cfg.plausible_script, None);
         assert_eq!(cfg.poll_interval.as_secs(), 60);
         assert_eq!(cfg.relays.len(), 3);
         assert_eq!(cfg.node_concurrency, 16);
