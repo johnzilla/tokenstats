@@ -37,9 +37,7 @@ pub async fn fetch_quotes(
     url: &str,
     cat: &ReferenceCatalog,
 ) -> Result<Vec<Quote>> {
-    let resp = client
-        .get(url)
-        .send()
+    let resp = super::get_with_retry(client, url)
         .await
         .with_context(|| format!("{} request", cat.provider))?
         .error_for_status()

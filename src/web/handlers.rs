@@ -187,7 +187,7 @@ pub async fn api_quotes(
     State(state): State<AppState>,
     Query(q): Query<QuotesQuery>,
 ) -> impl IntoResponse {
-    let limit = q.limit.unwrap_or(200).min(2000);
+    let limit = q.limit.unwrap_or(200).min(MAX_API_LIMIT);
     let all = state.store.list_quotes();
     let ctx = QuoteCtx::new(&state, &all, q.blend_ratio());
     let quotes = resolve_view(all, &q, &ctx);
@@ -298,6 +298,11 @@ pub async fn api_summary(State(state): State<AppState>) -> impl IntoResponse {
         "ts": Utc::now().to_rfc3339(),
     }))
 }
+
+/// `/api/quotes` row cap. Large enough for the whole board (~8k quotes on
+/// tokenstats.ai), so a consumer that asks for everything isn't silently
+/// handed only the cheapest slice; narrow with `source` / `kind` instead.
+const MAX_API_LIMIT: usize = 20_000;
 
 const APP_JS: &str = include_str!("static/app.js");
 const PLAUSIBLE_INIT_JS: &str = include_str!("static/plausible-init.js");
@@ -1522,6 +1527,29 @@ mod tests {
         // > 1 clamps to 1 (perfect endpoints only), not "nothing".
         assert_eq!(n("min_reliability=5"), 1);
         assert_eq!(n("min_reliability_24h=1.5"), 1);
+    }
+
+    #[tokio::test]
+    async fn api_limit_allows_the_whole_board() {
+        let st = state();
+        st.store
+            .upsert_quotes((0..2500).map(|i| quote(&format!("m{i}"), "https://n", 1.0, 5, "chat")));
+        let rows = |qs: &str| {
+            let st = st.clone();
+            let q = query(qs);
+            async move {
+                let resp = api_quotes(State(st), Query(q)).await.into_response();
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<Vec<serde_json::Value>>(&body)
+                    .unwrap()
+                    .len()
+            }
+        };
+        assert_eq!(rows("").await, 200);
+        assert_eq!(rows("limit=5000").await, 2500);
+        assert_eq!(rows("limit=999999").await, 2500);
     }
 
     #[test]

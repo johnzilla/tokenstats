@@ -157,6 +157,7 @@ pub fn guarded_client(timeout: Duration) -> Result<reqwest::Client> {
     });
     Ok(reqwest::Client::builder()
         .timeout(timeout)
+        .pool_idle_timeout(super::POOL_IDLE_TIMEOUT)
         .user_agent(concat!("tokenstats/", env!("CARGO_PKG_VERSION")))
         .redirect(policy)
         .dns_resolver(Arc::new(PublicOnlyResolver))
