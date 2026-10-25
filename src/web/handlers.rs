@@ -78,6 +78,11 @@ impl QuotesQuery {
         self.preset.as_deref().and_then(Preset::from_str)
     }
 
+    /// Negative ages are meaningless: ignored, like an invalid `ratio`.
+    fn max_age(&self) -> Option<i64> {
+        self.max_age_secs.filter(|s| *s >= 0)
+    }
+
     fn qs(&self, overrides: &[(&str, Option<&str>)]) -> String {
         let mut pairs: Vec<(String, String)> = Vec::new();
         let mut set = |k: &str, v: Option<&str>| {
@@ -135,6 +140,13 @@ impl QuotesQuery {
             .join("&");
         format!("?{body}")
     }
+}
+
+/// Reliability floors are fractions: NaN or ≤ 0 means no filter (rather than
+/// silently matching everything, unpolled endpoints included); above 1
+/// clamps to 1.
+fn reliability_floor(v: Option<f64>) -> Option<f64> {
+    v.filter(|x| x.is_finite() && *x > 0.0).map(|x| x.min(1.0))
 }
 
 /// Percent-encode a query value: only RFC 3986 unreserved characters (plus `,`
@@ -1205,7 +1217,7 @@ fn filter_quotes(quotes: Vec<Quote>, q: &QuotesQuery, ctx: &QuoteCtx) -> Vec<Quo
             if !in_list(q.kind.as_deref(), &quote.kind) {
                 return false;
             }
-            if let Some(max) = q.max_age_secs {
+            if let Some(max) = q.max_age() {
                 if ctx.age_secs(quote) > max {
                     return false;
                 }
@@ -1213,12 +1225,12 @@ fn filter_quotes(quotes: Vec<Quote>, q: &QuotesQuery, ctx: &QuoteCtx) -> Vec<Quo
             if exclude_stale && ctx.is_stale(quote) {
                 return false;
             }
-            if let Some(min) = q.min_reliability {
+            if let Some(min) = reliability_floor(q.min_reliability) {
                 if !ctx.reliability(quote).is_some_and(|r| r >= min) {
                     return false;
                 }
             }
-            if let Some(min) = q.min_reliability_24h {
+            if let Some(min) = reliability_floor(q.min_reliability_24h) {
                 let rel = ctx.stats(quote).and_then(|s| s.reliability_24h);
                 if !rel.is_some_and(|r| r >= min) {
                     return false;
@@ -1490,6 +1502,26 @@ mod tests {
         assert!(!html.contains("<b>"), "kind payload reflected raw");
         // The filter is still carried through links, encoded.
         assert!(html.contains("model=%22%3E%3Cscript%3E"));
+    }
+
+    #[test]
+    fn out_of_range_filters_are_normalized() {
+        let st = state();
+        st.store.record_poll("https://good", true, Some(10));
+        let all = vec![
+            quote("polled", "https://good", 1.0, 5, "chat"),
+            quote("unpolled", "https://none", 1.0, 5, "chat"),
+        ];
+        let ctx = QuoteCtx::new(&st, &all, 3.0);
+        let n = |qs: &str| filter_quotes(all.clone(), &query(qs), &ctx).len();
+        // ≤ 0 / NaN floors and negative ages mean "no filter".
+        assert_eq!(n("min_reliability=-1"), 2);
+        assert_eq!(n("min_reliability=0"), 2);
+        assert_eq!(n("min_reliability=NaN"), 2);
+        assert_eq!(n("max_age_secs=-5"), 2);
+        // > 1 clamps to 1 (perfect endpoints only), not "nothing".
+        assert_eq!(n("min_reliability=5"), 1);
+        assert_eq!(n("min_reliability_24h=1.5"), 1);
     }
 
     #[test]

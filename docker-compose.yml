@@ -33,10 +33,11 @@ services:
       RUST_LOG: "${RUST_LOG:-info,tokenstats=info,tower_http=info}"
     volumes:
       - tokenstats-data:/data
-    # Without the proxy profile, publish HTTP for smoke tests / IP access.
-    # With --profile proxy, only Caddy is public; tokenstats stays on the internal network.
+    # Localhost-only by default: Docker-published ports bypass UFW, and Caddy
+    # reaches the app over the internal network. For an app-only IP smoke test
+    # without Caddy, set TOKENSTATS_PUBLISH_PORT=8080 (all interfaces).
     ports:
-      - "${TOKENSTATS_PUBLISH_PORT:-8080}:8080"
+      - "${TOKENSTATS_PUBLISH_PORT:-127.0.0.1:8080}:8080"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
       interval: 30s

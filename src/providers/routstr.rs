@@ -7,10 +7,9 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use tracing::debug;
 
-use crate::pricing::CatalogHint;
 use crate::store::{NodeInfo, ProviderNode, Quote};
 
-use super::catalog::parse_models_payload_with_hint;
+use super::catalog::parse_models_payload;
 use super::netguard;
 
 /// Node was not polled because its endpoint is not public (SSRF guard).
@@ -122,7 +121,7 @@ async fn fetch_node_quotes(
         match try_fetch(client, url).await {
             Ok(body) => {
                 let latency_ms = started.elapsed().as_millis() as u64;
-                let models = parse_models_payload_with_hint(&body, CatalogHint::Routstr);
+                let models = parse_models_payload(&body);
                 debug!(%url, n = models.len(), latency_ms, "Routstr models response");
                 let now = Utc::now();
                 let quotes = models

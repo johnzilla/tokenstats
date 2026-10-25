@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::pricing::{
-    normalize_catalog_prices, sanitize_price, CatalogHint, ExplicitPerMillion, NormalizedPrices,
+    normalize_catalog_prices, sanitize_price, ExplicitPerMillion, NormalizedPrices,
 };
 
 /// One model entry after loose JSON parsing.
@@ -63,16 +63,9 @@ struct ModelRow {
 
 /// Parse a models list JSON body into catalog rows.
 /// Accepts `{ "data": [...] }`, `{ "models": [...] }`, or a bare array.
-///
-/// Unit interpretation uses [`CatalogHint::Routstr`] (safe for dual-fill; OpenRouter
-/// simply has no `sats_pricing`).
-#[cfg(test)]
+/// The same unit rules apply to every catalog (OpenRouter simply has no
+/// `sats_pricing`); see [`normalize_catalog_prices`].
 pub fn parse_models_payload(body: &Value) -> Vec<CatalogModel> {
-    parse_models_payload_with_hint(body, CatalogHint::Routstr)
-}
-
-/// Parse with an explicit catalog hint (OpenRouter vs Routstr).
-pub fn parse_models_payload_with_hint(body: &Value, hint: CatalogHint) -> Vec<CatalogModel> {
     let rows = body
         .get("data")
         .or_else(|| body.get("models"))
@@ -89,10 +82,10 @@ pub fn parse_models_payload_with_hint(body: &Value, hint: CatalogHint) -> Vec<Ca
         return Vec::new();
     };
 
-    arr.iter().filter_map(|v| parse_one(v, hint)).collect()
+    arr.iter().filter_map(parse_one).collect()
 }
 
-fn parse_one(v: &Value, hint: CatalogHint) -> Option<CatalogModel> {
+fn parse_one(v: &Value) -> Option<CatalogModel> {
     let row: ModelRow = serde_json::from_value(v.clone()).ok()?;
     let id = row.id.filter(|s| !s.is_empty())?;
 
@@ -128,7 +121,6 @@ fn parse_one(v: &Value, hint: CatalogHint) -> Option<CatalogModel> {
         sats_completion,
         row.input_cost,
         row.output_cost,
-        hint,
     )
     .with_explicit_per_million(explicit);
 
@@ -241,7 +233,7 @@ mod tests {
                 "context_length": 8192
             }]
         });
-        let models = parse_models_payload_with_hint(&body, CatalogHint::OpenRouter);
+        let models = parse_models_payload(&body);
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "acme/model");
         assert!((models[0].price_in_usd().unwrap() - 1.0).abs() < 1e-9);
@@ -266,7 +258,7 @@ mod tests {
             } },
             { "id": "heuristic-only", "pricing": { "prompt": "0.000002" } }
         ]});
-        let m = parse_models_payload_with_hint(&body, CatalogHint::OpenRouter);
+        let m = parse_models_payload(&body);
         assert!((m[0].price_in_usd().unwrap() - 0.005).abs() < 1e-12);
         assert!((m[0].price_out_usd().unwrap() - 0.008).abs() < 1e-12);
         assert!((m[1].price_in_sats().unwrap() - 0.5).abs() < 1e-12);
@@ -288,7 +280,7 @@ mod tests {
             { "id": "whisper-1" },
             { "id": "plain-model" }
         ]});
-        let kinds: Vec<_> = parse_models_payload_with_hint(&body, CatalogHint::Routstr)
+        let kinds: Vec<_> = parse_models_payload(&body)
             .into_iter()
             .map(|m| m.kind)
             .collect();
@@ -317,7 +309,7 @@ mod tests {
                 "pricing": { "prompt": "-1", "completion": "-1" }
             }]
         });
-        let m = parse_models_payload_with_hint(&body, CatalogHint::OpenRouter);
+        let m = parse_models_payload(&body);
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].price_in_usd(), None);
         assert_eq!(m[0].price_out_usd(), None);
@@ -380,7 +372,7 @@ mod tests {
                 "context_length": 1_000_000
             }]
         });
-        let m = parse_models_payload_with_hint(&body, CatalogHint::Routstr);
+        let m = parse_models_payload(&body);
         assert_eq!(m.len(), 1);
         assert!((m[0].price_in_usd().unwrap() - 11.5).abs() < 1e-9);
         assert!((m[0].price_out_usd().unwrap() - 57.5).abs() < 1e-9);

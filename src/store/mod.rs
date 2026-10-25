@@ -10,6 +10,7 @@ use serde::Serialize;
 use crate::pricing::{sane_btc_usd, sanitize_opt};
 
 mod history;
+use history::Window;
 pub use history::{EndpointStats, HourBucket, HISTORY_HOURS};
 
 /// How long to keep poll samples for reliability scoring.
@@ -151,6 +152,12 @@ struct PollSample {
 }
 
 /// Thread-safe in-memory store.
+///
+/// Locking rule: **never hold one of these `RwLock`s while acquiring another.**
+/// Methods read what they need from one map, release it, then take the next
+/// (e.g. `upsert_node` reads `fetches` before locking `nodes`; `record_poll`
+/// computes reliability before touching `nodes`). Keep it that way: with no
+/// nesting there is no lock order to get wrong.
 #[derive(Debug, Default)]
 pub struct Store {
     /// Keyed by `{source}:{provider_id}:{model}` for latest-wins updates.
@@ -166,9 +173,9 @@ pub struct Store {
     /// Latest probe per endpoint (not persisted; refreshed every cycle).
     probes: RwLock<HashMap<String, ProbeStatus>>,
     /// Last known BTC/USD rate for sats conversion.
-    btc_usd: RwLock<Option<f64>>,
-    /// When `btc_usd` was fetched (restored from SQLite when known).
-    btc_usd_at: RwLock<Option<DateTime<Utc>>>,
+    /// Last BTC/USD rate and when it was fetched (`None` = unknown, e.g. a
+    /// legacy snapshot). One lock so rate and timestamp always agree.
+    btc_usd: RwLock<Option<(f64, Option<DateTime<Utc>>)>>,
     /// Latest fetch outcome per `{source}|{endpoint}`.
     fetches: RwLock<HashMap<String, FetchStatus>>,
     last_cycle: RwLock<Option<PollCycle>>,
@@ -479,13 +486,15 @@ impl Store {
     }
 
     pub fn list_nodes(&self) -> Vec<ProviderNode> {
-        let Ok(map) = self.nodes.read() else {
-            return Vec::new();
+        // Clone out first so `nodes` is released before `reliability_for`
+        // reads `poll_history` (see the locking rule on `Store`).
+        let nodes: Vec<ProviderNode> = match self.nodes.read() {
+            Ok(map) => map.values().cloned().collect(),
+            Err(_) => return Vec::new(),
         };
         // Refresh reliability from history on read.
-        let mut v: Vec<_> = map
-            .values()
-            .cloned()
+        let mut v: Vec<_> = nodes
+            .into_iter()
             .map(|mut n| {
                 let (rel, ok, total, lat) = self.reliability_for(&normalize_endpoint(&n.endpoint));
                 n.reliability = rel;
@@ -538,6 +547,8 @@ impl Store {
                 latency_ms,
             );
         }
+        // Computed before locking `nodes` (see the locking rule on `Store`).
+        let (rel, pok, total, _) = self.reliability_for(&key);
         // Touch node last_seen / latency if present.
         if let Ok(mut map) = self.nodes.write() {
             if let Some(n) = map.get_mut(&key) {
@@ -547,13 +558,6 @@ impl Store {
                 if latency_ms.is_some() {
                     n.last_latency_ms = latency_ms;
                 }
-                let (rel, pok, total, _) = reliability_from_samples(
-                    self.poll_history
-                        .read()
-                        .ok()
-                        .as_ref()
-                        .and_then(|h| h.get(&key)),
-                );
                 n.reliability = rel;
                 n.poll_ok = pok;
                 n.poll_total = total;
@@ -573,29 +577,56 @@ impl Store {
     /// endpoint with any poll history.
     pub fn endpoint_stats(&self) -> HashMap<String, EndpointStats> {
         let now_hour = history::hour_of(Utc::now());
-        let raw = self.poll_history.read().ok();
-        let probe = self.probe_hourly.read().ok();
-        let Ok(hourly) = self.hourly.read() else {
-            return HashMap::new();
-        };
-        let mut keys: HashSet<&String> = hourly.keys().collect();
-        if let Some(raw) = raw.as_ref() {
-            keys.extend(raw.keys());
-        }
-        if let Some(probe) = probe.as_ref() {
-            keys.extend(probe.keys());
-        }
+        // One map at a time (see the locking rule on `Store`).
+        let rel_1h: HashMap<String, Option<f64>> = self
+            .poll_history
+            .read()
+            .map(|r| {
+                r.iter()
+                    .map(|(k, samples)| {
+                        let (rel, _, total, _) = reliability_from_samples(Some(samples));
+                        (k.clone(), (total > 0).then_some(rel))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let probe_day: HashMap<String, Window> = self
+            .probe_hourly
+            .read()
+            .map(|p| {
+                p.iter()
+                    .map(|(k, b)| (k.clone(), Window::over(b, now_hour, 24)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let catalog: HashMap<String, (Window, Window)> = self
+            .hourly
+            .read()
+            .map(|h| {
+                h.iter()
+                    .map(|(k, b)| {
+                        let day = Window::over(b, now_hour, 24);
+                        let week = Window::over(b, now_hour, HISTORY_HOURS);
+                        (k.clone(), (day, week))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let empty = Window::over(&VecDeque::new(), now_hour, 24);
+        let keys: HashSet<&String> = catalog
+            .keys()
+            .chain(rel_1h.keys())
+            .chain(probe_day.keys())
+            .collect();
         keys.into_iter()
             .map(|k| {
-                let rel_1h = raw.as_ref().and_then(|r| {
-                    let (rel, _, total, _) = reliability_from_samples(r.get(k));
-                    (total > 0).then_some(rel)
-                });
-                let stats = EndpointStats::from_buckets(
-                    hourly.get(k),
-                    probe.as_ref().and_then(|p| p.get(k)),
-                    rel_1h,
-                    now_hour,
+                let (day, week) = catalog.get(k).map_or((&empty, &empty), |(d, w)| (d, w));
+                let stats = EndpointStats::from_windows(
+                    day,
+                    week,
+                    probe_day.get(k).unwrap_or(&empty),
+                    rel_1h.get(k).copied().flatten(),
                 );
                 (k.clone(), stats)
             })
@@ -773,19 +804,21 @@ impl Store {
         if !sane_btc_usd(rate) {
             return false;
         }
-        if let (Ok(mut r), Ok(mut t)) = (self.btc_usd.write(), self.btc_usd_at.write()) {
-            *r = Some(rate);
-            *t = at;
+        if let Ok(mut g) = self.btc_usd.write() {
+            *g = Some((rate, at));
         }
         true
     }
 
     pub fn btc_usd(&self) -> Option<f64> {
-        self.btc_usd.read().ok().and_then(|g| *g)
+        self.btc_usd.read().ok().and_then(|g| g.map(|(r, _)| r))
     }
 
     pub fn btc_usd_at(&self) -> Option<DateTime<Utc>> {
-        self.btc_usd_at.read().ok().and_then(|g| *g)
+        self.btc_usd
+            .read()
+            .ok()
+            .and_then(|g| g.and_then(|(_, at)| at))
     }
 
     /// Snapshot all quotes for persistence.

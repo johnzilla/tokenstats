@@ -255,14 +255,30 @@ fn parse_content_meta(content: &str) -> ContentMeta {
     meta.region = v.get("region").and_then(|x| x.as_str()).map(str::to_string);
 
     if let Some(endpoints) = v.get("endpoints") {
-        meta.http_endpoint = endpoints
-            .get("http")
-            .and_then(|x| x.as_str())
-            .map(str::to_string);
-        meta.onion_endpoint = endpoints
-            .get("onion")
-            .and_then(|x| x.as_str())
-            .map(str::to_string);
+        if let Some(list) = endpoints.as_array() {
+            // Array shape: ["https://…", "http://….onion"] or [{"url": "…"}, …].
+            for url in list.iter().filter_map(|e| {
+                e.as_str()
+                    .or_else(|| e.get("url").and_then(|u| u.as_str()))
+                    .or_else(|| e.get("http").and_then(|u| u.as_str()))
+            }) {
+                let slot = if is_onion(url) {
+                    &mut meta.onion_endpoint
+                } else {
+                    &mut meta.http_endpoint
+                };
+                slot.get_or_insert_with(|| url.to_string());
+            }
+        } else {
+            meta.http_endpoint = endpoints
+                .get("http")
+                .and_then(|x| x.as_str())
+                .map(str::to_string);
+            meta.onion_endpoint = endpoints
+                .get("onion")
+                .and_then(|x| x.as_str())
+                .map(str::to_string);
+        }
     } else {
         meta.http_endpoint = v
             .get("endpoint")
@@ -272,6 +288,10 @@ fn parse_content_meta(content: &str) -> ContentMeta {
     }
 
     meta
+}
+
+fn is_onion(url: &str) -> bool {
+    url.contains(".onion")
 }
 
 fn short_id(s: &str) -> String {
@@ -293,5 +313,31 @@ mod identity_tests {
         assert_eq!(same_pubkey(Some(hex), Some("not-a-key")), Some(false));
         assert_eq!(same_pubkey(None, Some(npub)), None);
         assert_eq!(same_pubkey(Some(hex), None), None);
+    }
+}
+
+#[cfg(test)]
+mod content_meta_tests {
+    use super::parse_content_meta;
+
+    #[test]
+    fn endpoints_object_and_array_shapes() {
+        let obj = parse_content_meta(
+            r#"{"endpoints":{"http":"https://a.example","onion":"http://x.onion"}}"#,
+        );
+        assert_eq!(obj.http_endpoint.as_deref(), Some("https://a.example"));
+        assert_eq!(obj.onion_endpoint.as_deref(), Some("http://x.onion"));
+
+        let arr = parse_content_meta(
+            r#"{"endpoints":["http://y.onion","https://b.example","https://c.example"]}"#,
+        );
+        assert_eq!(arr.http_endpoint.as_deref(), Some("https://b.example"));
+        assert_eq!(arr.onion_endpoint.as_deref(), Some("http://y.onion"));
+
+        let objs = parse_content_meta(
+            r#"{"endpoints":[{"url":"https://d.example"},{"type":"tor","url":"http://z.onion"}]}"#,
+        );
+        assert_eq!(objs.http_endpoint.as_deref(), Some("https://d.example"));
+        assert_eq!(objs.onion_endpoint.as_deref(), Some("http://z.onion"));
     }
 }
