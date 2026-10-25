@@ -38,8 +38,11 @@ pub struct Quote {
     pub endpoint: Option<String>,
     pub region: Option<String>,
     pub context_length: Option<u64>,
+    /// Last successful catalog fetch that listed this model.
     pub observed_at: DateTime<Utc>,
     pub raw_kind: Option<u32>,
+    /// What the model produces: `chat`, `embedding`, `image`, `audio`, `rerank`, `other`.
+    pub kind: String,
 }
 
 /// A Routstr (or compatible) node discovered via Nostr or config.
@@ -65,6 +68,31 @@ pub struct ProviderNode {
     pub last_latency_ms: Option<u64>,
 }
 
+/// Outcome of the latest catalog fetch for one provider endpoint.
+#[derive(Debug, Clone, Serialize)]
+pub struct FetchStatus {
+    pub source: String,
+    pub provider_id: String,
+    pub endpoint: String,
+    pub last_attempt_at: DateTime<Utc>,
+    pub last_success_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub consecutive_failures: u32,
+    /// Models listed by the last successful fetch.
+    pub models: usize,
+}
+
+/// Summary of the most recent completed poll cycle.
+#[derive(Debug, Clone, Serialize)]
+pub struct PollCycle {
+    pub finished_at: DateTime<Utc>,
+    pub elapsed_ms: u64,
+    pub nodes_ok: usize,
+    pub nodes_failed: usize,
+    pub delisted: usize,
+    pub expired: usize,
+}
+
 #[derive(Debug, Clone)]
 struct PollSample {
     at: DateTime<Utc>,
@@ -83,6 +111,13 @@ pub struct Store {
     poll_history: RwLock<HashMap<String, VecDeque<PollSample>>>,
     /// Last known BTC/USD rate for sats conversion.
     btc_usd: RwLock<Option<f64>>,
+    /// Latest fetch outcome per `{source}|{endpoint}`.
+    fetches: RwLock<HashMap<String, FetchStatus>>,
+    last_cycle: RwLock<Option<PollCycle>>,
+    /// When the last Nostr provider announcement was received.
+    last_announcement_at: RwLock<Option<DateTime<Utc>>>,
+    /// USD per 1M above which a price is treated as a unit error (nulled).
+    price_ceiling_usd: RwLock<Option<f64>>,
 }
 
 impl Store {
@@ -94,11 +129,22 @@ impl Store {
         format!("{source}:{provider_id}:{model}")
     }
 
+    pub fn set_price_ceiling_usd(&self, ceiling: Option<f64>) {
+        if let Ok(mut g) = self.price_ceiling_usd.write() {
+            *g = ceiling.filter(|c| *c > 0.0);
+        }
+    }
+
+    fn price_ceiling(&self) -> Option<f64> {
+        self.price_ceiling_usd.read().ok().and_then(|g| *g)
+    }
+
     pub fn upsert_quotes(&self, quotes: impl IntoIterator<Item = Quote>) {
+        let ceiling = self.price_ceiling();
         if let Ok(mut map) = self.quotes.write() {
             for mut q in quotes {
                 // Drop dynamic sentinels / invalids before they can poison sorts or SQLite.
-                q = sanitize_quote(q);
+                q = sanitize_quote(q, ceiling);
                 let k = Self::quote_key(&q.source, &q.provider_id, &q.model);
                 if let Some(prev) = map.get(&k) {
                     // Preserve previous prices for delta unless caller already set them.
@@ -175,12 +221,13 @@ impl Store {
         if btc_usd <= 0.0 {
             return;
         }
+        let ceiling = self.price_ceiling();
         let Ok(mut map) = self.quotes.write() else {
             return;
         };
         for q in map.values_mut() {
             // Re-sanitize in case a legacy SQLite row loaded bad values.
-            *q = sanitize_quote(q.clone());
+            *q = sanitize_quote(q.clone(), ceiling);
             if let Some(usd) = q.price_in_usd {
                 q.price_in_sats = sanitize_opt(Some(usd_to_sats(usd, btc_usd)));
             } else if let Some(sats) = sanitize_opt(q.price_in_sats) {
@@ -196,6 +243,10 @@ impl Store {
                 q.price_out_sats = Some(sats);
             } else {
                 q.price_out_sats = None;
+            }
+            // Sats-only rows only get USD here, so bound them again.
+            if ceiling.is_some() {
+                *q = sanitize_quote(q.clone(), ceiling);
             }
         }
     }
@@ -322,6 +373,88 @@ impl Store {
         (rel, ok, total, lat)
     }
 
+    /// Success rate over the reliability window per normalized endpoint
+    /// (only endpoints with samples).
+    pub fn reliability_by_endpoint(&self) -> HashMap<String, f64> {
+        let Ok(hist) = self.poll_history.read() else {
+            return HashMap::new();
+        };
+        hist.iter()
+            .filter_map(|(k, samples)| {
+                let (rel, _, total, _) = reliability_from_samples(Some(samples));
+                (total > 0).then(|| (k.clone(), rel))
+            })
+            .collect()
+    }
+
+    /// Record a catalog fetch outcome (`Ok(models)` or `Err(message)`).
+    pub fn record_fetch(
+        &self,
+        source: &str,
+        provider_id: &str,
+        endpoint: &str,
+        outcome: Result<usize, String>,
+    ) {
+        let endpoint = normalize_endpoint(endpoint);
+        let now = Utc::now();
+        let Ok(mut map) = self.fetches.write() else {
+            return;
+        };
+        let st = map
+            .entry(format!("{source}|{endpoint}"))
+            .or_insert_with(|| FetchStatus {
+                source: source.to_string(),
+                provider_id: provider_id.to_string(),
+                endpoint: endpoint.clone(),
+                last_attempt_at: now,
+                last_success_at: None,
+                last_error: None,
+                consecutive_failures: 0,
+                models: 0,
+            });
+        st.provider_id = provider_id.to_string();
+        st.last_attempt_at = now;
+        match outcome {
+            Ok(models) => {
+                st.last_success_at = Some(now);
+                st.last_error = None;
+                st.consecutive_failures = 0;
+                st.models = models;
+            }
+            Err(e) => {
+                st.last_error = Some(e);
+                st.consecutive_failures += 1;
+            }
+        }
+    }
+
+    pub fn fetch_statuses(&self) -> Vec<FetchStatus> {
+        self.fetches
+            .read()
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn record_cycle(&self, cycle: PollCycle) {
+        if let Ok(mut g) = self.last_cycle.write() {
+            *g = Some(cycle);
+        }
+    }
+
+    pub fn last_cycle(&self) -> Option<PollCycle> {
+        self.last_cycle.read().ok().and_then(|g| g.clone())
+    }
+
+    pub fn record_announcement(&self) {
+        if let Ok(mut g) = self.last_announcement_at.write() {
+            *g = Some(Utc::now());
+        }
+    }
+
+    pub fn last_announcement_at(&self) -> Option<DateTime<Utc>> {
+        self.last_announcement_at.read().ok().and_then(|g| *g)
+    }
+
     pub fn set_btc_usd(&self, rate: f64) {
         if let Ok(mut g) = self.btc_usd.write() {
             *g = Some(rate);
@@ -351,9 +484,10 @@ impl Store {
     /// Load quotes bulk (startup restore) — no delta chaining.
     /// Invalid prices from older snapshots are sanitized on load.
     pub fn load_quotes(&self, quotes: Vec<Quote>) {
+        let ceiling = self.price_ceiling();
         if let Ok(mut map) = self.quotes.write() {
             for q in quotes {
-                let q = sanitize_quote(q);
+                let q = sanitize_quote(q, ceiling);
                 let k = Self::quote_key(&q.source, &q.provider_id, &q.model);
                 map.insert(k, q);
             }
@@ -393,14 +527,33 @@ fn prices_eq(a: Option<f64>, b: Option<f64>) -> bool {
     }
 }
 
-/// Zero out invalid / dynamic-sentinel price fields on a quote.
-fn sanitize_quote(mut q: Quote) -> Quote {
+/// Null invalid / dynamic-sentinel price fields on a quote. A USD price above
+/// `ceiling` is almost always a unit error (per-1k or per-token read as per-1M),
+/// so that side is nulled in both units rather than ranked.
+fn sanitize_quote(mut q: Quote, ceiling: Option<f64>) -> Quote {
     q.price_in_usd = sanitize_opt(q.price_in_usd);
     q.price_out_usd = sanitize_opt(q.price_out_usd);
     q.price_in_sats = sanitize_opt(q.price_in_sats);
     q.price_out_sats = sanitize_opt(q.price_out_sats);
     q.prev_price_in_usd = sanitize_opt(q.prev_price_in_usd);
     q.prev_price_out_usd = sanitize_opt(q.prev_price_out_usd);
+    if let Some(max) = ceiling {
+        let over = |v: Option<f64>| v.is_some_and(|x| x > max);
+        if over(q.price_in_usd) {
+            q.price_in_usd = None;
+            q.price_in_sats = None;
+        }
+        if over(q.price_out_usd) {
+            q.price_out_usd = None;
+            q.price_out_sats = None;
+        }
+        if over(q.prev_price_in_usd) {
+            q.prev_price_in_usd = None;
+        }
+        if over(q.prev_price_out_usd) {
+            q.prev_price_out_usd = None;
+        }
+    }
     q
 }
 
@@ -438,6 +591,7 @@ mod tests {
             context_length: None,
             observed_at: Utc::now(),
             raw_kind: None,
+            kind: "chat".into(),
         }
     }
 
@@ -532,6 +686,46 @@ mod tests {
         store.upsert_quotes([old, sample("new", 2.0)]);
         assert_eq!(store.prune_stale_quotes(Duration::hours(24)), 1);
         assert_eq!(store.list_quotes()[0].model, "new");
+    }
+
+    #[test]
+    fn price_ceiling_nulls_unit_errors_in_both_units() {
+        let store = Store::new();
+        store.set_price_ceiling_usd(Some(1000.0));
+        let mut q = sample("per-1k-misread", 15_000.0);
+        q.price_out_sats = Some(1e9);
+        store.upsert_quotes([q]);
+        let got = store.list_quotes().into_iter().next().unwrap();
+        assert_eq!(got.price_out_usd, None);
+        assert_eq!(got.price_out_sats, None);
+        assert_eq!(got.price_in_usd, Some(1.0));
+
+        // Sats-only rows are bounded once the oracle derives USD.
+        let mut sats_only = sample("sats-only", 1.0);
+        sats_only.price_in_usd = None;
+        sats_only.price_in_sats = Some(5e9); // ≈ $2,500/1M at $50k
+        store.upsert_quotes([sats_only]);
+        store.apply_sats_normalization(50_000.0);
+        let got = store
+            .list_quotes()
+            .into_iter()
+            .find(|q| q.model == "sats-only")
+            .unwrap();
+        assert_eq!(got.price_in_usd, None);
+        assert_eq!(got.price_in_sats, None);
+    }
+
+    #[test]
+    fn record_fetch_tracks_success_and_failures() {
+        let store = Store::new();
+        store.record_fetch("routstr", "n1", "https://n1/", Err("down".into()));
+        store.record_fetch("routstr", "n1", "https://n1", Err("down".into()));
+        let f = &store.fetch_statuses()[0];
+        assert_eq!((f.consecutive_failures, f.last_success_at), (2, None));
+        store.record_fetch("routstr", "n1", "https://n1", Ok(7));
+        let f = &store.fetch_statuses()[0];
+        assert_eq!((f.consecutive_failures, f.models), (0, 7));
+        assert!(f.last_success_at.is_some() && f.last_error.is_none());
     }
 
     #[test]

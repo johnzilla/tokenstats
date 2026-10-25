@@ -55,7 +55,7 @@ Centralized in `src/config.rs`. Prefer adding new knobs there (CLI + `TOKENSTATS
 ### Web / dashboard
 
 - Server-rendered HTML is intentional (no frontend build).
-- Query params: `source`, `model`, `preset`, `ratio`, `limit`.
+- Query params: `source`, `model`, `preset`, `ratio`, `limit`, plus quality filters `kind`, `max_age_secs`, `min_reliability`, `exclude_stale`, `exclude_outliers` (carried through board links and CSV export by `QuotesQuery::qs`).
 - Export path: `/export.csv` must honor the same filters as the board.
 - Escape all user/network-derived strings in HTML (`esc` / `esc_attr`).
 
@@ -86,9 +86,9 @@ Related helpers (not substitutes for the full board):
 | Endpoint | Use when |
 |----------|----------|
 | `GET /api/quotes` | **Main integration** — full filtered quote list |
-| `GET /api/summary` | Compact Best Now strip + counts + `btc_usd` |
-| `GET /api/nodes` | Discovered Routstr endpoints + reliability only |
-| `GET /health` | Liveness / quote count / `last_updated` |
+| `GET /api/summary` | Compact Best Now strip + counts + `btc_usd` + feed `status`/`feed` |
+| `GET /api/nodes` | Discovered Routstr endpoints + reliability + `last_success_at` / `last_error` / `consecutive_failures` |
+| `GET /health` | Liveness + feed `status` / `feed` object / quote count / `last_updated` |
 | `GET /export.csv` | Same filters as quotes, for offline analysis |
 
 Default base URL locally: `http://127.0.0.1:8080`.
@@ -96,12 +96,17 @@ Default base URL locally: `http://127.0.0.1:8080`.
 ### Request
 
 ```
-GET /api/quotes?source=&model=&preset=&ratio=&limit=
+GET /api/quotes?source=&model=&kind=&preset=&ratio=&limit=&max_age_secs=&min_reliability=&exclude_stale=&exclude_outliers=
 ```
 
 | Query param | Type | Default | Description |
 |-------------|------|---------|-------------|
-| `source` | string | (all) | Exact source match (case-insensitive): `openrouter`, `routstr`, `nostr` |
+| `source` | string | (all) | Exact source match (case-insensitive), comma-separated for several: `openrouter`, `routstr,nostr` |
+| `kind` | string | (all) | Model kind(s), comma-separated: `chat`, `embedding`, `image`, `audio`, `rerank`, `other` |
+| `max_age_secs` | int | (none) | Only quotes with `age_secs` ≤ this |
+| `min_reliability` | float | (none) | Only quotes whose endpoint's 1h success rate ≥ this (0–1). Quotes with no poll history are **excluded** |
+| `exclude_stale` | bool | off | `1`/`true` hides quotes with `stale: true` |
+| `exclude_outliers` | bool | off | `1`/`true` hides quotes with `outlier: true` |
 | `model` | string | (all) | Case-insensitive **substring** on model id (e.g. `deepseek`, `claude-sonnet`) |
 | `preset` | string | (none) | View preset (see below). When set, applies preset filter/sort instead of plain blend sort |
 | `ratio` | float | `3` | Output:input workload for blended cost (`1:r`). Allowed range effectively `>0` and `≤20`; invalid falls back to `3` |
@@ -149,6 +154,11 @@ Empty store / no matches → `[]`.
 | `context_length` | number \| null | Context window tokens if published |
 | `observed_at` | string (RFC3339) | When this quote was last observed |
 | `node` | string | Display label (`provider · host`) for the winning node/catalog |
+| `kind` | string | `chat` \| `embedding` \| `image` \| `audio` \| `rerank` \| `other`, from catalog `architecture.output_modalities`, else id heuristics, else `chat` |
+| `age_secs` | number | Seconds since `observed_at` |
+| `stale` | bool | `age_secs` > `TOKENSTATS_STALE_AFTER_SECS` (default 600) |
+| `reliability_1h` | number \| null | Endpoint's catalog-fetch success rate over the last hour (OpenRouter included); null until polled since restart |
+| `outlier` | bool | Blend is >10× above or below the median for the same model id across ≥3 quotes. Low outliers often mean a unit bug on the node |
 
 #### Example
 
@@ -185,7 +195,12 @@ Example element (illustrative):
   "region": null,
   "context_length": 1048576,
   "observed_at": "2026-07-22T23:37:15.389573Z",
-  "node": "OpenRouter · openrouter.ai"
+  "node": "OpenRouter · openrouter.ai",
+  "kind": "chat",
+  "age_secs": 12,
+  "stale": false,
+  "reliability_1h": 1.0,
+  "outlier": false
 }
 ```
 
@@ -193,12 +208,13 @@ Example element (illustrative):
 
 1. **API units are per 1M tokens** in both USD and sats. Raw catalog rates are often **per token**; tokenstats normalizes before serving.
 2. **`blended_usd` is the preferred sort/score key** for “cheapest workload” unless the consumer has a different in:out mix — pass `ratio` explicitly.
-3. **Invalid / dynamic prices are `null`**, not negative. Catalog sentinels (OpenRouter `"-1"`, negative floats) are sanitized at ingest and on SQLite restore. Do not invent costs for `null` sides.
+3. **Invalid / dynamic prices are `null`**, not negative. Catalog sentinels (OpenRouter `"-1"`, negative floats) are sanitized at ingest and on SQLite restore, and USD prices above `TOKENSTATS_MAX_PRICE_USD_PER_1M` (default $1000/1M) are nulled as unit errors. Do not invent costs for `null` sides.
 4. **Default cheapest sort** ranks only **strictly positive** blends; free (`0`) and missing prices sort last (not first).
 5. **`delta_*` may be null** until a second catalog poll changes a price; do not treat null as “flat”.
 6. **Data is latest-wins in memory** (optionally restored from SQLite). There is no historical series on this endpoint yet. `observed_at` is the last successful fetch that listed the model; delisted models are removed on the next successful fetch, and quotes unseen for `TOKENSTATS_QUOTE_TTL_SECS` (default 24h) are dropped.
 7. **No auth** on the local/default bind. If exposing publicly, put a reverse proxy / network policy in front; do not assume API keys exist on tokenstats.
 8. **Breaking changes:** prefer additive fields. If renaming/removing fields or changing array-vs-object envelope, update this section, `docs/USAGE.md`, and call out arbstr/agent consumers.
+9. **Check `/health` `status` before trusting the board.** `ok` = fresh; `degraded` = usable, read `feed.reasons`; `down` / `starting` = don't route on it; `offline` = serving a snapshot (`--no-poll`). `ok: true` is liveness only.
 
 ### Unit decision tree (ingest)
 
@@ -230,8 +246,9 @@ catalog model row
 ### Suggested consumer pattern (arbstr)
 
 ```
-1. GET /health          → wait until quotes > 0 (or last_updated set)
-2. GET /api/quotes?...  → select candidates by blended_usd / source / model
+1. GET /health          → wait for status "ok" (or "degraded" + acceptable reasons)
+2. GET /api/quotes?kind=chat&exclude_stale=1&exclude_outliers=1&min_reliability=0.5
+                        → select candidates by blended_usd / source / model
 3. Optionally GET /api/nodes for reliability before routing to a Routstr endpoint
 4. Re-poll /api/quotes on an interval aligned with TOKENSTATS_POLL_INTERVAL_SECS (default 60s)
 ```
@@ -262,7 +279,7 @@ docker compose up -d --build
 - Latency-based “Fastest” (not only name heuristics)
 - Signed oracle publish of Best Now
 - Model compare (same model across OpenRouter vs Routstr nodes)
-- Stale TTL for nodes/quotes
+- Stale TTL for nodes (quotes expire via `--quote-ttl-secs`)
 
 ## Docs to keep in sync
 

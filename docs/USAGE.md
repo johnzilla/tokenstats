@@ -33,6 +33,8 @@ Binary after release build: `./target/release/tokenstats serve`.
 | `TOKENSTATS_NODE_CONCURRENCY` | `--node-concurrency` | `16` |
 | `TOKENSTATS_NODE_TIMEOUT_SECS` | `--node-timeout-secs` | `10` |
 | `TOKENSTATS_QUOTE_TTL_SECS` | `--quote-ttl-secs` | `86400` (`0` = never expire) |
+| `TOKENSTATS_STALE_AFTER_SECS` | `--stale-after-secs` | `600` |
+| `TOKENSTATS_MAX_PRICE_USD_PER_1M` | `--max-price-usd-per-1m` | `1000` (`0` = no ceiling) |
 | `TOKENSTATS_OPENROUTER_URL` | `--openrouter-url` | OpenRouter models URL |
 | `TOKENSTATS_BTC_USD_URL` | `--btc-usd-url` | Coinbase spot URL |
 | `TOKENSTATS_LOG_JSON` | `--log-json` | false |
@@ -69,6 +71,12 @@ Nodes are polled concurrently (`--node-concurrency`) at `/v1/models` (falling ba
 
 - A successful catalog fetch replaces that provider endpoint's models: models it no longer lists are removed. An empty response is ignored rather than wiping the provider.
 - Quotes not re-observed within `--quote-ttl-secs` (default 24h) are dropped, e.g. when a node stays down. Expiry runs only while polling is enabled, so `--no-poll` inspection of an old snapshot keeps everything.
+- Quotes older than `--stale-after-secs` (default 10 min) are kept but flagged `stale: true`; pass `exclude_stale=1` to hide them.
+- A USD price above `--max-price-usd-per-1m` (default $1000) is treated as a unit error and nulled (both USD and sats for that side).
+
+### Feed health
+
+`/health` and `/api/summary` include `status` (`ok` · `degraded` · `down` · `starting` · `offline`) and a `feed` object: `reasons`, `stale_quotes`, `last_cycle` (nodes ok/failed, delisted, expired, elapsed), per-source `endpoints`/`healthy`/`failing`/`models`/`last_success_at`/`last_error`, and Nostr `discovery.lag_secs`. Many dead Routstr nodes alone does not degrade the feed; zero healthy nodes does. The dashboard header shows `feed <status>` (hover for reasons).
 
 ### Ephemeral / CI smoke
 
@@ -129,7 +137,7 @@ curl -OJ 'http://127.0.0.1:8080/export.csv?preset=frontier&ratio=3'
 curl -OJ 'http://127.0.0.1:8080/export.csv?source=openrouter&model=claude'
 ```
 
-Columns include source, provider, model, USD/sats, blended price, delta, endpoint, context, timestamps.
+Columns include source, provider, model, USD/sats, blended price, delta, endpoint, context, timestamps, plus `kind`, `age_secs`, `stale`, `reliability_1h`, `outlier`. Export honors the same filters as the board and API.
 
 ## API examples
 
@@ -142,6 +150,12 @@ curl -s localhost:8080/api/summary | jq '.best_now[:5]'
 
 # Filtered quotes
 curl -s 'localhost:8080/api/quotes?preset=fastest&limit=20' | jq '.[].model'
+
+# Routable-looking chat quotes only: fresh, reliable, no outliers
+curl -s 'localhost:8080/api/quotes?kind=chat&exclude_stale=1&min_reliability=0.5&exclude_outliers=1&limit=500' | jq length
+
+# Feed status
+curl -s localhost:8080/health | jq '{status, reasons: .feed.reasons}'
 
 # Nodes
 curl -s localhost:8080/api/nodes | jq

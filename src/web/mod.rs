@@ -1,8 +1,10 @@
 //! Lightweight Axum dashboard.
 
+mod feed;
 mod handlers;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::routing::get;
 use axum::Router;
@@ -14,6 +16,10 @@ use crate::store::Store;
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
+    /// Age past which quotes are flagged `stale`.
+    pub stale_after: Duration,
+    /// Whether the catalog poller runs (feed status reports `offline` if not).
+    pub polling: bool,
 }
 
 pub fn router(state: AppState) -> Router {

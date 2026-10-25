@@ -46,6 +46,7 @@ pub async fn fetch_quotes(client: &reqwest::Client, url: &str) -> Result<Vec<Quo
                 context_length: m.context_length,
                 observed_at: now,
                 raw_kind: None,
+                kind: m.kind,
             }
         })
         .collect();

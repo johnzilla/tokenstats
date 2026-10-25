@@ -179,6 +179,7 @@ fn handle_event(store: &Store, event: &Event) -> Result<()> {
         kind,
         "discovered Routstr node"
     );
+    store.record_announcement();
     store.upsert_node(node);
     Ok(())
 }

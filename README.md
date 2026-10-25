@@ -66,9 +66,9 @@ Query params: `?source=openrouter&preset=frontier&ratio=4&model=deepseek`
 | Path | Description |
 |------|-------------|
 | `GET /` | HTML dashboard (auto-refresh ~15s) |
-| `GET /health` | Liveness + quote/node counts + `last_updated` |
-| `GET /api/quotes` | JSON quotes (`source`, `model`, `preset`, `ratio`, `limit`) |
-| `GET /api/nodes` | Discovered nodes + reliability |
+| `GET /health` | Liveness + feed `status` (`ok`/`degraded`/`down`/…) + counts + `last_updated` |
+| `GET /api/quotes` | JSON quotes (`source`, `model`, `kind`, `preset`, `ratio`, `limit`, `max_age_secs`, `min_reliability`, `exclude_stale`, `exclude_outliers`) |
+| `GET /api/nodes` | Discovered nodes + reliability + last success/error |
 | `GET /api/summary` | Aggregates + Best Now strip |
 | `GET /export.csv` | CSV of current filtered view |
 
@@ -116,6 +116,8 @@ Specs: [Routstr/protocol](https://github.com/Routstr/protocol)
 | Persist interval | `--persist-interval-secs` | `30` |
 | Node poll concurrency / timeout | `--node-concurrency` / `--node-timeout-secs` | `16` / `10` |
 | Quote expiry | `--quote-ttl-secs` | `86400` |
+| Stale flag threshold | `--stale-after-secs` | `600` |
+| Price ceiling (USD/1M) | `--max-price-usd-per-1m` | `1000` |
 | Disable Nostr | `--no-nostr` | off |
 | Disable OpenRouter | `--no-openrouter` | off |
 | JSON logs | `--log-json` / `TOKENSTATS_LOG_JSON` | off |

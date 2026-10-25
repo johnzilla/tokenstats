@@ -354,6 +354,7 @@ mod tests {
             context_length: Some(128_000),
             observed_at: Utc::now(),
             raw_kind: None,
+            kind: "chat".into(),
         }
     }
 
