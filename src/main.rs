@@ -122,6 +122,7 @@ async fn run_serve(cfg: Config) -> Result<()> {
             poll_ok: 0,
             poll_total: 0,
             last_latency_ms: None,
+            skip_reason: None,
         });
         info!(%endpoint, "seeded node from config");
     }
@@ -154,6 +155,7 @@ async fn run_serve(cfg: Config) -> Result<()> {
             node_concurrency: cfg.node_concurrency,
             node_timeout: cfg.node_timeout,
             quote_ttl: cfg.quote_ttl,
+            allow_private_nodes: cfg.allow_private_nodes,
         };
         tokio::spawn(async move {
             match providers::run_poller(poll_store, poll_cfg, task_cancel).await {

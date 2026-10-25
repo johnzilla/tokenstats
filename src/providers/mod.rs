@@ -1,6 +1,7 @@
 //! HTTP polling of inference catalogs (OpenRouter + discovered Routstr nodes).
 
 mod catalog;
+mod netguard;
 mod openrouter;
 mod routstr;
 
@@ -29,6 +30,8 @@ pub struct PollerConfig {
     pub node_timeout: Duration,
     /// Drop quotes not re-observed within this window (`None` = keep forever).
     pub quote_ttl: Option<Duration>,
+    /// Poll Nostr-announced nodes on private/loopback addresses (trusted LAN only).
+    pub allow_private_nodes: bool,
 }
 
 pub async fn run_poller(
@@ -46,13 +49,15 @@ pub async fn run_poller(
         .timeout(cfg.http_timeout)
         .user_agent(concat!("tokenstats/", env!("CARGO_PKG_VERSION")))
         .build()?;
+    let nodes =
+        routstr::NodeFetcher::new(client.clone(), cfg.http_timeout, cfg.allow_private_nodes)?;
 
     tokio::select! {
         _ = cancel.cancelled() => {
             info!("provider poller received shutdown during initial poll");
             return Ok(());
         }
-        res = poll_once(&client, &store, &cfg) => {
+        res = poll_once(&client, &nodes, &store, &cfg) => {
             if let Err(e) = res {
                 warn!(error = %e, "initial provider poll failed");
             }
@@ -76,7 +81,7 @@ pub async fn run_poller(
                         info!("provider poller received shutdown mid-cycle");
                         break;
                     }
-                    res = poll_once(&client, &store, &cfg) => {
+                    res = poll_once(&client, &nodes, &store, &cfg) => {
                         if let Err(e) = res {
                             warn!(error = %e, "provider poll failed");
                         }
@@ -89,7 +94,12 @@ pub async fn run_poller(
     Ok(())
 }
 
-async fn poll_once(client: &reqwest::Client, store: &Store, cfg: &PollerConfig) -> Result<()> {
+async fn poll_once(
+    client: &reqwest::Client,
+    nodes: &routstr::NodeFetcher,
+    store: &Store,
+    cfg: &PollerConfig,
+) -> Result<()> {
     let started = Instant::now();
     let mut delisted = 0usize;
 
@@ -126,27 +136,34 @@ async fn poll_once(client: &reqwest::Client, store: &Store, cfg: &PollerConfig) 
     let sem = Arc::new(Semaphore::new(cfg.node_concurrency.max(1)));
     let mut tasks = JoinSet::new();
     for node in store.list_nodes() {
-        let client = client.clone();
+        let nodes = nodes.clone();
         let sem = Arc::clone(&sem);
         let timeout = cfg.node_timeout;
         tasks.spawn(async move {
             let _permit = sem.acquire_owned().await;
-            let res =
-                match tokio::time::timeout(timeout, routstr::fetch_node_quotes(&client, &node))
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(_) => Err(anyhow::anyhow!("timed out after {}s", timeout.as_secs())),
-                };
+            let res = match tokio::time::timeout(timeout, nodes.fetch(&node)).await {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!("timed out after {}s", timeout.as_secs())),
+            };
             (node, res)
         });
     }
 
-    let (mut nodes_ok, mut nodes_failed) = (0usize, 0usize);
+    let (mut nodes_ok, mut nodes_failed, mut nodes_blocked) = (0usize, 0usize, 0usize);
     while let Some(joined) = tasks.join_next().await {
         let Ok((node, res)) = joined else {
             continue;
         };
+        let blocked = res
+            .as_ref()
+            .err()
+            .and_then(|e| e.downcast_ref::<routstr::Blocked>());
+        store.set_node_skip_reason(&node.endpoint, blocked.map(|b| b.0.clone()));
+        if blocked.is_some() {
+            // Never requested: no reliability sample, no catalog change.
+            nodes_blocked += 1;
+            continue;
+        }
         match res {
             Ok((quotes, latency_ms)) => {
                 nodes_ok += 1;
@@ -202,6 +219,7 @@ async fn poll_once(client: &reqwest::Client, store: &Store, cfg: &PollerConfig) 
     info!(
         nodes_ok,
         nodes_failed,
+        nodes_blocked,
         delisted,
         expired,
         quotes = store.quote_count(),

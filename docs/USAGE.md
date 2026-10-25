@@ -19,6 +19,7 @@ Binary after release build: `./target/release/tokenstats serve`.
 | `TOKENSTATS_BIND` | `--bind` | `127.0.0.1:8080` |
 | `TOKENSTATS_RELAYS` | `--relay` | damus, nos.lol, nostr.band |
 | `TOKENSTATS_NODES` | `--node` | (none) |
+| `TOKENSTATS_ALLOW_PRIVATE_NODES` | `--allow-private-nodes` | false |
 | `TOKENSTATS_DB` | `--db` | `data/tokenstats.db` |
 | `TOKENSTATS_NO_NOSTR` | `--no-nostr` | false |
 | `TOKENSTATS_NO_POLL` | `--no-poll` | false |
@@ -66,6 +67,14 @@ tokenstats serve --node https://api.example.com --node https://other.example.com
 ```
 
 Nodes are polled concurrently (`--node-concurrency`) at `/v1/models` (falling back to `/models`), each within `--node-timeout-secs`. Failures and timeouts count against reliability.
+
+### Private-address guard (SSRF)
+
+Nostr announcements are unauthenticated, so by default tokenstats **never requests** a Nostr-discovered node whose host is, or resolves to, a non-public address: loopback (`127/8`, `::1`, `localhost`, `*.localhost`), RFC1918 (`10/8`, `172.16/12`, `192.168/16`), CGNAT `100.64/10`, link-local (`169.254/16` incl. cloud metadata `169.254.169.254`, `fe80::/10`), unique-local `fc00::/7`, unspecified (`0.0.0.0/8`, `::`) and multicast/broadcast. The guarded client connects only to checked addresses (no DNS rebinding) and refuses redirects to such hosts.
+
+- Skipped nodes still appear in `GET /api/nodes` with `skip_reason` set (e.g. `"127.0.0.1 is loopback"`); they get no reliability samples. `skip_reason` is `null` for polled nodes.
+- Operator-seeded `--node` endpoints are trusted, so `--node http://127.0.0.1:8000` works for local Routstr testing.
+- On a trusted LAN, `--allow-private-nodes` (`TOKENSTATS_ALLOW_PRIVATE_NODES=true`) polls private Nostr-announced nodes too. Don't enable it on a public deployment.
 
 ### Freshness
 
@@ -174,6 +183,7 @@ curl -s localhost:8080/api/nodes | jq
 |---------|-------------|
 | Empty board | Wait for first OpenRouter poll; check logs with `-v` |
 | No nodes | Nostr blocked? Use `--node URL` or wait for kind 38421 events |
+| Node has `skip_reason` | Its announced endpoint is private/loopback; seed it with `--node` or use `--allow-private-nodes` on a trusted LAN |
 | Sats show `—` | BTC/USD fetch failed (Coinbase); USD columns still work |
 | Deltas always `—` | Need a second catalog poll after prices change |
 | Stale data after restart | Confirm `--db` path; avoid `--no-persist` if you want restore |

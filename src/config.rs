@@ -83,6 +83,11 @@ pub enum Commands {
         #[arg(long, env = "TOKENSTATS_NODES", value_delimiter = ',')]
         node: Vec<String>,
 
+        /// Also poll Nostr-announced nodes on loopback/private/link-local addresses.
+        /// Only for trusted LANs: announcements are unauthenticated (SSRF risk).
+        #[arg(long, default_value_t = false, env = "TOKENSTATS_ALLOW_PRIVATE_NODES")]
+        allow_private_nodes: bool,
+
         /// SQLite database path (created if missing).
         #[arg(long, default_value = DEFAULT_DB, env = "TOKENSTATS_DB")]
         db: PathBuf,
@@ -156,6 +161,7 @@ pub struct Config {
     pub bind: SocketAddr,
     pub relays: Vec<String>,
     pub seed_nodes: Vec<String>,
+    pub allow_private_nodes: bool,
     pub db_path: PathBuf,
     pub persist: bool,
     pub enable_nostr: bool,
@@ -186,6 +192,7 @@ impl Config {
             no_openrouter,
             no_oracle,
             node,
+            allow_private_nodes,
             db,
             no_persist,
             poll_interval_secs,
@@ -206,6 +213,7 @@ impl Config {
             bind: *bind,
             relays: relay.clone(),
             seed_nodes: node.clone(),
+            allow_private_nodes: *allow_private_nodes,
             db_path: db.clone(),
             persist: !no_persist,
             enable_nostr: !no_nostr,
@@ -239,6 +247,7 @@ impl Config {
             enable_oracle = self.enable_oracle,
             relays = self.relays.len(),
             seed_nodes = self.seed_nodes.len(),
+            allow_private_nodes = self.allow_private_nodes,
             poll_interval_secs = self.poll_interval.as_secs(),
             btc_interval_secs = self.btc_rate_interval.as_secs(),
             persist_interval_secs = self.persist_interval.as_secs(),
@@ -274,6 +283,14 @@ mod tests {
         assert_eq!(cfg.quote_ttl, Some(Duration::from_secs(86_400)));
         assert_eq!(cfg.stale_after.as_secs(), 600);
         assert_eq!(cfg.max_price_usd_per_1m, Some(1000.0));
+        assert!(!cfg.allow_private_nodes);
+    }
+
+    #[test]
+    fn allow_private_nodes_flag() {
+        let cli =
+            Cli::try_parse_from(["tokenstats", "serve", "--allow-private-nodes"]).expect("parse");
+        assert!(Config::from_cli(&cli).allow_private_nodes);
     }
 
     #[test]

@@ -171,6 +171,7 @@ fn handle_event(store: &Store, event: &Event) -> Result<()> {
         poll_ok: 0,
         poll_total: 0,
         last_latency_ms: None,
+        skip_reason: None,
     };
 
     info!(
