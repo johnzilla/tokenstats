@@ -52,6 +52,7 @@ Centralized in `src/config.rs`. Prefer adding new knobs there (CLI + `TOKENSTATS
 - On upsert, preserve `prev_price_*` for delta indicators; oracle sats updates must **not** clobber deltas (`apply_sats_normalization`).
 - Node reliability: `record_poll` feeds raw 1h samples (`reliability_1h`) and hourly buckets with latency histograms (`src/store/history.rs`, 7 days) behind `endpoint_stats()`. Buckets persist in `endpoint_hours`; only hours touched since the last save are upserted.
 - SSRF guard (`src/providers/netguard.rs`): non-`cli` nodes (i.e. Nostr announcements) are never requested when the host is or resolves to loopback/private/CGNAT/link-local/unique-local/unspecified, unless `--allow-private-nodes`. Use the guarded client (public-only resolver + redirect checks) for any new fetch of announced URLs. Skips set `ProviderNode.skip_reason`.
+- Node probes: each cycle `NodeFetcher::poll` runs the catalog fetch and a `GET /v1/info` side by side (same guard). Probes feed `record_probe` (latency history in `endpoint_probe_hours` + latest `ProbeStatus`, not persisted), never reliability. Identity = `nostr::same_pubkey(announced pubkey, info.npub)`.
 
 ### Web / dashboard
 
@@ -88,7 +89,7 @@ Related helpers (not substitutes for the full board):
 |----------|----------|
 | `GET /api/quotes` | **Main integration** — full filtered quote list |
 | `GET /api/summary` | Compact Best Now strip + counts + `btc_usd` + feed `status`/`feed` |
-| `GET /api/nodes` | Discovered Routstr endpoints + reliability (`reliability_1h/24h/7d`, `polls_24h`) + `latency_p50_ms/p95_ms` + `last_success_at` / `last_error` / `consecutive_failures` + `skip_reason` (string \| null) when the SSRF guard refused to poll |
+| `GET /api/nodes` | Discovered Routstr endpoints + reliability (`reliability_1h/24h/7d`, `polls_24h`) + `latency_p50_ms/p95_ms`/`latency_source` + `identity_verified` + `probe` (`probed_at`, `ok`, `error`) + `info` (self-reported `/v1/info`: `name`, `version`, `npub`, `mints`, `onion_url`) + `last_success_at` / `last_error` / `consecutive_failures` + `skip_reason` (string \| null) when the SSRF guard refused to poll |
 | `GET /health` | Liveness + feed `status` / `feed` object / quote count / `last_updated` |
 | `GET /export.csv` | Same filters as quotes, for offline analysis |
 
@@ -120,8 +121,8 @@ GET /api/quotes?source=&model=&kind=&preset=&ratio=&limit=&max_age_secs=&min_rel
 | Value | Aliases | Behavior |
 |-------|---------|----------|
 | `frontier` | `cheapest-frontier`, `cheapest_frontier` | Popular frontier families, non-free, sorted by blend |
-| `fastest` | `fast` | Name heuristics (`flash`, `mini`, `turbo`, …), sorted by blend |
-| `private` | `most-private`, `most_private` | Routstr/Nostr/onion/localhost first |
+| `fastest` | `fast` | Fast model classes by name (`flash`, `mini`, `turbo`, …; no free way to measure tokens/s), then endpoints with measured latency and ≥90% 24h reliability first, by 24h p50, then blend |
+| `private` | `most-private`, `most_private` | Routstr/Nostr/onion/localhost; drops endpoints with 24h reliability < 50%; onion (announced or `/v1/info`) first, then identity-verified nodes, then other Routstr, by 24h reliability, then blend |
 | `local` | `local-first`, `local_first` | Local/ollama/vLLM-style candidates |
 
 Without `preset`, results are sorted by **ascending blended USD**, then model name.
@@ -162,7 +163,10 @@ Empty store / no matches → `[]`.
 | `stale` | bool | `age_secs` > `TOKENSTATS_STALE_AFTER_SECS` (default 600) |
 | `reliability_1h` | number \| null | Endpoint's catalog-fetch success rate over the last hour (reference catalogs included); null until polled since restart |
 | `reliability_24h`, `reliability_7d` | number \| null | Endpoint fetch success rate over the last 24 / 168 clock hours (current hour included), persisted in SQLite |
-| `latency_p50_ms`, `latency_p95_ms` | number \| null | Endpoint catalog-fetch response time over 24h, successful polls only. **Bucketed** (~25% bins, value = bin upper edge, max 20000). This is endpoint responsiveness, not inference speed or TTFT |
+| `latency_p50_ms`, `latency_p95_ms` | number \| null | Endpoint response time over 24h, successful samples only: the Routstr `/v1/info` probe when it has samples, else the catalog fetch (see `latency_source`). **Bucketed** (~25% bins, value = bin upper edge, max 20000). Endpoint responsiveness, not inference speed or TTFT |
+| `latency_source` | string \| null | `probe` \| `catalog` \| null (no samples) |
+| `identity_verified` | bool \| null | Node's `/v1/info` `npub` matches the Nostr key that announced it. `false` = mismatch or unparsable npub; null = nothing to compare (reference catalogs, `--node` seeds, not probed since restart) |
+| `onion` | string \| null | Node's onion address, from the announcement or `/v1/info` |
 | `outlier` | bool | Blend is >10× above or below the median for the same model id across ≥3 quotes. Low outliers often mean a unit bug on the node |
 
 #### Example
@@ -286,7 +290,7 @@ docker compose up -d --build
 ## Good next features (if asked)
 
 - Price history charts / multi-sample deltas beyond last snapshot
-- Latency-based “Fastest” (latency data exists now; presets still use name heuristics)
+- True inference latency / TTFT (needs paid completions; out of scope under "observe, don't pay")
 - Signed oracle publish of Best Now
 - Model compare (same model across OpenRouter vs Routstr nodes)
 - Stale TTL for nodes (quotes expire via `--quote-ttl-secs`)

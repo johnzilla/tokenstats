@@ -166,29 +166,43 @@ pub struct EndpointStats {
     pub reliability_1h: Option<f64>,
     pub reliability_24h: Option<f64>,
     pub reliability_7d: Option<f64>,
-    /// Catalog-fetch response time of successful polls over 24h (bucketed).
+    /// Response time of successful polls over 24h (bucketed): the `/v1/info`
+    /// probe when it has samples, else the catalog fetch (`latency_source`).
     pub latency_p50_ms: Option<u64>,
     pub latency_p95_ms: Option<u64>,
+    /// `probe` | `catalog` | null (no latency samples).
+    pub latency_source: Option<&'static str>,
     /// Polls in the 24h window (how much the figures above rest on).
     pub polls_24h: u32,
 }
 
 impl EndpointStats {
+    /// Reliability always comes from catalog polls (that is what keeps quotes
+    /// fresh); latency prefers the lighter `/v1/info` probe.
     pub fn from_buckets(
-        buckets: Option<&VecDeque<HourBucket>>,
+        catalog: Option<&VecDeque<HourBucket>>,
+        probe: Option<&VecDeque<HourBucket>>,
         reliability_1h: Option<f64>,
         now_hour: i64,
     ) -> Self {
         let empty = VecDeque::new();
-        let buckets = buckets.unwrap_or(&empty);
-        let day = Window::over(buckets, now_hour, 24);
-        let week = Window::over(buckets, now_hour, HISTORY_HOURS);
+        let day = Window::over(catalog.unwrap_or(&empty), now_hour, 24);
+        let week = Window::over(catalog.unwrap_or(&empty), now_hour, HISTORY_HOURS);
+        let probe_day = Window::over(probe.unwrap_or(&empty), now_hour, 24);
+        let (lat, source) = if probe_day.percentile(0.5).is_some() {
+            (&probe_day, Some("probe"))
+        } else if day.percentile(0.5).is_some() {
+            (&day, Some("catalog"))
+        } else {
+            (&day, None)
+        };
         Self {
             reliability_1h,
             reliability_24h: day.reliability(),
             reliability_7d: week.reliability(),
-            latency_p50_ms: day.percentile(0.50),
-            latency_p95_ms: day.percentile(0.95),
+            latency_p50_ms: lat.percentile(0.50),
+            latency_p95_ms: lat.percentile(0.95),
+            latency_source: source,
             polls_24h: day.total,
         }
     }
@@ -219,13 +233,35 @@ mod tests {
         record(&mut b, 100, true, Some(50));
         record(&mut b, 100 + 30, false, None); // 30h later
         let now = 100 + 30;
-        let stats = EndpointStats::from_buckets(Some(&b), None, now);
+        let stats = EndpointStats::from_buckets(Some(&b), None, None, now);
         assert_eq!(stats.reliability_24h, Some(0.0));
         assert_eq!(stats.reliability_7d, Some(0.5));
         assert_eq!(stats.latency_p50_ms, None);
         // A week on, the first bucket is gone.
         record(&mut b, 100 + HISTORY_HOURS, true, None);
         assert_eq!(b.front().unwrap().hour, 130);
+    }
+
+    #[test]
+    fn latency_prefers_probe_samples() {
+        let mut catalog = VecDeque::new();
+        let mut probe = VecDeque::new();
+        record(&mut catalog, 5, true, Some(2000));
+        let s = EndpointStats::from_buckets(Some(&catalog), Some(&probe), None, 5);
+        assert_eq!(
+            (s.latency_p50_ms, s.latency_source),
+            (Some(2000), Some("catalog"))
+        );
+        record(&mut probe, 5, true, Some(60));
+        let s = EndpointStats::from_buckets(Some(&catalog), Some(&probe), None, 5);
+        assert_eq!(
+            (s.latency_p50_ms, s.latency_source),
+            (Some(63), Some("probe"))
+        );
+        // Reliability stays catalog-based.
+        record(&mut probe, 5, false, None);
+        let s = EndpointStats::from_buckets(Some(&catalog), Some(&probe), None, 5);
+        assert_eq!(s.reliability_24h, Some(1.0));
     }
 
     #[test]

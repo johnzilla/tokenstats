@@ -11,7 +11,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::providers::model_kind;
-use crate::store::{HourBucket, ProviderNode, Quote, Store};
+use crate::store::{HourBucket, ProviderNode, Quote, Store, Stream};
+
+/// SQLite table per hourly history stream (same schema).
+const HOURLY_TABLES: [(Stream, &str); 2] = [
+    (Stream::Catalog, "endpoint_hours"),
+    (Stream::Probe, "endpoint_probe_hours"),
+];
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -69,6 +75,14 @@ impl Db {
                 last_latency_ms INTEGER
             );
             CREATE TABLE IF NOT EXISTS endpoint_hours (
+                endpoint TEXT NOT NULL,
+                hour INTEGER NOT NULL,
+                ok INTEGER NOT NULL,
+                total INTEGER NOT NULL,
+                latency_hist TEXT NOT NULL,
+                PRIMARY KEY (endpoint, hour)
+            );
+            CREATE TABLE IF NOT EXISTS endpoint_probe_hours (
                 endpoint TEXT NOT NULL,
                 hour INTEGER NOT NULL,
                 ok INTEGER NOT NULL,
@@ -182,24 +196,28 @@ impl Db {
         let n_nodes = nodes.len();
         store.load_nodes(nodes);
 
-        let mut stmt =
-            conn.prepare("SELECT endpoint, hour, ok, total, latency_hist FROM endpoint_hours")?;
-        let hours: Vec<(String, HourBucket)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    HourBucket {
-                        hour: row.get(1)?,
-                        ok: row.get::<_, i64>(2)? as u32,
-                        total: row.get::<_, i64>(3)? as u32,
-                        latency_hist: HourBucket::hist_from_str(&row.get::<_, String>(4)?),
-                    },
-                ))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-        let n_hours = hours.len();
-        store.load_hourly(hours);
+        let mut n_hours = 0;
+        for (stream, table) in HOURLY_TABLES {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT endpoint, hour, ok, total, latency_hist FROM {table}"
+            ))?;
+            let hours: Vec<(String, HourBucket)> = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        HourBucket {
+                            hour: row.get(1)?,
+                            ok: row.get::<_, i64>(2)? as u32,
+                            total: row.get::<_, i64>(3)? as u32,
+                            latency_hist: HourBucket::hist_from_str(&row.get::<_, String>(4)?),
+                        },
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            n_hours += hours.len();
+            store.load_hourly(stream, hours);
+        }
 
         info!(
             quotes = n_quotes,
@@ -281,15 +299,15 @@ impl Db {
         // expire the oldest. Past hours never change, so this stays small.
         let now_hour = Utc::now().timestamp().div_euclid(3600);
         let dirty_from = *self.hourly_dirty_from.lock().expect("dirty lock");
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO endpoint_hours (endpoint, hour, ok, total, latency_hist)
+        for (stream, table) in HOURLY_TABLES {
+            let mut stmt = tx.prepare(&format!(
+                "INSERT INTO {table} (endpoint, hour, ok, total, latency_hist)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(endpoint, hour) DO UPDATE SET
                     ok = excluded.ok, total = excluded.total,
-                    latency_hist = excluded.latency_hist",
-            )?;
-            for (endpoint, b) in store.hourly_snapshot(dirty_from) {
+                    latency_hist = excluded.latency_hist"
+            ))?;
+            for (endpoint, b) in store.hourly_snapshot(stream, dirty_from) {
                 stmt.execute(params![
                     endpoint,
                     b.hour,
@@ -299,7 +317,7 @@ impl Db {
                 ])?;
             }
             tx.execute(
-                "DELETE FROM endpoint_hours WHERE hour <= ?1",
+                &format!("DELETE FROM {table} WHERE hour <= ?1"),
                 params![now_hour - crate::store::HISTORY_HOURS],
             )?;
         }
@@ -381,6 +399,7 @@ mod tests {
         let store = Store::new();
         store.record_poll("https://n1", true, Some(90));
         store.record_poll("https://n1", false, None);
+        store.record_probe("https://n1", Ok((Default::default(), 30, None)));
         let db = Db::open(&path).unwrap();
         db.save_from(&store).unwrap();
         // Second save only rewrites the current hour; still one row.
@@ -391,7 +410,9 @@ mod tests {
         db.load_into(&restored).unwrap();
         let st = &restored.endpoint_stats()["https://n1"];
         assert_eq!(st.polls_24h, 3);
-        assert_eq!(st.latency_p50_ms, Some(100));
+        // Probe history persists too and wins for latency.
+        assert_eq!(st.latency_source, Some("probe"));
+        assert_eq!(st.latency_p50_ms, Some(32));
         drop(db);
         for ext in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{ext}", path.display()));

@@ -1,13 +1,44 @@
 //! Market helpers: popular families, blended cost, filter presets.
 
+use std::collections::HashMap;
+
 use crate::pricing::{blend_sort_key, is_rankable_blend, sanitize_opt};
-use crate::store::Quote;
+use crate::store::{normalize_endpoint, Quote};
 
 /// Default output:input token ratio for blended cost (1 in : N out → ratio = N).
 pub const DEFAULT_BLEND_RATIO: f64 = 3.0;
 
 /// Centralized catalogs (not sovereign nodes): never "local" or "private".
 pub const REFERENCE_SOURCES: &[&str] = &["openrouter", "orcarouter"];
+
+/// Fastest ranks endpoints at or above this 24h reliability ahead of the rest.
+pub const FAST_MIN_RELIABILITY: f64 = 0.9;
+/// Most Private drops endpoints whose 24h reliability is known and below this.
+pub const PRIVATE_MIN_RELIABILITY: f64 = 0.5;
+
+/// Measured signals presets rank on, per normalized endpoint.
+#[derive(Debug, Clone, Default)]
+pub struct EndpointSignals {
+    pub latency_p50_ms: Option<u64>,
+    pub reliability_24h: Option<f64>,
+    /// Node advertises an onion address (announcement or `/v1/info`).
+    pub onion: bool,
+    pub identity_verified: Option<bool>,
+}
+
+pub type Signals = HashMap<String, EndpointSignals>;
+
+fn signals_for<'a>(signals: &'a Signals, q: &Quote) -> Option<&'a EndpointSignals> {
+    signals.get(&normalize_endpoint(q.endpoint.as_deref()?))
+}
+
+fn default_blend_key(q: &Quote) -> f64 {
+    blend_sort_key(blended_usd(
+        q.price_in_usd,
+        q.price_out_usd,
+        DEFAULT_BLEND_RATIO,
+    ))
+}
 
 /// Popular model families for the "Best Now" strip.
 pub const POPULAR_FAMILIES: &[PopularFamily] = &[
@@ -220,7 +251,7 @@ pub struct BestNowRow<'a> {
     pub blended_usd: f64,
 }
 
-pub fn apply_preset(quotes: Vec<Quote>, preset: Preset) -> Vec<Quote> {
+pub fn apply_preset(quotes: Vec<Quote>, preset: Preset, signals: &Signals) -> Vec<Quote> {
     match preset {
         Preset::CheapestFrontier => {
             let mut v: Vec<_> = quotes
@@ -246,24 +277,34 @@ pub fn apply_preset(quotes: Vec<Quote>, preset: Preset) -> Vec<Quote> {
             v
         }
         Preset::Fastest => {
+            // Fast model classes are still a name heuristic (no free way to
+            // measure tokens/s); among them, rank by measured endpoint latency.
             let mut v: Vec<_> = quotes
                 .into_iter()
                 .filter(|q| is_fast_model(&q.model))
                 .collect();
-            // Prefer cheaper flash-class models first among "fast" names.
             v.sort_by(|a, b| {
-                let ba = blend_sort_key(blended_usd(
-                    a.price_in_usd,
-                    a.price_out_usd,
-                    DEFAULT_BLEND_RATIO,
-                ));
-                let bb = blend_sort_key(blended_usd(
-                    b.price_in_usd,
-                    b.price_out_usd,
-                    DEFAULT_BLEND_RATIO,
-                ));
-                ba.partial_cmp(&bb)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                let key = |q: &Quote| {
+                    let sig = signals_for(signals, q);
+                    let p50 = sig.and_then(|s| s.latency_p50_ms);
+                    let reliable = sig
+                        .and_then(|s| s.reliability_24h)
+                        .is_some_and(|r| r >= FAST_MIN_RELIABILITY);
+                    // Tier 0: reliable + measured; 1: measured; 2: no data.
+                    let tier = match (p50.is_some(), reliable) {
+                        (true, true) => 0u8,
+                        (true, false) => 1,
+                        _ => 2,
+                    };
+                    (tier, p50.unwrap_or(u64::MAX))
+                };
+                key(a)
+                    .cmp(&key(b))
+                    .then_with(|| {
+                        default_blend_key(a)
+                            .partial_cmp(&default_blend_key(b))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
                     .then_with(|| a.model.cmp(&b.model))
             });
             v
@@ -283,26 +324,32 @@ pub fn apply_preset(quotes: Vec<Quote>, preset: Preset) -> Vec<Quote> {
                             })
                             .unwrap_or(false)
                 })
+                // Private but unreachable is no use; unknown reliability stays.
+                .filter(|q| {
+                    signals_for(signals, q)
+                        .and_then(|s| s.reliability_24h)
+                        .is_none_or(|r| r >= PRIVATE_MIN_RELIABILITY)
+                })
                 .collect();
             v.sort_by(|a, b| {
-                // onion first, then routstr, then blended price
-                let sa = privacy_rank(a);
-                let sb = privacy_rank(b);
-                sa.cmp(&sb).then_with(|| {
-                    let ba = blend_sort_key(blended_usd(
-                        a.price_in_usd,
-                        a.price_out_usd,
-                        DEFAULT_BLEND_RATIO,
-                    ));
-                    let bb = blend_sort_key(blended_usd(
-                        b.price_in_usd,
-                        b.price_out_usd,
-                        DEFAULT_BLEND_RATIO,
-                    ));
-                    ba.partial_cmp(&bb)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.model.cmp(&b.model))
-                })
+                let rel = |q: &Quote| {
+                    signals_for(signals, q)
+                        .and_then(|s| s.reliability_24h)
+                        .unwrap_or(0.0)
+                };
+                privacy_rank(a, signals)
+                    .cmp(&privacy_rank(b, signals))
+                    .then_with(|| {
+                        rel(b)
+                            .partial_cmp(&rel(a))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| {
+                        default_blend_key(a)
+                            .partial_cmp(&default_blend_key(b))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| a.model.cmp(&b.model))
             });
             v
         }
@@ -349,18 +396,20 @@ fn is_local_candidate(q: &Quote) -> bool {
             && !REFERENCE_SOURCES.contains(&q.source.as_str())
 }
 
-fn privacy_rank(q: &Quote) -> u8 {
-    let onion = q
-        .endpoint
-        .as_deref()
-        .map(|e| e.contains(".onion"))
-        .unwrap_or(false);
+/// 0 onion (endpoint or advertised) · 1 identity-verified node · 2 other
+/// Routstr/Nostr · 3 everything else (e.g. localhost).
+fn privacy_rank(q: &Quote, signals: &Signals) -> u8 {
+    let sig = signals_for(signals, q);
+    let onion =
+        q.endpoint.as_deref().is_some_and(|e| e.contains(".onion")) || sig.is_some_and(|s| s.onion);
     if onion {
         0
-    } else if q.source == "routstr" || q.source == "nostr" {
+    } else if sig.and_then(|s| s.identity_verified) == Some(true) {
         1
-    } else {
+    } else if q.source == "routstr" || q.source == "nostr" {
         2
+    } else {
+        3
     }
 }
 
@@ -425,7 +474,7 @@ mod tests {
             q("openai/gpt-4o", 5.0, 15.0),
             q("anthropic/claude-sonnet-4", 1.0, 3.0),
         ];
-        let sorted = apply_preset(quotes, Preset::CheapestFrontier);
+        let sorted = apply_preset(quotes, Preset::CheapestFrontier, &Signals::new());
         // First rankable row should be the cheap sonnet, not the −1e6 auto.
         assert_eq!(sorted[0].model, "anthropic/claude-sonnet-4");
     }
@@ -455,13 +504,101 @@ mod tests {
         assert!(Preset::from_str("nope").is_none());
     }
 
+    fn at(model: &str, endpoint: &str) -> Quote {
+        let mut x = q(model, 1.0, 1.0);
+        x.source = "routstr".into();
+        x.endpoint = Some(endpoint.into());
+        x
+    }
+
+    fn sig(p50: Option<u64>, rel: Option<f64>, onion: bool, id: Option<bool>) -> EndpointSignals {
+        EndpointSignals {
+            latency_p50_ms: p50,
+            reliability_24h: rel,
+            onion,
+            identity_verified: id,
+        }
+    }
+
+    #[test]
+    fn fastest_ranks_reliable_measured_endpoints_by_latency() {
+        let signals: Signals = [
+            (
+                "https://slow".to_string(),
+                sig(Some(800), Some(1.0), false, None),
+            ),
+            (
+                "https://quick".to_string(),
+                sig(Some(60), Some(0.95), false, None),
+            ),
+            (
+                "https://flaky".to_string(),
+                sig(Some(20), Some(0.5), false, None),
+            ),
+        ]
+        .into();
+        let quotes = vec![
+            at("m-flash", "https://slow"),
+            at("m-flash", "https://flaky"),
+            at("m-flash", "https://unknown"),
+            at("m-flash", "https://quick"),
+            at("big-model", "https://quick"),
+        ];
+        let got: Vec<_> = apply_preset(quotes, Preset::Fastest, &signals)
+            .into_iter()
+            .map(|q| q.endpoint.unwrap())
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "https://quick",
+                "https://slow",
+                "https://flaky",
+                "https://unknown"
+            ]
+        );
+    }
+
+    #[test]
+    fn most_private_prefers_onion_then_verified_and_drops_dead() {
+        let signals: Signals = [
+            (
+                "https://onion-node".to_string(),
+                sig(None, Some(0.6), true, None),
+            ),
+            (
+                "https://verified".to_string(),
+                sig(None, Some(0.99), false, Some(true)),
+            ),
+            (
+                "https://dead".to_string(),
+                sig(None, Some(0.1), false, Some(true)),
+            ),
+        ]
+        .into();
+        let quotes = vec![
+            at("m", "https://plain"),
+            at("m", "https://dead"),
+            at("m", "https://verified"),
+            at("m", "https://onion-node"),
+        ];
+        let got: Vec<_> = apply_preset(quotes, Preset::MostPrivate, &signals)
+            .into_iter()
+            .map(|q| q.endpoint.unwrap())
+            .collect();
+        assert_eq!(
+            got,
+            ["https://onion-node", "https://verified", "https://plain"]
+        );
+    }
+
     #[test]
     fn free_reference_catalog_models_are_not_local() {
         let mut orca = q("orcarouter/free", 0.0, 0.0);
         orca.source = "orcarouter".into();
         let mut node = q("some-free-model", 0.0, 0.0);
         node.source = "routstr".into();
-        let local = apply_preset(vec![orca, node], Preset::LocalFirst);
+        let local = apply_preset(vec![orca, node], Preset::LocalFirst, &Signals::new());
         let models: Vec<_> = local.iter().map(|q| q.model.as_str()).collect();
         assert_eq!(models, ["some-free-model"]);
     }
