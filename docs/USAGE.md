@@ -173,9 +173,15 @@ where \(r\) is the output:input ratio (2, 3, or 4). Default \(r = 3\) (1:3 in:ou
 Presets run after the other filters, so combine them with `kind=chat` to keep embedding models out.
 | **Local-first** | Ollama, vLLM, localhost, free local-style rows |
 
+### Compare a model across sources
+
+`/compare?model=claude-sonnet-4.5` (or **compare** when hovering a board row) puts every offer of one model side by side: OpenRouter, OrcaRouter and each Routstr node, cheapest blend first, with **vs cheapest**, out sats, Rel 24h, latency, age and a healthy mark. Without `model` it lists the models offered by the most sources.
+
+Catalogs spell ids differently (`anthropic/claude-sonnet-4.5`, `claude-sonnet-4-5`, `claude-sonnet-4-5-20250929`), so offers are joined on `canonical_model`: vendor prefix dropped, lowercased, `.` / `_` as `-`, trailing release date stripped. A `:variant` suffix (`:free`, `:batch`) stays its own group. `model` matches as a substring of that key. Blend ratio and the quality filters apply; presets don't. Each group's cheapest offer and spread skip outliers (usually a node's unit bug), which stay listed with a negative **vs cheapest**.
+
 ### Copy curl / OpenAI config
 
-Hover a Best Now or price-board row → **curl** or **config**.
+Hover a Best Now or price-board row → **curl** or **config** (or **compare**, see above).
 
 - **curl**: `POST {base}/chat/completions` with `Authorization: Bearer $API_KEY`
 - **config**: JSON with `base_url`, `model`, and a Python OpenAI client snippet
@@ -192,7 +198,7 @@ curl -OJ 'http://127.0.0.1:8080/export.csv?source=openrouter&model=claude'
 curl -OJ 'http://127.0.0.1:8080/export.csv?source=openrouter,orcarouter&model=claude'
 ```
 
-Columns include source, provider, model, USD/sats, blended price, delta, endpoint, context, timestamps, plus `kind`, `age_secs`, `stale`, `reliability_1h`, `outlier`. Export honors the same filters as the board and API.
+Columns include source, provider, model, USD/sats, blended price, delta, endpoint, context, timestamps, plus `kind`, `age_secs`, `stale`, reliability / latency, `outlier`, `healthy` and `canonical_model`. Export honors the same filters as the board and API.
 
 ## API examples
 
@@ -208,6 +214,9 @@ curl -s 'localhost:8080/api/quotes?preset=fastest&limit=20' | jq '.[].model'
 
 # Routable-looking chat quotes only: fresh, reliable, no outliers
 curl -s 'localhost:8080/api/quotes?kind=chat&exclude_stale=1&min_reliability=0.5&exclude_outliers=1&limit=500' | jq length
+
+# One model across all sources: cheapest healthy offer and spread
+curl -s 'localhost:8080/api/compare?model=claude-sonnet-4.5&exclude_stale=1' | jq '.[0] | {canonical_model, offers, spread_pct, node: .cheapest_healthy.node, blend: .cheapest_healthy.blended_usd}'
 
 # Feed status
 curl -s localhost:8080/health | jq '{status, reasons: .feed.reasons}'

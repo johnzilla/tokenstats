@@ -11,8 +11,8 @@ use serde::Deserialize;
 use super::feed::feed_status;
 use super::AppState;
 use crate::market::{
-    apply_preset, best_now, blended_usd, delta_pct, EndpointSignals, Preset, Signals,
-    DEFAULT_BLEND_RATIO,
+    apply_preset, best_now, blended_usd, canonical_model, delta_pct, EndpointSignals, Preset,
+    Signals, DEFAULT_BLEND_RATIO,
 };
 use crate::pricing::{blend_sort_key, is_rankable_blend};
 use crate::store::{
@@ -326,12 +326,168 @@ pub async fn api_summary(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
+/// One model (by `canonical_model`) as offered across sources.
+struct CompareGroup {
+    key: String,
+    /// Cheapest blend first; free / unpriced offers last.
+    quotes: Vec<Quote>,
+}
+
+impl CompareGroup {
+    fn sources(&self) -> std::collections::BTreeSet<&str> {
+        self.quotes.iter().map(|q| q.source.as_str()).collect()
+    }
+
+    /// Rankable, non-outlier blends, ascending (same order as `quotes`).
+    /// Outliers are usually unit bugs, so they would make a fake cheapest
+    /// offer and a meaningless spread.
+    fn blends(&self, ctx: &QuoteCtx) -> Vec<f64> {
+        self.quotes
+            .iter()
+            .filter(|q| !ctx.is_outlier(q))
+            .filter_map(|q| blended_usd(q.price_in_usd, q.price_out_usd, ctx.ratio))
+            .filter(|b| is_rankable_blend(Some(*b)))
+            .collect()
+    }
+
+    /// Cheapest rankable, non-outlier offer that also passes `pred`.
+    fn cheapest(&self, ctx: &QuoteCtx, pred: impl Fn(&Quote) -> bool) -> Option<&Quote> {
+        self.quotes.iter().find(|q| {
+            is_rankable_blend(blended_usd(q.price_in_usd, q.price_out_usd, ctx.ratio))
+                && !ctx.is_outlier(q)
+                && pred(q)
+        })
+    }
+}
+
+/// Group the filtered board by `canonical_model`. `model` matches as a
+/// substring of the canonical key (so `claude-sonnet-4.5` finds
+/// `claude-sonnet-4-5`); `preset` is ignored. An exact key match comes
+/// first, then models offered by the most sources.
+fn compare_groups(all: Vec<Quote>, q: &QuotesQuery, ctx: &QuoteCtx) -> Vec<CompareGroup> {
+    let needle = q
+        .model
+        .as_deref()
+        .map(canonical_model)
+        .filter(|n| !n.is_empty());
+    let unfiltered_model = QuotesQuery {
+        model: None,
+        ..q.clone()
+    };
+    let mut groups: BTreeMap<String, Vec<Quote>> = BTreeMap::new();
+    for quote in filter_quotes(all, &unfiltered_model, ctx) {
+        let key = canonical_model(&quote.model);
+        if needle.as_deref().is_none_or(|n| key.contains(n)) {
+            groups.entry(key).or_default().push(quote);
+        }
+    }
+    let ratio = ctx.ratio;
+    let mut out: Vec<CompareGroup> = groups
+        .into_iter()
+        .map(|(key, mut quotes)| {
+            quotes.sort_by(|a, b| {
+                let ba = blend_sort_key(blended_usd(a.price_in_usd, a.price_out_usd, ratio));
+                let bb = blend_sort_key(blended_usd(b.price_in_usd, b.price_out_usd, ratio));
+                ba.partial_cmp(&bb)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.source.cmp(&b.source))
+            });
+            CompareGroup { key, quotes }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        let exact = |g: &CompareGroup| needle.as_deref() != Some(g.key.as_str());
+        exact(a)
+            .cmp(&exact(b))
+            .then_with(|| b.sources().len().cmp(&a.sources().len()))
+            .then_with(|| b.quotes.len().cmp(&a.quotes.len()))
+            .then_with(|| a.key.cmp(&b.key))
+    });
+    out
+}
+
+fn compare_json(g: &CompareGroup, ctx: &QuoteCtx) -> serde_json::Value {
+    let ratio = ctx.ratio;
+    let blends = g.blends(ctx);
+    let min = blends.first().copied();
+    let models: std::collections::BTreeSet<&str> =
+        g.quotes.iter().map(|q| q.model.as_str()).collect();
+    let quotes: Vec<_> = g
+        .quotes
+        .iter()
+        .map(|q| {
+            let mut v = enrich_json(q, ctx);
+            v["vs_cheapest_pct"] = serde_json::json!(vs_cheapest_pct(q, min, ratio));
+            v
+        })
+        .collect();
+    serde_json::json!({
+        "canonical_model": g.key,
+        "models": models,
+        "sources": g.sources(),
+        "offers": g.quotes.len(),
+        "blend_ratio": ratio,
+        "min_blended_usd": min,
+        "median_blended_usd": median(&blends),
+        "max_blended_usd": blends.last(),
+        "spread_pct": spread_pct(&blends),
+        "cheapest": g.cheapest(ctx, |_| true).map(|q| enrich_json(q, ctx)),
+        "cheapest_healthy": g.cheapest(ctx, |q| ctx.is_healthy(q)).map(|q| enrich_json(q, ctx)),
+        "quotes": quotes,
+    })
+}
+
+/// How much pricier than the cheapest offer, in % (0 for the cheapest).
+fn vs_cheapest_pct(q: &Quote, min: Option<f64>, ratio: f64) -> Option<f64> {
+    let b = blended_usd(q.price_in_usd, q.price_out_usd, ratio).filter(|b| *b > 0.0)?;
+    min.filter(|m| *m > 0.0).map(|m| (b - m) / m * 100.0)
+}
+
+/// (max − min) / min in %, over ascending rankable blends; needs two offers.
+fn spread_pct(sorted: &[f64]) -> Option<f64> {
+    match (sorted.first(), sorted.last()) {
+        (Some(min), Some(max)) if sorted.len() >= 2 && *min > 0.0 => {
+            Some((max - min) / min * 100.0)
+        }
+        _ => None,
+    }
+}
+
+fn median(sorted: &[f64]) -> Option<f64> {
+    let mid = sorted.len() / 2;
+    match sorted.len() {
+        0 => None,
+        n if n % 2 == 0 => Some((sorted[mid - 1] + sorted[mid]) / 2.0),
+        _ => Some(sorted[mid]),
+    }
+}
+
+/// Same model across OpenRouter, OrcaRouter and Routstr nodes.
+pub async fn api_compare(
+    State(state): State<AppState>,
+    Query(q): Query<QuotesQuery>,
+) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(50).min(MAX_COMPARE_GROUPS);
+    let all = state.store.list_quotes();
+    let ctx = QuoteCtx::new(&state, &all, q.blend_ratio());
+    let groups: Vec<_> = compare_groups(all, &q, &ctx)
+        .iter()
+        .take(limit)
+        .map(|g| compare_json(g, &ctx))
+        .collect();
+    Json(groups)
+}
+
+/// `/api/compare` group cap.
+const MAX_COMPARE_GROUPS: usize = 1_000;
+
 /// `/api/quotes` row cap. Large enough for the whole board (~8k quotes on
 /// tokenstats.ai), so a consumer that asks for everything isn't silently
 /// handed only the cheapest slice; narrow with `source` / `kind` instead.
 const MAX_API_LIMIT: usize = 20_000;
 
 const APP_JS: &str = include_str!("static/app.js");
+const APP_CSS: &str = include_str!("static/app.css");
 const PLAUSIBLE_INIT_JS: &str = include_str!("static/plausible-init.js");
 
 fn js(body: &'static str) -> Response {
@@ -367,13 +523,13 @@ pub async fn export_csv(State(state): State<AppState>, Query(q): Query<QuotesQue
         "source,provider,provider_id,model,price_in_usd,price_out_usd,blended_usd,blend_ratio,\
          price_in_sats,price_out_sats,delta_out_pct,endpoint,region,context_length,observed_at,\
          kind,age_secs,stale,reliability_1h,outlier,reliability_24h,reliability_7d,\
-         latency_p50_ms,latency_p95_ms,latency_source,identity_verified,healthy\n",
+         latency_p50_ms,latency_p95_ms,latency_source,identity_verified,healthy,canonical_model\n",
     );
     for quote in quotes.into_iter().take(limit) {
         let blend = blended_usd(quote.price_in_usd, quote.price_out_usd, ratio);
         let d = delta_pct(quote.price_out_usd, quote.prev_price_out_usd);
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             csv_cell(&quote.source),
             csv_cell(&quote.provider),
             csv_cell(&quote.provider_id),
@@ -408,6 +564,7 @@ pub async fn export_csv(State(state): State<AppState>, Query(q): Query<QuotesQue
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
             ctx.is_healthy(&quote),
+            csv_cell(&canonical_model(&quote.model)),
         ));
     }
 
@@ -481,7 +638,7 @@ pub async fn dashboard(
                     io_out = fmt_usd(b.quote.price_out_usd),
                     source = esc(&b.quote.source),
                     delta = fmt_delta(d),
-                    actions = row_actions_html(),
+                    actions = row_actions_html(Some((b.quote, ratio))),
                 )
             })
             .collect()
@@ -691,17 +848,7 @@ pub async fn dashboard(
         ),
     ]
     .iter()
-    .map(|(key, label, n, current)| {
-        let on = truthy(*current);
-        let cls = if on { "pill active" } else { "pill" };
-        let href = q.qs(&[(key, if on { None } else { Some("1") })]);
-        let href = if href.is_empty() {
-            "/".into()
-        } else {
-            esc_attr(&href)
-        };
-        format!(r#"<a class="{cls}" href="{href}">{label} <span>{n}</span></a>"#)
-    })
+    .map(|(key, label, n, current)| toggle_pill(&q, "/", key, label, Some(*n), *current))
     .collect::<Vec<_>>()
     .join("");
 
@@ -736,175 +883,7 @@ pub async fn dashboard(
   <meta http-equiv="refresh" content="15"/>
   <title>tokenstats — inference market</title>
   <style>
-    :root {{
-      --bg: #0b0f14;
-      --panel: #121820;
-      --border: #1e2a38;
-      --text: #e6edf3;
-      --muted: #8b9cb3;
-      --accent: #3dffa8;
-      --warn: #ffb020;
-      --blue: #5eb1ff;
-      --down: #3dffa8;
-      --up: #ff6b6b;
-      --best: #1a2e24;
-      font-family: "IBM Plex Mono", "SF Mono", ui-monospace, monospace;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0; padding: 1.5rem 2rem 3rem;
-      background: var(--bg); color: var(--text);
-      min-height: 100vh;
-    }}
-    header {{
-      display: flex; flex-wrap: wrap; align-items: baseline;
-      gap: 0.75rem 1.5rem; margin-bottom: 1rem;
-      border-bottom: 1px solid var(--border); padding-bottom: 1rem;
-    }}
-    h1 {{
-      margin: 0; font-size: 1.25rem; font-weight: 600;
-      letter-spacing: 0.04em;
-    }}
-    h1 span {{ color: var(--accent); }}
-    h2 {{
-      margin: 1.5rem 0 0.65rem; font-size: 0.8rem; font-weight: 500;
-      color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em;
-      display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem 1rem;
-    }}
-    h2 .hint {{ font-weight: 400; text-transform: none; letter-spacing: 0; }}
-    h2 .export {{
-      margin-left: auto; font-weight: 400; text-transform: none; letter-spacing: 0;
-      font-size: 0.75rem;
-    }}
-    .meta {{ color: var(--muted); font-size: 0.85rem; }}
-    .badge {{
-      display: inline-block; padding: 0.15rem 0.5rem;
-      border: 1px solid var(--border); border-radius: 999px;
-      color: var(--accent); font-size: 0.75rem;
-    }}
-    .pills {{ display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.45rem 0; align-items: center; }}
-    .pills .label {{ color: var(--muted); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; margin-right: 0.25rem; }}
-    .pill {{
-      display: inline-flex; align-items: center; gap: 0.35rem;
-      padding: 0.25rem 0.65rem; border: 1px solid var(--border);
-      border-radius: 999px; color: var(--muted); text-decoration: none;
-      font-size: 0.75rem; background: var(--panel);
-    }}
-    .pill span {{ color: var(--accent); }}
-    .pill.active {{ border-color: var(--accent); color: var(--text); }}
-    .pill:hover {{ border-color: var(--muted); }}
-    table {{
-      width: 100%; border-collapse: collapse;
-      background: var(--panel); border: 1px solid var(--border);
-      border-radius: 8px; overflow: hidden;
-    }}
-    th, td {{
-      text-align: left; padding: 0.5rem 0.7rem;
-      border-bottom: 1px solid var(--border); font-size: 0.8rem;
-      vertical-align: top;
-    }}
-    th {{
-      color: var(--muted); font-weight: 500; font-size: 0.68rem;
-      text-transform: uppercase; letter-spacing: 0.06em;
-      background: #0e141c;
-    }}
-    tr:last-child td {{ border-bottom: none; }}
-    tr:hover td {{ background: #151d28; }}
-    tr.best-row td {{ background: var(--best); }}
-    tr.best-row:hover td {{ background: #20352c; }}
-    .num {{ font-variant-numeric: tabular-nums; color: var(--accent); }}
-    .num-sats {{ font-variant-numeric: tabular-nums; color: var(--warn); font-size: 0.75rem; }}
-    .blend {{ font-variant-numeric: tabular-nums; color: var(--blue); font-weight: 600; }}
-    .stack-price {{ font-size: 0.95rem; font-weight: 700; }}
-    .sub {{ font-size: 0.7rem; margin-top: 0.15rem; line-height: 1.3; }}
-    .node-name {{ color: var(--warn); max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-    .model-id {{ word-break: break-all; }}
-    .muted {{ color: var(--muted); }}
-    .empty {{ text-align: center; color: var(--muted); padding: 2rem; }}
-    code {{ font-size: 0.75rem; color: var(--warn); }}
-    .src {{
-      display: inline-block; padding: 0.1rem 0.4rem; border-radius: 4px;
-      font-size: 0.68rem; border: 1px solid var(--border);
-    }}
-    .src-openrouter, .src-orcarouter {{ color: var(--blue); }}
-    .src-routstr {{ color: var(--accent); }}
-    .src-nostr {{ color: var(--warn); }}
-    .family {{
-      color: var(--accent); font-size: 0.75rem; font-weight: 600;
-      letter-spacing: 0.02em;
-    }}
-    .delta-up {{ color: var(--up); font-variant-numeric: tabular-nums; }}
-    .delta-down {{ color: var(--down); font-variant-numeric: tabular-nums; }}
-    .delta-flat {{ color: var(--muted); }}
-    .rel {{
-      position: relative; display: inline-flex; align-items: center;
-      width: 72px; height: 18px; background: #0e141c;
-      border: 1px solid var(--border); border-radius: 4px; overflow: hidden;
-    }}
-    .rel-bar {{
-      position: absolute; left: 0; top: 0; bottom: 0;
-      background: var(--accent); opacity: 0.35;
-    }}
-    .rel-good .rel-bar {{ background: var(--accent); }}
-    .rel-mid .rel-bar {{ background: var(--warn); }}
-    .rel-bad .rel-bar {{ background: var(--up); }}
-    .rel-none .rel-bar {{ background: var(--border); width: 0 !important; }}
-    .rel-label {{
-      position: relative; z-index: 1; width: 100%; text-align: center;
-      font-size: 0.68rem; color: var(--text);
-    }}
-    .rel-txt {{ font-variant-numeric: tabular-nums; }}
-    .rel-txt.rel-good {{ color: var(--accent); }}
-    .rel-txt.rel-mid {{ color: var(--warn); }}
-    .rel-txt.rel-bad {{ color: var(--up); }}
-    .tag {{
-      display: inline-block; padding: 0 0.3rem; border-radius: 4px;
-      font-size: 0.65rem; border: 1px solid currentColor; font-weight: 400;
-    }}
-    .tag-stale {{ color: var(--warn); }}
-    .tag-outlier {{ color: var(--up); }}
-    .feed {{
-      margin: -0.25rem 0 0.75rem; padding: 0.45rem 0.7rem;
-      background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
-      color: var(--muted); font-size: 0.75rem; line-height: 1.6;
-    }}
-    .feed-status {{ font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }}
-    .feed-ok {{ color: var(--accent); }}
-    .feed-degraded, .feed-starting, .feed-offline {{ color: var(--warn); }}
-    .feed-down {{ color: var(--up); }}
-    .feed-reasons {{ color: var(--warn); }}
-    .node-status {{ font-size: 0.72rem; white-space: nowrap; }}
-    .node-healthy {{ color: var(--accent); }}
-    .node-failing {{ color: var(--up); }}
-    .node-dormant, .node-skipped, .node-pending {{ color: var(--muted); }}
-    .actions-cell {{ position: relative; min-width: 4.5rem; white-space: nowrap; }}
-    .row-actions {{
-      display: none; gap: 0.3rem; flex-wrap: wrap;
-    }}
-    tr.quote-row:hover .row-actions,
-    tr.quote-row:focus-within .row-actions {{
-      display: inline-flex;
-    }}
-    .row-actions button {{
-      cursor: pointer; border: 1px solid var(--border); background: #0e141c;
-      color: var(--muted); font: inherit; font-size: 0.65rem;
-      padding: 0.15rem 0.4rem; border-radius: 4px;
-    }}
-    .row-actions button:hover {{ color: var(--accent); border-color: var(--accent); }}
-    .toast {{
-      position: fixed; bottom: 1.25rem; right: 1.25rem;
-      background: var(--panel); border: 1px solid var(--accent);
-      color: var(--text); padding: 0.55rem 0.9rem; border-radius: 8px;
-      font-size: 0.8rem; opacity: 0; pointer-events: none;
-      transition: opacity 0.2s; z-index: 50;
-    }}
-    .toast.show {{ opacity: 1; }}
-    footer {{
-      margin-top: 1.25rem; color: var(--muted); font-size: 0.75rem;
-    }}
-    a {{ color: var(--accent); }}
-    .links a {{ margin-right: 0.75rem; }}
-  </style>
+{css}  </style>
   <!-- Privacy-friendly analytics by Plausible -->
 {analytics}
 </head>
@@ -916,6 +895,7 @@ pub async fn dashboard(
     <span class="meta" title="Freshest quote observation vs page render">{last_label} · {page_label}</span>
     <span class="meta links">
       <a href="{csv_href}">Export CSV</a>
+      <a href="/compare">Compare</a>
       <a href="/api/summary">/api/summary</a>
       <a href="/api/quotes">/api/quotes</a>
       <a href="/health">/health</a>
@@ -1023,14 +1003,7 @@ pub async fn dashboard(
         btc = btc_label,
         filter_note = filter_note,
         last_label = last_label,
-        analytics = match &state.analytics {
-            Some(a) => format!(
-                r#"<script async src="{}"></script>
-  <script src="/static/plausible-init.js"></script>"#,
-                esc_attr(&a.script)
-            ),
-            None => String::new(),
-        },
+        analytics = analytics_tags(&state),
         feed_strip = feed_strip,
         quality_pills = quality_pills,
         page_label = page_label,
@@ -1048,9 +1021,250 @@ pub async fn dashboard(
         rows = rows,
         node_rows = node_rows,
         ratio_i = ratio as i32,
+        css = APP_CSS,
     );
 
     ([(header::CACHE_CONTROL, "no-store")], Html(html))
+}
+
+/// Groups shown on `/compare` (the API takes `limit`).
+const COMPARE_PAGE_GROUPS: usize = 25;
+
+/// `/compare?model=`: one table per model, every source's offer side by side.
+pub async fn compare_page(
+    State(state): State<AppState>,
+    Query(q): Query<QuotesQuery>,
+) -> impl IntoResponse {
+    let ratio = q.blend_ratio();
+    let all = state.store.list_quotes();
+    let ctx = QuoteCtx::new(&state, &all, ratio);
+    let groups = compare_groups(all, &q, &ctx);
+    let total = groups.len();
+    let model = q.model.as_deref().unwrap_or("").trim();
+
+    let sections: String = if groups.is_empty() {
+        format!(
+            r#"<p class="empty">No model matches “{}” with these filters.</p>"#,
+            esc(model)
+        )
+    } else {
+        groups
+            .iter()
+            .take(COMPARE_PAGE_GROUPS)
+            .map(|g| compare_section(g, &ctx))
+            .collect()
+    };
+    let heading = if model.is_empty() {
+        format!("Models offered by the most sources · {total} models")
+    } else if total > COMPARE_PAGE_GROUPS {
+        format!("{COMPARE_PAGE_GROUPS} of {total} models match")
+    } else {
+        format!("{total} models match")
+    };
+
+    // Everything but `model` rides along as hidden fields, so a new search
+    // keeps the blend and quality filters.
+    let hidden: String = [
+        ("ratio", q.ratio.map(|r| r.to_string())),
+        ("source", q.source.clone()),
+        ("kind", q.kind.clone()),
+        ("healthy", q.healthy.clone()),
+        ("exclude_stale", q.exclude_stale.clone()),
+        ("exclude_outliers", q.exclude_outliers.clone()),
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| v.filter(|v| !v.is_empty()).map(|v| (k, v)))
+    .map(|(k, v)| {
+        format!(
+            r#"<input type="hidden" name="{k}" value="{}"/>"#,
+            esc_attr(&v)
+        )
+    })
+    .collect();
+    let ratio_pills: String = [2.0_f64, 3.0, 4.0]
+        .iter()
+        .map(|r| {
+            let cls = if (ratio - *r).abs() < 0.01 {
+                "pill active"
+            } else {
+                "pill"
+            };
+            let href = format!("/compare{}", q.qs(&[("ratio", Some(&r.to_string()))]));
+            format!(
+                r#"<a class="{cls}" href="{}">1:{r:.0}</a>"#,
+                esc_attr(&href)
+            )
+        })
+        .collect();
+    let quality_pills: String = [
+        ("healthy", "healthy only", q.healthy.as_deref()),
+        ("exclude_stale", "hide stale", q.exclude_stale.as_deref()),
+        (
+            "exclude_outliers",
+            "hide outliers",
+            q.exclude_outliers.as_deref(),
+        ),
+    ]
+    .iter()
+    .map(|(key, label, current)| toggle_pill(&q, "/compare", key, label, None, *current))
+    .collect();
+    let api_href = format!("/api/compare{}", q.qs(&[]));
+    let board_href = format!("/{}", q.qs(&[]));
+
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>tokenstats — compare {title}</title>
+  <style>
+{css}  </style>
+{analytics}
+</head>
+<body>
+  <header>
+    <h1><span>token</span>stats</h1>
+    <span class="meta">compare one model across sources · blend 1:{ratio_i}</span>
+    <span class="meta links">
+      <a href="{board_href}">Board</a>
+      <a href="{api_href}">/api/compare</a>
+    </span>
+  </header>
+  <form class="search" method="get" action="/compare">
+    <input type="search" name="model" value="{model_attr}" placeholder="model id, e.g. claude-sonnet-4.5 or deepseek" aria-label="Model"/>
+    {hidden}
+    <button type="submit">Compare</button>
+  </form>
+  <div class="pills">
+    <span class="label">Blend</span>
+    {ratio_pills}
+  </div>
+  <div class="pills">
+    <span class="label">Quality</span>
+    {quality_pills}
+  </div>
+  <p class="meta">{heading} · ids are joined on a canonical key (vendor prefix, case, <code>.</code>/<code>_</code> and release date ignored) · cheapest blend first</p>
+  {sections}
+  <footer>tokenstats · observe only: prices are catalog list prices, not measured spend</footer>
+  <div id="toast" class="toast" role="status"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>"#,
+        title = esc(if model.is_empty() { "models" } else { model }),
+        css = APP_CSS,
+        analytics = analytics_tags(&state),
+        ratio_i = ratio as i32,
+        board_href = esc_attr(&board_href),
+        api_href = esc_attr(&api_href),
+        model_attr = esc_attr(model),
+    );
+    ([(header::CACHE_CONTROL, "no-store")], Html(html))
+}
+
+fn compare_section(g: &CompareGroup, ctx: &QuoteCtx) -> String {
+    let ratio = ctx.ratio;
+    let blends = g.blends(ctx);
+    let min = blends.first().copied();
+    let sources = g.sources();
+    let healthy = g.cheapest(ctx, |q| ctx.is_healthy(q));
+    let best = g.cheapest(ctx, |_| true);
+    let mut hint = vec![format!(
+        "{} offers · {}",
+        g.quotes.len(),
+        sources.into_iter().collect::<Vec<_>>().join(", ")
+    )];
+    if let Some(m) = min {
+        hint.push(format!("cheapest {}", fmt_usd(Some(m))));
+    }
+    if let Some(s) = spread_pct(&blends) {
+        hint.push(format!("spread {s:.0}%"));
+    }
+    if let Some(h) = healthy {
+        hint.push(format!(
+            "cheapest healthy {} ({})",
+            fmt_usd(blended_usd(h.price_in_usd, h.price_out_usd, ratio)),
+            node_display_name(h)
+        ));
+    }
+    let rows: String = g
+        .quotes
+        .iter()
+        .map(|q| {
+            let blend = blended_usd(q.price_in_usd, q.price_out_usd, ratio);
+            let st = ctx.stats(q);
+            let rel = st.and_then(|s| s.reliability_24h.or(s.reliability_1h));
+            let vs = match vs_cheapest_pct(q, min, ratio) {
+                Some(v) if v.abs() < 0.05 => "cheapest".to_string(),
+                Some(v) => format!("{v:+.0}%"),
+                None => "—".into(),
+            };
+            let cls = if best.is_some_and(|b| std::ptr::eq(b, q)) {
+                "quote-row cmp-best"
+            } else {
+                "quote-row"
+            };
+            let flags = [
+                ctx.is_stale(q)
+                    .then_some(r#"<span class="tag tag-stale">stale</span>"#),
+                ctx.is_outlier(q)
+                    .then_some(r#"<span class="tag tag-outlier">outlier</span>"#),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
+            format!(
+                r#"<tr class="{cls}" {attrs}>
+          <td><span class="src src-{source}">{source}</span></td>
+          <td>{provider}<div class="sub muted">{node}</div><div class="sub"><code>{model}</code></div>{actions}</td>
+          <td class="num">{pin}</td>
+          <td class="num">{pout}</td>
+          <td class="blend">{blend}</td>
+          <td class="muted">{vs}</td>
+          <td class="num-sats">{sats}</td>
+          <td class="rel-txt">{rel}</td>
+          <td class="muted">{lat}</td>
+          <td class="muted">{age} {flags}</td>
+          <td>{healthy}</td>
+        </tr>"#,
+                attrs = quote_data_attrs(q),
+                source = esc(&q.source),
+                provider = esc(&q.provider),
+                node = esc(&node_display_name(q)),
+                model = esc(&q.model),
+                actions = row_actions_html(None),
+                pin = fmt_usd(q.price_in_usd),
+                pout = fmt_usd(q.price_out_usd),
+                blend = fmt_usd(blend),
+                sats = fmt_sats(q.price_out_sats),
+                rel = fmt_pct(rel),
+                lat = st
+                    .and_then(|s| s.latency_p50_ms)
+                    .map(|ms| format!("≤{ms} ms"))
+                    .unwrap_or_else(|| "—".into()),
+                age = fmt_age(ctx.age_secs(q)),
+                healthy = if ctx.is_healthy(q) {
+                    r#"<span class="node-healthy">✓</span>"#
+                } else {
+                    r#"<span class="muted">·</span>"#
+                },
+            )
+        })
+        .collect();
+    format!(
+        r#"<h2>{key} <span class="hint">{hint}</span></h2>
+  <div class="table-wrap"><table>
+    <thead><tr>
+      <th>Source</th><th>Provider / node / id</th><th>In</th><th>Out</th>
+      <th>Blend</th><th>vs cheapest</th><th>Out sats</th><th>Rel 24h</th>
+      <th>Latency</th><th>Age</th><th title="Last fetch OK, ≥90% reliable, probe OK, not stale">Healthy</th>
+    </tr></thead>
+    <tbody>{rows}</tbody>
+  </table></div>"#,
+        key = esc(&g.key),
+        hint = esc(&hint.join(" · ")),
+    )
 }
 
 fn quote_row(q: &Quote, ctx: &QuoteCtx) -> String {
@@ -1118,7 +1332,7 @@ fn quote_row(q: &Quote, ctx: &QuoteCtx) -> String {
         provider = esc(&q.provider),
         node = esc(&node_display_name(q)),
         model = esc(&q.model),
-        actions = row_actions_html(),
+        actions = row_actions_html(Some((q, ctx.ratio))),
         pin_usd = fmt_usd(q.price_in_usd),
         pout_usd = fmt_usd(q.price_out_usd),
         blend = fmt_usd(blend),
@@ -1249,12 +1463,55 @@ fn feed_strip_html(feed: &serde_json::Value, btc_age: Option<i64>) -> String {
     )
 }
 
-fn row_actions_html() -> String {
-    r#"<div class="row-actions">
+/// Hover actions: copy buttons, plus a link to `/compare` for this model
+/// (omitted on the compare page itself).
+fn row_actions_html(compare: Option<(&Quote, f64)>) -> String {
+    let link = compare
+        .map(|(q, ratio)| {
+            let mut href = format!(
+                "/compare?model={}",
+                percent_encode(&canonical_model(&q.model))
+            );
+            if (ratio - DEFAULT_BLEND_RATIO).abs() > f64::EPSILON {
+                href.push_str(&format!("&ratio={}", percent_encode(&ratio.to_string())));
+            }
+            format!(
+                r#"
+      <a href="{}" title="Same model across sources">compare</a>"#,
+                esc_attr(&href)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        r#"<div class="row-actions">
       <button type="button" data-copy="curl" title="Copy curl for chat/completions">curl</button>
-      <button type="button" data-copy="openai" title="Copy OpenAI-compatible config JSON">config</button>
+      <button type="button" data-copy="openai" title="Copy OpenAI-compatible config JSON">config</button>{link}
     </div>"#
-        .into()
+    )
+}
+
+/// A filter pill that toggles `key=1` on `base` (`/` or `/compare`).
+fn toggle_pill(
+    q: &QuotesQuery,
+    base: &str,
+    key: &str,
+    label: &str,
+    count: Option<usize>,
+    current: Option<&str>,
+) -> String {
+    let on = truthy(current);
+    let cls = if on { "pill active" } else { "pill" };
+    let href = format!(
+        "{base}{}",
+        q.qs(&[(key, if on { None } else { Some("1") })])
+    );
+    let count = count
+        .map(|n| format!(" <span>{n}</span>"))
+        .unwrap_or_default();
+    format!(
+        r#"<a class="{cls}" href="{}">{label}{count}</a>"#,
+        esc_attr(&href)
+    )
 }
 
 fn quote_data_attrs(q: &Quote) -> String {
@@ -1299,6 +1556,18 @@ fn host_from_url(url: &str) -> Option<String> {
     }
 }
 
+/// Plausible `<script>` tags when `--plausible-script` is set.
+fn analytics_tags(state: &AppState) -> String {
+    match &state.analytics {
+        Some(a) => format!(
+            r#"<script async src="{}"></script>
+  <script src="/static/plausible-init.js"></script>"#,
+            esc_attr(&a.script)
+        ),
+        None => String::new(),
+    }
+}
+
 fn btc_age_secs(state: &AppState) -> Option<i64> {
     state
         .store
@@ -1332,7 +1601,7 @@ struct QuoteCtx {
     fetches: HashMap<String, FetchStatus>,
     /// What presets rank on (derived from the three maps above).
     signals: Signals,
-    /// Lowercased model id → median rankable blend across all quotes.
+    /// `canonical_model` → median rankable blend across all quotes.
     medians: HashMap<String, f64>,
 }
 
@@ -1343,7 +1612,7 @@ impl QuoteCtx {
             let b = blended_usd(q.price_in_usd, q.price_out_usd, ratio);
             if is_rankable_blend(b) {
                 blends
-                    .entry(q.model.to_ascii_lowercase())
+                    .entry(canonical_model(&q.model))
                     .or_default()
                     .extend(b);
             }
@@ -1351,15 +1620,9 @@ impl QuoteCtx {
         let medians = blends
             .into_iter()
             .filter(|(_, v)| v.len() >= OUTLIER_MIN_PEERS)
-            .map(|(k, mut v)| {
+            .filter_map(|(k, mut v)| {
                 v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                let mid = v.len() / 2;
-                let m = if v.len() % 2 == 0 {
-                    (v[mid - 1] + v[mid]) / 2.0
-                } else {
-                    v[mid]
-                };
-                (k, m)
+                median(&v).map(|m| (k, m))
             })
             .collect();
         let stats = state.store.endpoint_stats();
@@ -1468,7 +1731,7 @@ impl QuoteCtx {
             return false;
         };
         self.medians
-            .get(&q.model.to_ascii_lowercase())
+            .get(&canonical_model(&q.model))
             .is_some_and(|m| b < m / OUTLIER_FACTOR || b > m * OUTLIER_FACTOR)
     }
 }
@@ -1498,6 +1761,7 @@ fn enrich_json(q: &Quote, ctx: &QuoteCtx) -> serde_json::Value {
         "provider": q.provider,
         "provider_id": q.provider_id,
         "model": q.model,
+        "canonical_model": canonical_model(&q.model),
         "price_in_usd": q.price_in_usd,
         "price_out_usd": q.price_out_usd,
         "price_in_sats": q.price_in_sats,
@@ -1990,5 +2254,150 @@ mod tests {
         assert!(html.contains(r#"<span class="tag tag-stale">1h</span>"#));
         assert!(html.contains("hide stale <span>1</span>"));
         assert!(html.contains(r#"class="feed""#));
+    }
+
+    fn src(source: &str, mut q: Quote) -> Quote {
+        q.source = source.into();
+        q
+    }
+
+    async fn html_of(resp: Response) -> String {
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn compare_joins_spellings_across_sources() {
+        let st = state();
+        let all = vec![
+            src(
+                "openrouter",
+                quote("anthropic/claude-sonnet-4.5", "https://or", 3.0, 5, "chat"),
+            ),
+            quote(
+                "claude-sonnet-4-5-20250929",
+                "https://cheap",
+                1.5,
+                5,
+                "chat",
+            ),
+            quote("claude-sonnet-4-5", "https://ok", 2.0, 5, "chat"),
+            // Unit bug: an outlier must not become the cheapest offer.
+            quote("claude-sonnet-4.5", "https://bug", 0.001, 5, "chat"),
+            quote("claude-sonnet-4-5:free", "https://ok", 0.0, 5, "chat"),
+            quote("claude-sonnet-4", "https://ok", 1.0, 5, "chat"),
+            src(
+                "orcarouter",
+                quote("deepseek/deepseek-v4", "https://orca", 0.2, 5, "chat"),
+            ),
+        ];
+        for _ in 0..10 {
+            st.store.record_poll("https://ok", true, Some(100));
+        }
+        st.store.record_fetch("routstr", "ok", "https://ok", Ok(3));
+        let ctx = QuoteCtx::new(&st, &all, 3.0);
+
+        let groups = compare_groups(all.clone(), &query("model=claude-sonnet-4.5"), &ctx);
+        let keys: Vec<&str> = groups.iter().map(|g| g.key.as_str()).collect();
+        assert_eq!(keys, ["claude-sonnet-4-5", "claude-sonnet-4-5:free"]);
+        let g = compare_json(&groups[0], &ctx);
+        assert_eq!(g["offers"], 4);
+        assert_eq!(g["sources"], serde_json::json!(["openrouter", "routstr"]));
+        assert_eq!(g["min_blended_usd"], 1.5);
+        assert_eq!(g["max_blended_usd"], 3.0);
+        assert_eq!(g["spread_pct"], 100.0);
+        assert_eq!(g["cheapest"]["endpoint"], "https://cheap");
+        assert_eq!(g["cheapest_healthy"]["endpoint"], "https://ok");
+        let vs: Vec<_> = g["quotes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|q| q["vs_cheapest_pct"].as_f64().unwrap().round())
+            .collect();
+        assert_eq!(vs, [-100.0, 0.0, 33.0, 100.0]);
+        assert_eq!(g["quotes"][0]["outlier"], true);
+        assert_eq!(g["quotes"][0]["canonical_model"], "claude-sonnet-4-5");
+
+        // No needle: models offered by the most sources first.
+        let groups = compare_groups(all.clone(), &query(""), &ctx);
+        assert_eq!(groups[0].key, "claude-sonnet-4-5");
+        // Board filters still apply.
+        let groups = compare_groups(all, &query("model=claude&source=openrouter"), &ctx);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].quotes.len(), 1);
+    }
+
+    #[test]
+    fn spread_and_median_need_enough_offers() {
+        assert_eq!(spread_pct(&[2.0]), None);
+        assert_eq!(spread_pct(&[2.0, 3.0]), Some(50.0));
+        assert_eq!(median(&[]), None);
+        assert_eq!(median(&[1.0, 2.0, 4.0]), Some(2.0));
+        assert_eq!(median(&[1.0, 2.0, 4.0, 8.0]), Some(3.0));
+    }
+
+    #[test]
+    fn outliers_are_judged_across_catalog_spellings() {
+        let all = vec![
+            src(
+                "openrouter",
+                quote("anthropic/claude-sonnet-4.5", "https://or", 3.0, 0, "chat"),
+            ),
+            quote("claude-sonnet-4-5", "https://a", 3.1, 0, "chat"),
+            quote("claude-sonnet-4-5-20250929", "https://b", 2.9, 0, "chat"),
+            quote("claude-sonnet-4.5", "https://c", 0.003, 0, "chat"),
+        ];
+        let ctx = QuoteCtx::new(&state(), &all, 3.0);
+        let flags: Vec<_> = all.iter().map(|q| ctx.is_outlier(q)).collect();
+        assert_eq!(flags, [false, false, false, true]);
+    }
+
+    #[tokio::test]
+    async fn compare_page_escapes_and_board_links_to_it() {
+        let st = state();
+        st.store.upsert_quotes([quote(
+            "anthropic/claude-sonnet-4.5",
+            "https://a",
+            1.0,
+            5,
+            "chat",
+        )]);
+        let html = html_of(
+            compare_page(State(st.clone()), Query(query(XSS)))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert!(!html.contains("<script>alert"), "payload reflected raw");
+        assert!(!html.contains("\"><script>"), "attribute broken out of");
+        assert!(!html.contains("<b>"), "kind payload reflected raw");
+        assert!(html.contains(r#"name="kind" value="&lt;b&gt;""#));
+
+        let html = html_of(
+            compare_page(
+                State(st.clone()),
+                Query(query("model=Claude-Sonnet-4.5&ratio=4")),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert!(html.contains("<h2>claude-sonnet-4-5 <span"));
+        assert!(html.contains(r#"<tr class="quote-row cmp-best""#));
+        assert!(html.contains(r#"href="/compare?model=Claude-Sonnet-4.5&amp;ratio=2""#));
+        assert!(
+            !html.contains(">compare</a>"),
+            "no self link on the compare page"
+        );
+
+        let html = html_of(
+            dashboard(State(st), Query(query("ratio=4")))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert!(html.contains(r#"<a href="/compare?model=claude-sonnet-4-5&amp;ratio=4""#));
     }
 }
