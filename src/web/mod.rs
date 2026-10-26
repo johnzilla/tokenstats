@@ -24,6 +24,8 @@ pub struct AppState {
     pub stale_after: Duration,
     /// Whether the catalog poller runs (feed status reports `offline` if not).
     pub polling: bool,
+    /// Catalog poll interval (dormant-node backoff is a multiple of it).
+    pub poll_interval: Duration,
     /// Plausible analytics, when `--plausible-script` is set.
     pub analytics: Option<Analytics>,
 }
@@ -139,6 +141,7 @@ mod tests {
             store: Arc::new(Store::new()),
             stale_after: Duration::from_secs(600),
             polling: true,
+            poll_interval: Duration::from_secs(60),
             analytics,
         }
     }

@@ -133,6 +133,107 @@ pub struct FetchStatus {
     pub models: usize,
 }
 
+/// Consecutive failed catalog fetches before a node is polled on a backoff.
+pub const DORMANT_AFTER_FAILURES: u32 = 5;
+/// Longest gap between polls of a dormant node.
+pub const DORMANT_MAX_BACKOFF: Duration = Duration::hours(1);
+
+impl FetchStatus {
+    /// Last fetch succeeded.
+    pub fn is_healthy(&self) -> bool {
+        self.consecutive_failures == 0 && self.last_success_at.is_some()
+    }
+
+    /// Failed often enough in a row to be polled on a backoff.
+    pub fn is_dormant(&self) -> bool {
+        self.consecutive_failures >= DORMANT_AFTER_FAILURES
+    }
+
+    /// Coarse cause of the current failure streak (`None` when healthy).
+    pub fn failure_class(&self) -> Option<&'static str> {
+        (self.consecutive_failures > 0)
+            .then(|| classify_failure(self.last_error.as_deref().unwrap_or("")))
+    }
+
+    /// When a dormant endpoint is next due: the gap doubles from two poll
+    /// intervals with each failure past the threshold, up to
+    /// [`DORMANT_MAX_BACKOFF`]. `None` = poll every cycle.
+    pub fn next_poll_at(&self, interval: std::time::Duration) -> Option<DateTime<Utc>> {
+        if !self.is_dormant() {
+            return None;
+        }
+        let doublings = (self.consecutive_failures - DORMANT_AFTER_FAILURES + 1).min(16);
+        let backoff = Duration::from_std(interval)
+            .unwrap_or(Duration::minutes(1))
+            .checked_mul(1 << doublings)
+            .map_or(DORMANT_MAX_BACKOFF, |d| d.min(DORMANT_MAX_BACKOFF));
+        Some(self.last_attempt_at + backoff)
+    }
+
+    /// Poll this cycle? Dormant endpoints wait out their backoff unless the
+    /// node announced itself again since the last attempt.
+    pub fn poll_due(
+        &self,
+        announced_at: DateTime<Utc>,
+        interval: std::time::Duration,
+        now: DateTime<Utc>,
+    ) -> bool {
+        // Half an interval of slack: `last_attempt_at` is stamped when the
+        // fetch finished, a few seconds after the cycle that started it.
+        let slack = Duration::from_std(interval / 2).unwrap_or_default();
+        announced_at > self.last_attempt_at
+            || self
+                .next_poll_at(interval)
+                .is_none_or(|due| now + slack >= due)
+    }
+}
+
+/// Bucket a fetch error string into a coarse class operators can count:
+/// `dns`, `timeout`, `tls`, `connect`, `http_4xx`, `http_5xx`, `parse`, `other`.
+pub fn classify_failure(error: &str) -> &'static str {
+    let e = error.to_ascii_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|n| e.contains(n));
+    if has(&["dns error", "failed to lookup address", "no such host"]) {
+        "dns"
+    } else if let Some(status) = e.split("→ ").nth(1) {
+        // `GET <url> → 504 Gateway Timeout`: the status wins over its text.
+        match status.as_bytes().first() {
+            Some(b'4') => "http_4xx",
+            Some(b'5') => "http_5xx",
+            _ => "other",
+        }
+    } else if has(&["http status client error"]) {
+        // reqwest `error_for_status` (reference catalogs).
+        "http_4xx"
+    } else if has(&["http status server error"]) {
+        "http_5xx"
+    } else if has(&["timed out", "timeout"]) {
+        "timeout"
+    } else if has(&[
+        "certificate",
+        "tls",
+        "ssl",
+        "handshake",
+        "corrupt message",
+        "fatal alert",
+    ]) {
+        "tls"
+    } else if has(&[
+        "(connect)",
+        "tcp connect",
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "unreachable",
+    ]) {
+        "connect"
+    } else if has(&["json", "decode", "expected", "shape", "no models"]) {
+        "parse"
+    } else {
+        "other"
+    }
+}
+
 /// Summary of the most recent completed poll cycle.
 #[derive(Debug, Clone, Serialize)]
 pub struct PollCycle {
@@ -140,6 +241,8 @@ pub struct PollCycle {
     pub elapsed_ms: u64,
     pub nodes_ok: usize,
     pub nodes_failed: usize,
+    /// Dormant nodes not due this cycle (backoff), so not polled.
+    pub nodes_dormant: usize,
     pub delisted: usize,
     pub expired: usize,
 }
@@ -1313,5 +1416,78 @@ mod tests {
         assert_eq!(n.skip_reason.as_deref(), Some("loopback"));
         store.set_node_skip_reason("http://127.0.0.1:18131", None);
         assert!(store.list_nodes()[0].skip_reason.is_none());
+    }
+
+    #[test]
+    fn classifies_real_fetch_errors() {
+        let cases = [
+            ("GET https://x/v1/models error sending request for url (https://x/v1/models): client error (Connect): dns error: failed to lookup address information", "dns"),
+            ("GET https://x/v1/models → 404 Not Found", "http_4xx"),
+            ("GET https://x/v1/models → 530 <unknown status code>", "http_5xx"),
+            ("GET https://x/v1/models → 504 Gateway Timeout", "http_5xx"),
+            ("catalog timed out after 10s", "timeout"),
+            ("GET https://x error sending request for url (https://x): client error (Connect): received fatal alert: InternalError", "tls"),
+            ("GET https://x error sending request for url (https://x): client error (Connect): tcp connect error: Connection refused (os error 111)", "connect"),
+            ("JSON https://x/v1/models: error decoding response body", "parse"),
+            ("OrcaRouter status: HTTP status server error (502 Bad Gateway) for url (https://x)", "http_5xx"),
+            ("something new", "other"),
+        ];
+        for (err, class) in cases {
+            assert_eq!(classify_failure(err), class, "{err}");
+        }
+    }
+
+    #[test]
+    fn dormant_nodes_back_off_until_announced_again() {
+        let store = Store::new();
+        let interval = std::time::Duration::from_secs(60);
+        for _ in 0..DORMANT_AFTER_FAILURES - 1 {
+            store.record_fetch("routstr", "n", "https://n", Err("dns error".into()));
+        }
+        let f = store.fetch_statuses().remove(0);
+        assert!(!f.is_dormant() && f.next_poll_at(interval).is_none());
+        assert_eq!(f.failure_class(), Some("dns"));
+
+        store.record_fetch("routstr", "n", "https://n", Err("dns error".into()));
+        let f = store.fetch_statuses().remove(0);
+        assert!(f.is_dormant());
+        // First dormant failure waits two intervals.
+        assert_eq!(
+            f.next_poll_at(interval),
+            Some(f.last_attempt_at + Duration::minutes(2))
+        );
+        let old_announcement = f.last_attempt_at - Duration::hours(1);
+        assert!(!f.poll_due(
+            old_announcement,
+            interval,
+            f.last_attempt_at + Duration::minutes(1)
+        ));
+        assert!(f.poll_due(
+            old_announcement,
+            interval,
+            f.last_attempt_at + Duration::minutes(2)
+        ));
+        // A fresh announcement brings it back right away.
+        let fresh = f.last_attempt_at + Duration::seconds(1);
+        assert!(f.poll_due(fresh, interval, fresh));
+
+        // The gap doubles, capped at an hour.
+        let mut f = f;
+        f.consecutive_failures = 7;
+        assert_eq!(
+            f.next_poll_at(interval),
+            Some(f.last_attempt_at + Duration::minutes(8))
+        );
+        f.consecutive_failures = 400;
+        assert_eq!(
+            f.next_poll_at(interval),
+            Some(f.last_attempt_at + DORMANT_MAX_BACKOFF)
+        );
+
+        store.record_fetch("routstr", "n", "https://n", Ok(3));
+        let f = store.fetch_statuses().remove(0);
+        assert!(
+            f.is_healthy() && f.failure_class().is_none() && f.next_poll_at(interval).is_none()
+        );
     }
 }

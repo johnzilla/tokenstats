@@ -74,11 +74,17 @@ tokenstats serve --node https://api.example.com --node https://other.example.com
 
 Nodes are polled concurrently (`--node-concurrency`) at `/v1/models` (falling back to `/models`), each within `--node-timeout-secs`. Failures and timeouts count against reliability.
 
+### Dead nodes and failure classes
+
+Relays keep replaying announcements from nodes whose domains are long gone, so after 5 failed catalog fetches in a row a node turns **dormant**: it is polled on a backoff (2, 4, 8 … poll intervals, capped at 1 hour) instead of every cycle, and comes back immediately when a fetch succeeds or it announces itself again. Dormant nodes stay listed.
+
+`GET /api/nodes` reports each node's `status` (`healthy` · `failing` · `dormant` · `skipped` · `pending`), `failure_class` for the current failure streak (`dns`, `timeout`, `tls`, `connect`, `http_4xx`, `http_5xx`, `parse`, `ssrf_skip`, `other`) and `next_poll_at` for dormant nodes. The feed's `sources.routstr` adds `dormant`, `skipped` and `failure_classes` counts.
+
 ### Private-address guard (SSRF)
 
 Nostr announcements are unauthenticated, so by default tokenstats **never requests** a Nostr-discovered node whose host is, or resolves to, a non-public address: loopback (`127/8`, `::1`, `localhost`, `*.localhost`), RFC1918 (`10/8`, `172.16/12`, `192.168/16`), CGNAT `100.64/10`, link-local (`169.254/16` incl. cloud metadata `169.254.169.254`, `fe80::/10`), unique-local `fc00::/7`, unspecified (`0.0.0.0/8`, `::`) and multicast/broadcast. The guarded client connects only to checked addresses (no DNS rebinding) and refuses redirects to such hosts.
 
-- Skipped nodes still appear in `GET /api/nodes` with `skip_reason` set (e.g. `"127.0.0.1 is loopback"`); they get no reliability samples. `skip_reason` is `null` for polled nodes.
+- Skipped nodes still appear in `GET /api/nodes` with `skip_reason` set (e.g. `"127.0.0.1 is loopback"`), `status: "skipped"` and `failure_class: "ssrf_skip"`; they get no reliability samples. `skip_reason` is `null` for polled nodes.
 - Operator-seeded `--node` endpoints are trusted, so `--node http://127.0.0.1:8000` works for local Routstr testing.
 - On a trusted LAN, `--allow-private-nodes` (`TOKENSTATS_ALLOW_PRIVATE_NODES=true`) polls private Nostr-announced nodes too. Don't enable it on a public deployment.
 
@@ -116,7 +122,7 @@ Every response carries `X-Content-Type-Options: nosniff` and a `Content-Security
 
 ### Feed health
 
-`/health` and `/api/summary` include `status` (`ok` · `degraded` · `down` · `starting` · `offline`) and a `feed` object: `reasons`, `stale_quotes`, `last_cycle` (nodes ok/failed, delisted, expired, elapsed), per-source `endpoints`/`healthy`/`failing`/`models`/`last_success_at`/`last_error`, and Nostr `discovery.lag_secs`. Many dead Routstr nodes alone does not degrade the feed; zero healthy nodes does. The dashboard shows a feed strip under the header (see [Feed strip and quality signals](#feed-strip-and-quality-signals)).
+`/health` and `/api/summary` include `status` (`ok` · `degraded` · `down` · `starting` · `offline`) and a `feed` object: `reasons`, `stale_quotes`, `last_cycle` (nodes ok/failed, delisted, expired, elapsed), per-source `endpoints`/`healthy`/`failing`/`dormant`/`failure_classes`/`models`/`last_success_at`/`last_error` (Routstr also `skipped`), `last_cycle.nodes_dormant` (not due this cycle), and Nostr `discovery.lag_secs`. Many dead Routstr nodes alone does not degrade the feed; zero healthy nodes does. The dashboard shows a feed strip under the header (see [Feed strip and quality signals](#feed-strip-and-quality-signals)).
 
 ### Ephemeral / CI smoke
 
@@ -144,9 +150,9 @@ Flagship variants are preferred over mini/nano/lite when available.
 
 ### Feed strip and quality signals
 
-Under the header, a one-line strip mirrors `/health` `feed`: status (with reasons when not `ok`), last poll cycle age and duration, each reference catalog (✓ + model count; hover a source for its last error), Routstr nodes OK / total, stale quote count, BTC rate age and Nostr announcement lag.
+Under the header, a one-line strip mirrors `/health` `feed`: status (with reasons when not `ok`), last poll cycle age and duration, each reference catalog (✓ + model count; hover a source for its last error), Routstr nodes OK / total (with dormant count; hover for failure classes), stale quote count, BTC rate age and Nostr announcement lag.
 
-The price board shows the API's per-quote signals: **Rel 24h** (endpoint catalog-fetch success; 1h right after a restart; hover for 1h / 24h / 7d), **Latency** (24h p50, hover for p95 and whether it comes from the `/v1/info` probe or the catalog fetch), **Age** (highlighted when stale), and an **outlier** tag on the blend. The **Quality** pills toggle `exclude_stale` / `exclude_outliers`; like the other filters they carry into links and CSV export.
+The price board shows the API's per-quote signals: **Rel 24h** (endpoint catalog-fetch success; 1h right after a restart; hover for 1h / 24h / 7d), **Latency** (24h p50, hover for p95 and whether it comes from the `/v1/info` probe or the catalog fetch), **Age** (highlighted when stale), and an **outlier** tag on the blend. The **Quality** pills toggle `healthy` / `exclude_stale` / `exclude_outliers`; like the other filters they carry into links and CSV export.
 
 ### Blended cost
 
@@ -161,8 +167,8 @@ where \(r\) is the output:input ratio (2, 3, or 4). Default \(r = 3\) (1:3 in:ou
 | Preset | Intent |
 |--------|--------|
 | **Cheapest Frontier** | Popular frontier families, non-free, sorted by blend |
-| **Fastest** | Fast model classes by name (`flash`, `mini`, `turbo`, `haiku`, …), ranked by measured endpoint latency (reliable ≥90% / 24h first) |
-| **Most Private** | Routstr/Nostr/onion/localhost endpoints; onion first, then identity-verified nodes; drops nodes below 50% 24h reliability |
+| **Fastest** | Fast model classes by name (`flash`, `mini`, `turbo`, `haiku`, …), ranked by measured endpoint latency (reliable ≥90% / 24h with a successful last fetch first) |
+| **Most Private** | Routstr/Nostr/onion/localhost endpoints; onion first, then identity-verified nodes; drops nodes below 50% 24h reliability or whose last fetch failed |
 
 Presets run after the other filters, so combine them with `kind=chat` to keep embedding models out.
 | **Local-first** | Ollama, vLLM, localhost, free local-style rows |

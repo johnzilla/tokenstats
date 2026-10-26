@@ -24,6 +24,8 @@ pub struct EndpointSignals {
     /// Node advertises an onion address (announcement or `/v1/info`).
     pub onion: bool,
     pub identity_verified: Option<bool>,
+    /// The endpoint's last catalog fetch failed.
+    pub failing: bool,
 }
 
 pub type Signals = HashMap<String, EndpointSignals>;
@@ -287,9 +289,9 @@ pub fn apply_preset(quotes: Vec<Quote>, preset: Preset, signals: &Signals) -> Ve
                 let key = |q: &Quote| {
                     let sig = signals_for(signals, q);
                     let p50 = sig.and_then(|s| s.latency_p50_ms);
-                    let reliable = sig
-                        .and_then(|s| s.reliability_24h)
-                        .is_some_and(|r| r >= FAST_MIN_RELIABILITY);
+                    let reliable = sig.is_some_and(|s| {
+                        !s.failing && s.reliability_24h.is_some_and(|r| r >= FAST_MIN_RELIABILITY)
+                    });
                     // Tier 0: reliable + measured; 1: measured; 2: no data.
                     let tier = match (p50.is_some(), reliable) {
                         (true, true) => 0u8,
@@ -326,9 +328,11 @@ pub fn apply_preset(quotes: Vec<Quote>, preset: Preset, signals: &Signals) -> Ve
                 })
                 // Private but unreachable is no use; unknown reliability stays.
                 .filter(|q| {
-                    signals_for(signals, q)
-                        .and_then(|s| s.reliability_24h)
-                        .is_none_or(|r| r >= PRIVATE_MIN_RELIABILITY)
+                    signals_for(signals, q).is_none_or(|s| {
+                        !s.failing
+                            && s.reliability_24h
+                                .is_none_or(|r| r >= PRIVATE_MIN_RELIABILITY)
+                    })
                 })
                 .collect();
             v.sort_by(|a, b| {
@@ -517,6 +521,7 @@ mod tests {
             reliability_24h: rel,
             onion,
             identity_verified: id,
+            failing: false,
         }
     }
 
@@ -590,6 +595,31 @@ mod tests {
             got,
             ["https://onion-node", "https://verified", "https://plain"]
         );
+    }
+
+    #[test]
+    fn presets_sideline_endpoints_whose_last_fetch_failed() {
+        let mut down = sig(Some(100), Some(0.99), true, Some(true));
+        down.failing = true;
+        let signals: Signals = [
+            ("https://down".to_string(), down),
+            (
+                "https://up".to_string(),
+                sig(Some(900), Some(0.99), false, None),
+            ),
+        ]
+        .into();
+        let quotes = vec![at("m-flash", "https://down"), at("m-flash", "https://up")];
+        let fastest: Vec<_> = apply_preset(quotes.clone(), Preset::Fastest, &signals)
+            .into_iter()
+            .map(|q| q.endpoint.unwrap())
+            .collect();
+        assert_eq!(fastest, ["https://up", "https://down"]);
+        let private: Vec<_> = apply_preset(quotes, Preset::MostPrivate, &signals)
+            .into_iter()
+            .map(|q| q.endpoint.unwrap())
+            .collect();
+        assert_eq!(private, ["https://up"]);
     }
 
     #[test]

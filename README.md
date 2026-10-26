@@ -55,8 +55,8 @@ cargo run -- serve --bind 0.0.0.0:8080 --db ./tokenstats.db
 | **Best Now** | Cheapest blended price for popular families (Claude, Grok, DeepSeek, GPT, Gemini, …). Shows **node under the price**. |
 | **Blend ratio** | Toggle 1:2 / 1:3 / 1:4 in:out workload (`?ratio=3`). |
 | **Presets** | Cheapest Frontier · Fastest · Most Private · Local-first |
-| **Feed strip** | Feed status + reasons, last cycle, per-source health, Routstr nodes OK, stale count, BTC rate age |
-| **Signals** | Per-quote 24h reliability, p50 latency, age (stale highlighted), outlier tag; **Quality** pills hide stale / outliers |
+| **Feed strip** | Feed status + reasons, last cycle, per-source health, Routstr nodes OK + dormant, stale count, BTC rate age |
+| **Signals** | Per-quote 24h reliability, p50 latency, age (stale highlighted), outlier tag; **Quality** pills: healthy only, hide stale / outliers |
 | **Δ out** | Price change vs previous catalog snapshot |
 | **Hover → copy** | **curl** or OpenAI-compatible **config** JSON for that quote |
 | **Export CSV** | Current filtered view → `/export.csv?...` |
@@ -70,8 +70,8 @@ Query params: `?source=openrouter&preset=frontier&ratio=4&model=deepseek`
 |------|-------------|
 | `GET /` | HTML dashboard (auto-refresh ~15s) |
 | `GET /health` | Liveness + feed `status` (`ok`/`degraded`/`down`/…) + counts + `last_updated` |
-| `GET /api/quotes` | JSON quotes (`source`, `model`, `kind`, `preset`, `ratio`, `limit`, `max_age_secs`, `min_reliability`, `min_reliability_24h`, `max_latency_ms`, `exclude_stale`, `exclude_outliers`) |
-| `GET /api/nodes` | Discovered nodes + reliability (1h/24h/7d) + latency p50/p95 + last success/error (+ `skip_reason` when not polled) |
+| `GET /api/quotes` | JSON quotes (`source`, `model`, `kind`, `preset`, `ratio`, `limit`, `max_age_secs`, `min_reliability`, `min_reliability_24h`, `max_latency_ms`, `exclude_stale`, `exclude_outliers`, `healthy`) |
+| `GET /api/nodes` | Discovered nodes + `status` (healthy/failing/dormant/skipped) + `failure_class` + reliability (1h/24h/7d) + latency p50/p95 + last success/error (+ `skip_reason` when not polled) |
 | `GET /api/summary` | Aggregates + Best Now strip |
 | `GET /export.csv` | CSV of current filtered view |
 

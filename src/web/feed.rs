@@ -1,5 +1,7 @@
 //! Feed health: is the board fresh and complete enough to act on?
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
 
@@ -83,7 +85,19 @@ pub fn feed_status(state: &AppState, quotes: &[Quote]) -> Value {
         .filter(|(_, s)| s.attempted)
         .map(|(name, s)| (name.to_string(), s.to_json()))
         .collect();
-    sources.insert("routstr".into(), routstr.to_json());
+    let mut routstr_json = routstr.to_json();
+    // Nodes the SSRF guard refuses are never fetched, so they have no fetch
+    // status; count them here so operators see the whole failure picture.
+    let skipped = store
+        .list_nodes()
+        .iter()
+        .filter(|n| n.skip_reason.is_some())
+        .count();
+    routstr_json["skipped"] = json!(skipped);
+    if skipped > 0 {
+        routstr_json["failure_classes"]["ssrf_skip"] = json!(skipped);
+    }
+    sources.insert("routstr".into(), routstr_json);
 
     let last_announcement = store.last_announcement_at();
     json!({
@@ -105,6 +119,10 @@ struct SourceSummary {
     attempted: bool,
     endpoints: usize,
     healthy: usize,
+    /// Failing endpoints polled on a backoff (subset of `failing`).
+    dormant: usize,
+    /// Failing endpoints by `classify_failure` class.
+    failure_classes: BTreeMap<&'static str, usize>,
     models: usize,
     last_success_at: Option<DateTime<Utc>>,
     last_error: Option<String>,
@@ -116,6 +134,8 @@ impl SourceSummary {
             "endpoints": self.endpoints,
             "healthy": self.healthy,
             "failing": self.endpoints - self.healthy,
+            "dormant": self.dormant,
+            "failure_classes": self.failure_classes,
             "models": self.models,
             "last_success_at": self.last_success_at,
             "last_error": self.last_error,
@@ -126,14 +146,17 @@ impl SourceSummary {
 /// Aggregate fetch outcomes for one source. `healthy` = last fetch succeeded.
 fn source_summary(fetches: &[FetchStatus], source: &str) -> SourceSummary {
     let rows: Vec<&FetchStatus> = fetches.iter().filter(|f| f.source == source).collect();
-    let healthy: Vec<&&FetchStatus> = rows
-        .iter()
-        .filter(|f| f.consecutive_failures == 0 && f.last_success_at.is_some())
-        .collect();
+    let healthy: Vec<&&FetchStatus> = rows.iter().filter(|f| f.is_healthy()).collect();
+    let mut failure_classes = BTreeMap::new();
+    for class in rows.iter().filter_map(|f| f.failure_class()) {
+        *failure_classes.entry(class).or_insert(0) += 1;
+    }
     SourceSummary {
         attempted: !rows.is_empty(),
         endpoints: rows.len(),
         healthy: healthy.len(),
+        dormant: rows.iter().filter(|f| f.is_dormant()).count(),
+        failure_classes,
         models: healthy.iter().map(|f| f.models).sum(),
         last_success_at: rows.iter().filter_map(|f| f.last_success_at).max(),
         // Most recent failure, so a single-endpoint source shows its error.
@@ -172,6 +195,7 @@ mod tests {
             elapsed_ms: 1,
             nodes_ok: 0,
             nodes_failed: 0,
+            nodes_dormant: 0,
             delisted: 0,
             expired: 0,
         });
@@ -179,6 +203,7 @@ mod tests {
             store,
             stale_after: std::time::Duration::from_secs(600),
             polling: true,
+            poll_interval: std::time::Duration::from_secs(60),
             analytics: None,
         }
     }
@@ -212,5 +237,29 @@ mod tests {
         assert_eq!(s.last_error.as_deref(), Some("boom"));
         assert!(source_summary(&rows, "openrouter").last_error.is_none());
         assert!(!source_summary(&rows, "orcarouter").attempted);
+    }
+
+    #[test]
+    fn routstr_summary_counts_dormant_classes_and_skips() {
+        let st = state_with_fresh_catalog();
+        st.store.record_fetch("routstr", "a", "https://a", Ok(3));
+        for _ in 0..crate::store::DORMANT_AFTER_FAILURES {
+            st.store
+                .record_fetch("routstr", "b", "https://b", Err("dns error".into()));
+        }
+        st.store.record_fetch(
+            "routstr",
+            "c",
+            "https://c",
+            Err("GET https://c → 404 Not Found".into()),
+        );
+        let r = &feed_status(&st, &[])["sources"]["routstr"];
+        assert_eq!(
+            (r["healthy"].as_u64(), r["failing"].as_u64()),
+            (Some(1), Some(2))
+        );
+        assert_eq!(r["dormant"], 1);
+        assert_eq!(r["failure_classes"], json!({"dns": 1, "http_4xx": 1}));
+        assert_eq!(r["skipped"], 0);
     }
 }
