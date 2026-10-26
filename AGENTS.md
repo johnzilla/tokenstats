@@ -54,6 +54,7 @@ Centralized in `src/config.rs`. Prefer adding new knobs there (CLI + `TOKENSTATS
 - BTC/USD: `Store::set_btc_usd(rate, at)` rejects rates outside `pricing::BTC_USD_MIN..=MAX`; `btc_usd_at` is persisted in `meta` and drives feed staleness.
 - Node reliability: `record_poll` feeds raw 1h samples (`reliability_1h`) and hourly buckets with latency histograms (`src/store/history.rs`, 7 days) behind `endpoint_stats()`. Buckets persist in `endpoint_hours`; only hours touched since the last save are upserted.
 - SSRF guard (`src/providers/netguard.rs`): non-`cli` nodes (i.e. Nostr announcements) are never requested when the host is or resolves to loopback/private/CGNAT/link-local/unique-local/unspecified, unless `--allow-private-nodes`. Use the guarded client (public-only resolver + redirect checks) for any new fetch of announced URLs. Skips set `ProviderNode.skip_reason`.
+- Dormant nodes: after `DORMANT_AFTER_FAILURES` (5) failed catalog fetches in a row a node is polled on a backoff (2, 4, 8 … poll intervals, capped at `DORMANT_MAX_BACKOFF` = 1h) until it succeeds or announces itself again (`last_seen` newer than the last attempt). Fetch errors are bucketed by `store::classify_failure`; `FetchStatus` is in-memory, so dormancy rebuilds after a restart.
 - Node probes: each cycle `NodeFetcher::poll` runs the catalog fetch and a `GET /v1/info` side by side (same guard). Probes feed `record_probe` (latency history in `endpoint_probe_hours` + latest `ProbeStatus`, not persisted), never reliability. Identity = `nostr::same_pubkey(announced pubkey, info.npub)`.
 
 ### Web / dashboard
@@ -98,7 +99,7 @@ Related helpers (not substitutes for the full board):
 |----------|----------|
 | `GET /api/quotes` | **Main integration** — full filtered quote list |
 | `GET /api/summary` | Compact Best Now strip + counts + `btc_usd` + feed `status`/`feed` |
-| `GET /api/nodes` | Discovered Routstr endpoints + reliability (`reliability_1h/24h/7d`, `polls_24h`) + `latency_p50_ms/p95_ms`/`latency_source` + `identity_verified` + `probe` (`probed_at`, `ok`, `error`) + `info` (self-reported `/v1/info`: `name`, `version`, `npub`, `mints`, `onion_url`) + `last_success_at` / `last_error` / `consecutive_failures` + `skip_reason` (string \| null) when the SSRF guard refused to poll |
+| `GET /api/nodes` | Discovered Routstr endpoints + reliability (`reliability_1h/24h/7d`, `polls_24h`) + `latency_p50_ms/p95_ms`/`latency_source` + `identity_verified` + `probe` (`probed_at`, `ok`, `error`) + `info` (self-reported `/v1/info`: `name`, `version`, `npub`, `mints`, `onion_url`) + `last_success_at` / `last_error` / `consecutive_failures` + `skip_reason` (string \| null) when the SSRF guard refused to poll + `status` (`healthy` \| `failing` \| `dormant` \| `skipped` \| `pending`) + `failure_class` (`dns` \| `timeout` \| `tls` \| `connect` \| `http_4xx` \| `http_5xx` \| `parse` \| `ssrf_skip` \| `other` \| null) + `next_poll_at` (dormant nodes only) |
 | `GET /health` | Liveness + feed `status` / `feed` object / quote count / `btc_usd` + `btc_usd_at` / `btc_usd_age_secs` / `last_updated` |
 | `GET /export.csv` | Same filters as quotes, for offline analysis |
 
@@ -107,7 +108,7 @@ Default base URL locally: `http://127.0.0.1:8080`.
 ### Request
 
 ```
-GET /api/quotes?source=&model=&kind=&preset=&ratio=&limit=&max_age_secs=&min_reliability=&min_reliability_24h=&max_latency_ms=&exclude_stale=&exclude_outliers=
+GET /api/quotes?source=&model=&kind=&preset=&ratio=&limit=&max_age_secs=&min_reliability=&min_reliability_24h=&max_latency_ms=&exclude_stale=&exclude_outliers=&healthy=
 ```
 
 | Query param | Type | Default | Description |
@@ -120,6 +121,7 @@ GET /api/quotes?source=&model=&kind=&preset=&ratio=&limit=&max_age_secs=&min_rel
 | `max_latency_ms` | int | (none) | Only quotes whose endpoint's 24h p50 response time ≤ this. No latency samples → **excluded** |
 | `exclude_stale` | bool | off | `1`/`true` hides quotes with `stale: true` |
 | `exclude_outliers` | bool | off | `1`/`true` hides quotes with `outlier: true` |
+| `healthy` | bool | off | `1`/`true` keeps only quotes with `healthy: true` |
 | `model` | string | (all) | Case-insensitive **substring** on model id (e.g. `deepseek`, `claude-sonnet`) |
 | `preset` | string | (none) | View preset (see below). When set, applies preset filter/sort instead of plain blend sort |
 | `ratio` | float | `3` | Output:input workload for blended cost (`1:r`). Allowed range effectively `>0` and `≤20`; invalid falls back to `3` |
@@ -130,8 +132,8 @@ GET /api/quotes?source=&model=&kind=&preset=&ratio=&limit=&max_age_secs=&min_rel
 | Value | Aliases | Behavior |
 |-------|---------|----------|
 | `frontier` | `cheapest-frontier`, `cheapest_frontier` | Popular frontier families, non-free, sorted by blend |
-| `fastest` | `fast` | Fast model classes by name (`flash`, `mini`, `turbo`, …; no free way to measure tokens/s), then endpoints with measured latency and ≥90% 24h reliability first, by 24h p50, then blend |
-| `private` | `most-private`, `most_private` | Routstr/Nostr/onion/localhost; drops endpoints with 24h reliability < 50%; onion (announced or `/v1/info`) first, then identity-verified nodes, then other Routstr, by 24h reliability, then blend |
+| `fastest` | `fast` | Fast model classes by name (`flash`, `mini`, `turbo`, …; no free way to measure tokens/s), then endpoints with measured latency, ≥90% 24h reliability and a successful last fetch first, by 24h p50, then blend |
+| `private` | `most-private`, `most_private` | Routstr/Nostr/onion/localhost; drops endpoints with 24h reliability < 50% or whose last fetch failed; onion (announced or `/v1/info`) first, then identity-verified nodes, then other Routstr, by 24h reliability, then blend |
 | `local` | `local-first`, `local_first` | Local/ollama/vLLM-style candidates |
 
 Without `preset`, results are sorted by **ascending blended USD**, then model name.
@@ -177,6 +179,7 @@ Empty store / no matches → `[]`.
 | `identity_verified` | bool \| null | Node's `/v1/info` `npub` matches the Nostr key that announced it. `false` = mismatch or unparsable npub; null = nothing to compare (reference catalogs, `--node` seeds, not probed since restart) |
 | `onion` | string \| null | Node's onion address, from the announcement or `/v1/info` |
 | `outlier` | bool | Blend is >10× above or below the median for the same model id across ≥3 quotes. Low outliers often mean a unit bug on the node. Computed with the request's `ratio`, so the flag can change with `ratio` |
+| `healthy` | bool | Routable now: the endpoint's last catalog fetch succeeded, its 24h success rate (1h right after a restart) is ≥ 0.9, its `/v1/info` probe isn't failing, and the quote isn't stale. Always `false` without current poll evidence (e.g. `--no-poll` snapshots) |
 
 #### Example
 
@@ -269,7 +272,7 @@ catalog model row
 
 ```
 1. GET /health          → wait for status "ok" (or "degraded" + acceptable reasons)
-2. GET /api/quotes?kind=chat&exclude_stale=1&exclude_outliers=1&min_reliability_24h=0.9
+2. GET /api/quotes?kind=chat&exclude_outliers=1&healthy=1
                         → select candidates by blended_usd / source / model
 3. Optionally GET /api/nodes for reliability before routing to a Routstr endpoint
 4. Re-poll /api/quotes on an interval aligned with TOKENSTATS_POLL_INTERVAL_SECS (default 60s)

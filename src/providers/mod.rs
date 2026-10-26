@@ -40,6 +40,7 @@ pub async fn get_with_retry(
 }
 pub use reference::{ReferenceCatalog, OPENROUTER, ORCAROUTER};
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -49,7 +50,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::store::{PollCycle, Store};
+use crate::store::{normalize_endpoint, FetchStatus, PollCycle, Store};
 
 #[derive(Debug, Clone)]
 pub struct PollerConfig {
@@ -167,7 +168,24 @@ async fn poll_once(
     // Poll nodes concurrently; results are applied here so tasks don't need the store.
     let sem = Arc::new(Semaphore::new(cfg.node_concurrency.max(1)));
     let mut tasks = JoinSet::new();
+    let fetches: HashMap<String, FetchStatus> = store
+        .fetch_statuses()
+        .into_iter()
+        .filter(|f| f.source == "routstr")
+        .map(|f| (f.endpoint.clone(), f))
+        .collect();
+    let now = chrono::Utc::now();
+    let mut nodes_dormant = 0usize;
     for node in store.list_nodes() {
+        // Long-dead nodes (relays keep replaying their announcements) are
+        // polled on a backoff instead of every cycle.
+        if fetches
+            .get(&normalize_endpoint(&node.endpoint))
+            .is_some_and(|f| !f.poll_due(node.last_seen, cfg.interval, now))
+        {
+            nodes_dormant += 1;
+            continue;
+        }
         let nodes = nodes.clone();
         let sem = Arc::clone(&sem);
         let timeout = cfg.node_timeout;
@@ -271,12 +289,14 @@ async fn poll_once(
         elapsed_ms,
         nodes_ok,
         nodes_failed,
+        nodes_dormant,
         delisted,
         expired,
     });
     info!(
         nodes_ok,
         nodes_failed,
+        nodes_dormant,
         nodes_blocked,
         delisted,
         expired,

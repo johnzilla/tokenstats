@@ -15,7 +15,9 @@ use crate::market::{
     DEFAULT_BLEND_RATIO,
 };
 use crate::pricing::{blend_sort_key, is_rankable_blend};
-use crate::store::{normalize_endpoint, EndpointStats, ProbeStatus, Quote};
+use crate::store::{
+    normalize_endpoint, EndpointStats, FetchStatus, ProbeStatus, ProviderNode, Quote,
+};
 
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let quotes = state.store.list_quotes();
@@ -65,6 +67,8 @@ pub struct QuotesQuery {
     pub exclude_stale: Option<String>,
     /// `1`/`true` hides quotes priced >10× off the cross-source median.
     pub exclude_outliers: Option<String>,
+    /// `1`/`true` keeps only quotes with `healthy: true`.
+    pub healthy: Option<String>,
 }
 
 impl QuotesQuery {
@@ -99,6 +103,7 @@ impl QuotesQuery {
         let mut ratio = self.ratio.map(|r| format!("{r}"));
         let mut exclude_stale = self.exclude_stale.as_deref();
         let mut exclude_outliers = self.exclude_outliers.as_deref();
+        let mut healthy = self.healthy.as_deref();
 
         for (k, v) in overrides {
             match *k {
@@ -108,6 +113,7 @@ impl QuotesQuery {
                 "ratio" => ratio = v.map(|s| s.to_string()),
                 "exclude_stale" => exclude_stale = *v,
                 "exclude_outliers" => exclude_outliers = *v,
+                "healthy" => healthy = *v,
                 "clear" if *v == Some("1") => {
                     source = None;
                     model = None;
@@ -133,6 +139,7 @@ impl QuotesQuery {
         set("kind", self.kind.as_deref());
         set("exclude_stale", exclude_stale);
         set("exclude_outliers", exclude_outliers);
+        set("healthy", healthy);
 
         if pairs.is_empty() {
             return String::new();
@@ -255,6 +262,22 @@ pub async fn api_nodes(State(state): State<AppState>) -> impl IntoResponse {
                     "consecutive_failures".into(),
                     serde_json::json!(fetch.map(|f| f.consecutive_failures).unwrap_or(0)),
                 );
+                obj.insert(
+                    "status".into(),
+                    serde_json::json!(node_status(n.skip_reason.is_some(), fetch)),
+                );
+                obj.insert(
+                    "failure_class".into(),
+                    serde_json::json!(if n.skip_reason.is_some() {
+                        Some("ssrf_skip")
+                    } else {
+                        fetch.and_then(|f| f.failure_class())
+                    }),
+                );
+                obj.insert(
+                    "next_poll_at".into(),
+                    serde_json::json!(fetch.and_then(|f| f.next_poll_at(state.poll_interval))),
+                );
             }
             v
         })
@@ -344,13 +367,13 @@ pub async fn export_csv(State(state): State<AppState>, Query(q): Query<QuotesQue
         "source,provider,provider_id,model,price_in_usd,price_out_usd,blended_usd,blend_ratio,\
          price_in_sats,price_out_sats,delta_out_pct,endpoint,region,context_length,observed_at,\
          kind,age_secs,stale,reliability_1h,outlier,reliability_24h,reliability_7d,\
-         latency_p50_ms,latency_p95_ms,latency_source,identity_verified\n",
+         latency_p50_ms,latency_p95_ms,latency_source,identity_verified,healthy\n",
     );
     for quote in quotes.into_iter().take(limit) {
         let blend = blended_usd(quote.price_in_usd, quote.price_out_usd, ratio);
         let d = delta_pct(quote.price_out_usd, quote.prev_price_out_usd);
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             csv_cell(&quote.source),
             csv_cell(&quote.provider),
             csv_cell(&quote.provider_id),
@@ -384,6 +407,7 @@ pub async fn export_csv(State(state): State<AppState>, Query(q): Query<QuotesQue
             ctx.identity_verified(&quote)
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
+            ctx.is_healthy(&quote),
         ));
     }
 
@@ -483,14 +507,56 @@ pub async fn dashboard(
 
     let node_stats = state.store.endpoint_stats();
     let node_probes = state.store.probe_statuses();
+    let node_fetches: HashMap<String, FetchStatus> = state
+        .store
+        .fetch_statuses()
+        .into_iter()
+        .filter(|f| f.source == "routstr")
+        .map(|f| (f.endpoint.clone(), f))
+        .collect();
+    let status_of = |n: &ProviderNode| {
+        let fetch = node_fetches.get(&normalize_endpoint(&n.endpoint));
+        (node_status(n.skip_reason.is_some(), fetch), fetch)
+    };
+    // Answering nodes first; long-dead and refused ones sink to the bottom.
+    let mut nodes = nodes;
+    nodes.sort_by_key(|n| {
+        let rank = match status_of(n).0 {
+            "healthy" => 0,
+            "failing" => 1,
+            "pending" => 2,
+            "dormant" => 3,
+            _ => 4,
+        };
+        (rank, std::cmp::Reverse(n.last_seen))
+    });
     let node_rows: String = if nodes.is_empty() {
-        r#"<tr><td colspan="7" class="empty">No Routstr nodes discovered yet (kind 38421)…</td></tr>"#
+        r#"<tr><td colspan="8" class="empty">No Routstr nodes discovered yet (kind 38421)…</td></tr>"#
             .into()
     } else {
         nodes
             .iter()
             .map(|n| {
                 let st = node_stats.get(&normalize_endpoint(&n.endpoint));
+                let (status, fetch) = status_of(n);
+                let class = if n.skip_reason.is_some() {
+                    Some("ssrf_skip")
+                } else {
+                    fetch.and_then(|f| f.failure_class())
+                };
+                let status_label = match class {
+                    Some(c) => format!("{status} · {c}"),
+                    None => status.to_string(),
+                };
+                let status_title = n
+                    .skip_reason
+                    .clone()
+                    .or_else(|| fetch.and_then(|f| f.last_error.clone()))
+                    .map(|e| match fetch.and_then(|f| f.next_poll_at(state.poll_interval)) {
+                        Some(due) => format!("{e} · next poll {}", due.format("%H:%M UTC")),
+                        None => e,
+                    })
+                    .unwrap_or_default();
                 let score_pct = (n.reliability * 100.0).round() as i32;
                 let bar_cls = if score_pct >= 90 {
                     "rel-good"
@@ -507,6 +573,7 @@ pub async fn dashboard(
                       <td><code>{id}</code></td>
                       <td class="muted">{endpoint}</td>
                       <td class="muted">{region}</td>
+                      <td><span class="node-status node-{status}" title="{status_title}">{status_label}</span></td>
                       <td>
                         <div class="rel {bar_cls}" title="{ok}/{total} polls last hour · 24h {rel_24h} · 7d {rel_7d}">
                           <span class="rel-bar" style="width:{score}%"></span>
@@ -520,6 +587,9 @@ pub async fn dashboard(
                     id = esc(&short(&n.provider_id, 16)),
                     endpoint = esc(&n.endpoint),
                     region = n.region.as_deref().map(esc).unwrap_or_else(|| "—".into()),
+                    status = status,
+                    status_label = esc(&status_label),
+                    status_title = esc_attr(&status_title),
                     ok = n.poll_ok,
                     total = n.poll_total,
                     score = score_pct,
@@ -604,20 +674,25 @@ pub async fn dashboard(
     let feed_strip = feed_strip_html(&feed, btc_age_secs(&state));
 
     let outliers = all.iter().filter(|x| ctx.is_outlier(x)).count();
+    let healthy = all.iter().filter(|x| ctx.is_healthy(x)).count();
     let quality_pills: String = [
+        ("healthy", "healthy only", healthy, q.healthy.as_deref()),
         (
             "exclude_stale",
             "hide stale",
             feed["stale_quotes"].as_u64().unwrap_or(0) as usize,
+            q.exclude_stale.as_deref(),
         ),
-        ("exclude_outliers", "hide outliers", outliers),
+        (
+            "exclude_outliers",
+            "hide outliers",
+            outliers,
+            q.exclude_outliers.as_deref(),
+        ),
     ]
     .iter()
-    .map(|(key, label, n)| {
-        let on = truthy(match *key {
-            "exclude_stale" => q.exclude_stale.as_deref(),
-            _ => q.exclude_outliers.as_deref(),
-        });
+    .map(|(key, label, n, current)| {
+        let on = truthy(*current);
         let cls = if on { "pill active" } else { "pill" };
         let href = q.qs(&[(key, if on { None } else { Some("1") })]);
         let href = if href.is_empty() {
@@ -798,6 +873,10 @@ pub async fn dashboard(
     .feed-degraded, .feed-starting, .feed-offline {{ color: var(--warn); }}
     .feed-down {{ color: var(--up); }}
     .feed-reasons {{ color: var(--warn); }}
+    .node-status {{ font-size: 0.72rem; white-space: nowrap; }}
+    .node-healthy {{ color: var(--accent); }}
+    .node-failing {{ color: var(--up); }}
+    .node-dormant, .node-skipped, .node-pending {{ color: var(--muted); }}
     .actions-cell {{ position: relative; min-width: 4.5rem; white-space: nowrap; }}
     .row-actions {{
       display: none; gap: 0.3rem; flex-wrap: wrap;
@@ -912,7 +991,7 @@ pub async fn dashboard(
     </tbody>
   </table>
 
-  <h2>Nodes <span class="hint">reliability = successful polls / total (last hour; hover for 24h / 7d) · latency = /v1/info probe (else catalog fetch), 24h · id ✓ = /v1/info npub matches the announcing key</span></h2>
+  <h2>Nodes <span class="hint">dormant = 5+ failed polls in a row, polled on a backoff (hover status for the error) · reliability = successful polls / total (last hour; hover for 24h / 7d) · latency = /v1/info probe (else catalog fetch), 24h · id ✓ = /v1/info npub matches the announcing key</span></h2>
   <table>
     <thead>
       <tr>
@@ -920,6 +999,7 @@ pub async fn dashboard(
         <th>Provider id</th>
         <th>Endpoint</th>
         <th>Region</th>
+        <th>Status</th>
         <th>Reliability</th>
         <th>Latency</th>
         <th>Via</th>
@@ -1058,6 +1138,18 @@ fn quote_row(q: &Quote, ctx: &QuoteCtx) -> String {
     )
 }
 
+/// `skipped` (SSRF guard) · `pending` (not fetched yet) · `healthy` ·
+/// `dormant` (failing, polled on a backoff) · `failing`.
+fn node_status(skipped: bool, fetch: Option<&FetchStatus>) -> &'static str {
+    match fetch {
+        _ if skipped => "skipped",
+        None => "pending",
+        Some(f) if f.is_healthy() => "healthy",
+        Some(f) if f.is_dormant() => "dormant",
+        Some(_) => "failing",
+    }
+}
+
 /// Compact age: `42s`, `7m`, `3h`, `2d`.
 fn fmt_age(secs: i64) -> String {
     match secs {
@@ -1090,7 +1182,10 @@ fn feed_strip_html(feed: &serde_json::Value, btc_age: Option<i64>) -> String {
             let endpoints = s["endpoints"].as_u64().unwrap_or(0);
             let healthy = s["healthy"].as_u64().unwrap_or(0);
             let text = if name == "routstr" {
-                format!("routstr {healthy}/{endpoints} nodes OK")
+                match s["dormant"].as_u64().unwrap_or(0) {
+                    0 => format!("routstr {healthy}/{endpoints} nodes OK"),
+                    d => format!("routstr {healthy}/{endpoints} nodes OK ({d} dormant)"),
+                }
             } else {
                 let mark = if healthy == endpoints && endpoints > 0 {
                     "✓"
@@ -1099,10 +1194,28 @@ fn feed_strip_html(feed: &serde_json::Value, btc_age: Option<i64>) -> String {
                 };
                 format!("{} {mark} {}", esc(name), s["models"].as_u64().unwrap_or(0))
             };
-            let title = s["last_error"]
-                .as_str()
-                .map(|e| format!(" title=\"last error: {}\"", esc_attr(e)))
-                .unwrap_or_default();
+            let classes = s["failure_classes"]
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .map(|(k, v)| format!("{k} {}", v.as_u64().unwrap_or(0)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|c| !c.is_empty());
+            let title = [
+                classes.map(|c| format!("failing: {c}")),
+                s["last_error"].as_str().map(|e| format!("last error: {e}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
+            let title = if title.is_empty() {
+                String::new()
+            } else {
+                format!(" title=\"{}\"", esc_attr(&title))
+            };
             parts.push(format!("<span{title}>{text}</span>"));
         }
     }
@@ -1201,6 +1314,8 @@ fn freshest_ts(quotes: &[Quote]) -> Option<DateTime<Utc>> {
 const OUTLIER_FACTOR: f64 = 10.0;
 /// Quotes for the same model needed before outliers are judged.
 const OUTLIER_MIN_PEERS: usize = 3;
+/// Success rate an endpoint needs for its quotes to count as `healthy`.
+const HEALTHY_MIN_RELIABILITY: f64 = 0.9;
 
 /// Per-request context for freshness, reliability and outlier fields/filters.
 struct QuoteCtx {
@@ -1213,6 +1328,8 @@ struct QuoteCtx {
     probes: HashMap<String, ProbeStatus>,
     /// Normalized endpoint → onion address (announcement or `/v1/info`).
     onions: HashMap<String, String>,
+    /// Normalized endpoint → latest catalog fetch outcome.
+    fetches: HashMap<String, FetchStatus>,
     /// What presets rank on (derived from the three maps above).
     signals: Signals,
     /// Lowercased model id → median rankable blend across all quotes.
@@ -1263,8 +1380,15 @@ impl QuoteCtx {
                     .map(|o| (key, o))
             })
             .collect();
+        let fetches: HashMap<String, FetchStatus> = state
+            .store
+            .fetch_statuses()
+            .into_iter()
+            .map(|f| (f.endpoint.clone(), f))
+            .collect();
         let mut keys: Vec<&String> = stats.keys().chain(probes.keys()).collect();
         keys.extend(onions.keys());
+        keys.extend(fetches.keys());
         let signals = keys
             .into_iter()
             .map(|k| {
@@ -1274,6 +1398,7 @@ impl QuoteCtx {
                     reliability_24h: st.and_then(|s| s.reliability_24h),
                     onion: onions.contains_key(k),
                     identity_verified: probes.get(k).and_then(|p| p.identity_verified),
+                    failing: fetches.get(k).is_some_and(|f| !f.is_healthy()),
                 };
                 (k.clone(), sig)
             })
@@ -1285,6 +1410,7 @@ impl QuoteCtx {
             stats,
             probes,
             onions,
+            fetches,
             signals,
             medians,
         }
@@ -1316,6 +1442,23 @@ impl QuoteCtx {
 
     fn reliability(&self, q: &Quote) -> Option<f64> {
         self.stats(q).and_then(|s| s.reliability_1h)
+    }
+
+    /// Routable right now: the endpoint's last catalog fetch succeeded, it
+    /// succeeds ≥ 90% of the time (24h, else 1h right after a restart), its
+    /// `/v1/info` probe isn't failing, and the quote isn't stale. Needs
+    /// current evidence, so a snapshot served with `--no-poll` has none.
+    fn is_healthy(&self, q: &Quote) -> bool {
+        let Some(key) = Self::endpoint_key(q) else {
+            return false;
+        };
+        let st = self.stats.get(&key);
+        self.fetches.get(&key).is_some_and(FetchStatus::is_healthy)
+            && st
+                .and_then(|s| s.reliability_24h.or(s.reliability_1h))
+                .is_some_and(|r| r >= HEALTHY_MIN_RELIABILITY)
+            && self.probes.get(&key).is_none_or(|p| p.ok)
+            && !self.is_stale(q)
     }
 
     fn is_outlier(&self, q: &Quote) -> bool {
@@ -1382,12 +1525,14 @@ fn enrich_json(q: &Quote, ctx: &QuoteCtx) -> serde_json::Value {
         "identity_verified": ctx.identity_verified(q),
         "onion": ctx.onion(q),
         "outlier": ctx.is_outlier(q),
+        "healthy": ctx.is_healthy(q),
     })
 }
 
 fn filter_quotes(quotes: Vec<Quote>, q: &QuotesQuery, ctx: &QuoteCtx) -> Vec<Quote> {
     let exclude_stale = truthy(q.exclude_stale.as_deref());
     let exclude_outliers = truthy(q.exclude_outliers.as_deref());
+    let healthy_only = truthy(q.healthy.as_deref());
     quotes
         .into_iter()
         .filter(|quote| {
@@ -1423,6 +1568,9 @@ fn filter_quotes(quotes: Vec<Quote>, q: &QuotesQuery, ctx: &QuoteCtx) -> Vec<Quo
                 }
             }
             if exclude_outliers && ctx.is_outlier(quote) {
+                return false;
+            }
+            if healthy_only && !ctx.is_healthy(quote) {
                 return false;
             }
             if let Some(ref m) = q.model {
@@ -1550,6 +1698,7 @@ mod tests {
             store: Arc::new(Store::new()),
             stale_after: StdDuration::from_secs(600),
             polling: true,
+            poll_interval: StdDuration::from_secs(60),
             analytics: None,
         }
     }
@@ -1737,6 +1886,58 @@ mod tests {
         // Quality toggles can be switched off without dropping other filters.
         let off = q.qs(&[("exclude_stale", None)]);
         assert!(!off.contains("exclude_stale") && off.contains("kind=chat"));
+    }
+
+    #[test]
+    fn healthy_needs_a_current_reliable_fetch() {
+        let st = state();
+        let all = vec![
+            quote("m/good", "https://good", 1.0, 5, "chat"),
+            quote("m/down", "https://down", 1.0, 5, "chat"),
+            quote("m/flaky", "https://flaky", 1.0, 5, "chat"),
+            quote("m/old", "https://good", 1.0, 3600, "chat"),
+            quote("m/unpolled", "https://new", 1.0, 5, "chat"),
+        ];
+        for (ep, oks) in [("https://good", [true; 10]), ("https://down", [true; 10])] {
+            for ok in oks {
+                st.store.record_poll(ep, ok, Some(100));
+            }
+        }
+        for i in 0..10 {
+            st.store.record_poll("https://flaky", i % 2 == 0, Some(100));
+        }
+        st.store
+            .record_fetch("routstr", "good", "https://good", Ok(2));
+        st.store
+            .record_fetch("routstr", "flaky", "https://flaky", Ok(1));
+        st.store
+            .record_fetch("routstr", "down", "https://down", Err("dns error".into()));
+        let ctx = QuoteCtx::new(&st, &all, 3.0);
+        let flags: Vec<bool> = all.iter().map(|q| ctx.is_healthy(q)).collect();
+        assert_eq!(flags, [true, false, false, false, false]);
+        assert_eq!(enrich_json(&all[0], &ctx)["healthy"], true);
+
+        let kept = filter_quotes(all.clone(), &query("healthy=1"), &ctx);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(filter_quotes(all, &query("healthy=0"), &ctx).len(), 5);
+    }
+
+    #[test]
+    fn node_status_reflects_skip_and_fetch_streak() {
+        let store = Store::new();
+        assert_eq!(node_status(false, None), "pending");
+        assert_eq!(node_status(true, None), "skipped");
+        store.record_fetch("routstr", "n", "https://n", Err("x".into()));
+        let f = store.fetch_statuses().remove(0);
+        assert_eq!(node_status(false, Some(&f)), "failing");
+        for _ in 1..crate::store::DORMANT_AFTER_FAILURES {
+            store.record_fetch("routstr", "n", "https://n", Err("x".into()));
+        }
+        let f = store.fetch_statuses().remove(0);
+        assert_eq!(node_status(false, Some(&f)), "dormant");
+        store.record_fetch("routstr", "n", "https://n", Ok(1));
+        let f = store.fetch_statuses().remove(0);
+        assert_eq!(node_status(false, Some(&f)), "healthy");
     }
 
     #[test]

@@ -220,6 +220,7 @@ async fn run_serve(cfg: Config) -> Result<()> {
         store: Arc::clone(&store),
         stale_after: cfg.stale_after,
         polling: cfg.enable_poll,
+        poll_interval: cfg.poll_interval,
         analytics: cfg
             .plausible_script
             .as_deref()
