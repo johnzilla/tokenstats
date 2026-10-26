@@ -55,6 +55,8 @@ cargo run -- serve --bind 0.0.0.0:8080 --db ./tokenstats.db
 | **Best Now** | Cheapest blended price for popular families (Claude, Grok, DeepSeek, GPT, Gemini, …). Shows **node under the price**. |
 | **Blend ratio** | Toggle 1:2 / 1:3 / 1:4 in:out workload (`?ratio=3`). |
 | **Presets** | Cheapest Frontier · Fastest · Most Private · Local-first |
+| **Feed strip** | Feed status + reasons, last cycle, per-source health, Routstr nodes OK, stale count, BTC rate age |
+| **Signals** | Per-quote 24h reliability, p50 latency, age (stale highlighted), outlier tag; **Quality** pills hide stale / outliers |
 | **Δ out** | Price change vs previous catalog snapshot |
 | **Hover → copy** | **curl** or OpenAI-compatible **config** JSON for that quote |
 | **Export CSV** | Current filtered view → `/export.csv?...` |

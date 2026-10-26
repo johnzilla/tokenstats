@@ -97,6 +97,8 @@ impl QuotesQuery {
         let mut model = self.model.as_deref();
         let mut preset = self.preset.as_deref();
         let mut ratio = self.ratio.map(|r| format!("{r}"));
+        let mut exclude_stale = self.exclude_stale.as_deref();
+        let mut exclude_outliers = self.exclude_outliers.as_deref();
 
         for (k, v) in overrides {
             match *k {
@@ -104,6 +106,8 @@ impl QuotesQuery {
                 "model" => model = *v,
                 "preset" => preset = *v,
                 "ratio" => ratio = v.map(|s| s.to_string()),
+                "exclude_stale" => exclude_stale = *v,
+                "exclude_outliers" => exclude_outliers = *v,
                 "clear" if *v == Some("1") => {
                     source = None;
                     model = None;
@@ -127,8 +131,8 @@ impl QuotesQuery {
         set("min_reliability_24h", min_rel_24h.as_deref());
         set("max_latency_ms", max_lat.as_deref());
         set("kind", self.kind.as_deref());
-        set("exclude_stale", self.exclude_stale.as_deref());
-        set("exclude_outliers", self.exclude_outliers.as_deref());
+        set("exclude_stale", exclude_stale);
+        set("exclude_outliers", exclude_outliers);
 
         if pairs.is_empty() {
             return String::new();
@@ -411,6 +415,7 @@ pub async fn dashboard(
     let btc = state.store.btc_usd();
     let page_generated = Utc::now();
     let last_data = freshest_ts(&all);
+    let ctx = QuoteCtx::new(&state, &all, ratio);
 
     let best = best_now(&all, ratio);
     let best_rows: String = if best.is_empty() {
@@ -425,7 +430,7 @@ pub async fn dashboard(
                       <td><span class="family">{family}</span></td>
                       <td>
                         <strong class="model-id">{model}</strong>
-                        <div class="sub muted">updated {updated}</div>
+                        <div class="sub muted" title="{at_full}">updated {age} ago{stale}</div>
                       </td>
                       <td>
                         <div class="num stack-price">{blend}</div>
@@ -439,7 +444,13 @@ pub async fn dashboard(
                     attrs = quote_data_attrs(b.quote),
                     family = esc(b.family),
                     model = esc(&b.quote.model),
-                    updated = b.quote.observed_at.format("%H:%M:%S UTC"),
+                    at_full = b.quote.observed_at.to_rfc3339(),
+                    age = fmt_age(ctx.age_secs(b.quote)),
+                    stale = if ctx.is_stale(b.quote) {
+                        r#" <span class="tag tag-stale">stale</span>"#
+                    } else {
+                        ""
+                    },
                     blend = fmt_usd(Some(b.blended_usd)),
                     node = esc(&node_label),
                     io_in = fmt_usd(b.quote.price_in_usd),
@@ -452,7 +463,6 @@ pub async fn dashboard(
             .collect()
     };
 
-    let ctx = QuoteCtx::new(&state, &all, ratio);
     let mut filtered = resolve_view(all.clone(), &q, &ctx);
     let total_filtered = filtered.len();
     filtered.truncate(150);
@@ -463,11 +473,11 @@ pub async fn dashboard(
     }
 
     let rows: String = if filtered.is_empty() {
-        r#"<tr><td colspan="11" class="empty">No quotes match this filter…</td></tr>"#.into()
+        r#"<tr><td colspan="13" class="empty">No quotes match this filter…</td></tr>"#.into()
     } else {
         filtered
             .iter()
-            .map(|quote| quote_row(quote, ratio))
+            .map(|quote| quote_row(quote, &ctx))
             .collect()
     };
 
@@ -591,17 +601,34 @@ pub async fn dashboard(
     };
     let page_label = format!("page {}", page_generated.format("%H:%M:%S UTC"));
     let feed = feed_status(&state, &all);
-    let feed_label = format!("feed {}", feed["status"].as_str().unwrap_or("unknown"));
-    let feed_title = feed["reasons"]
-        .as_array()
-        .map(|r| {
-            r.iter()
-                .filter_map(|v| v.as_str())
-                .collect::<Vec<_>>()
-                .join("; ")
-        })
-        .filter(|r| !r.is_empty())
-        .unwrap_or_else(|| "Feed health (see /health)".into());
+    let feed_strip = feed_strip_html(&feed, btc_age_secs(&state));
+
+    let outliers = all.iter().filter(|x| ctx.is_outlier(x)).count();
+    let quality_pills: String = [
+        (
+            "exclude_stale",
+            "hide stale",
+            feed["stale_quotes"].as_u64().unwrap_or(0) as usize,
+        ),
+        ("exclude_outliers", "hide outliers", outliers),
+    ]
+    .iter()
+    .map(|(key, label, n)| {
+        let on = truthy(match *key {
+            "exclude_stale" => q.exclude_stale.as_deref(),
+            _ => q.exclude_outliers.as_deref(),
+        });
+        let cls = if on { "pill active" } else { "pill" };
+        let href = q.qs(&[(key, if on { None } else { Some("1") })]);
+        let href = if href.is_empty() {
+            "/".into()
+        } else {
+            esc_attr(&href)
+        };
+        format!(r#"<a class="{cls}" href="{href}">{label} <span>{n}</span></a>"#)
+    })
+    .collect::<Vec<_>>()
+    .join("");
 
     let filter_note = format!(
         " · {shown}/{total} · blend 1:{r:.0}",
@@ -751,6 +778,26 @@ pub async fn dashboard(
       position: relative; z-index: 1; width: 100%; text-align: center;
       font-size: 0.68rem; color: var(--text);
     }}
+    .rel-txt {{ font-variant-numeric: tabular-nums; }}
+    .rel-txt.rel-good {{ color: var(--accent); }}
+    .rel-txt.rel-mid {{ color: var(--warn); }}
+    .rel-txt.rel-bad {{ color: var(--up); }}
+    .tag {{
+      display: inline-block; padding: 0 0.3rem; border-radius: 4px;
+      font-size: 0.65rem; border: 1px solid currentColor; font-weight: 400;
+    }}
+    .tag-stale {{ color: var(--warn); }}
+    .tag-outlier {{ color: var(--up); }}
+    .feed {{
+      margin: -0.25rem 0 0.75rem; padding: 0.45rem 0.7rem;
+      background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+      color: var(--muted); font-size: 0.75rem; line-height: 1.6;
+    }}
+    .feed-status {{ font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }}
+    .feed-ok {{ color: var(--accent); }}
+    .feed-degraded, .feed-starting, .feed-offline {{ color: var(--warn); }}
+    .feed-down {{ color: var(--up); }}
+    .feed-reasons {{ color: var(--warn); }}
     .actions-cell {{ position: relative; min-width: 4.5rem; white-space: nowrap; }}
     .row-actions {{
       display: none; gap: 0.3rem; flex-wrap: wrap;
@@ -788,7 +835,6 @@ pub async fn dashboard(
     <span class="badge">LIVE</span>
     <span class="meta">{quotes} quotes · {nodes} nodes · {btc}{filter_note}</span>
     <span class="meta" title="Freshest quote observation vs page render">{last_label} · {page_label}</span>
-    <span class="meta" title="{feed_title}">{feed_label}</span>
     <span class="meta links">
       <a href="{csv_href}">Export CSV</a>
       <a href="/api/summary">/api/summary</a>
@@ -796,6 +842,7 @@ pub async fn dashboard(
       <a href="/health">/health</a>
     </span>
   </header>
+  {feed_strip}
 
   <div class="pills">
     <span class="label">Source</span>
@@ -810,6 +857,10 @@ pub async fn dashboard(
     <span class="label">Blend</span>
     {ratio_pills}
     <span class="meta">in:out workload for blended $/M</span>
+  </div>
+  <div class="pills">
+    <span class="label">Quality</span>
+    {quality_pills}
   </div>
 
   <h2>
@@ -851,7 +902,9 @@ pub async fn dashboard(
         <th>In sats</th>
         <th>Out sats</th>
         <th>Ctx</th>
-        <th>Updated</th>
+        <th title="Endpoint catalog-fetch success, 24h (hover for 1h / 7d)">Rel 24h</th>
+        <th title="Endpoint response time, 24h p50 (hover for p95)">Latency</th>
+        <th title="Time since the catalog last listed this quote">Age</th>
       </tr>
     </thead>
     <tbody>
@@ -878,7 +931,7 @@ pub async fn dashboard(
   </table>
 
   <footer>
-    Sovereign inference market observability · OpenRouter + Routstr · MPL-2.0
+    Sovereign inference market observability · OpenRouter + OrcaRouter + Routstr · MPL-2.0
     · auto-refresh 15s · last data {last_label}
   </footer>
   <div id="toast" class="toast" role="status"></div>
@@ -898,8 +951,8 @@ pub async fn dashboard(
             ),
             None => String::new(),
         },
-        feed_label = esc(&feed_label),
-        feed_title = esc_attr(&feed_title),
+        feed_strip = feed_strip,
+        quality_pills = quality_pills,
         page_label = page_label,
         all_active = all_active,
         all_href = if all_href.is_empty() {
@@ -920,9 +973,44 @@ pub async fn dashboard(
     ([(header::CACHE_CONTROL, "no-store")], Html(html))
 }
 
-fn quote_row(q: &Quote, ratio: f64) -> String {
-    let blend = blended_usd(q.price_in_usd, q.price_out_usd, ratio);
+fn quote_row(q: &Quote, ctx: &QuoteCtx) -> String {
+    let blend = blended_usd(q.price_in_usd, q.price_out_usd, ctx.ratio);
     let d = delta_pct(q.price_out_usd, q.prev_price_out_usd);
+    let st = ctx.stats(q);
+    // 24h is what routing trusts; fall back to 1h right after a restart.
+    let rel = st.and_then(|s| s.reliability_24h.or(s.reliability_1h));
+    let rel_cls = match rel {
+        Some(r) if r >= 0.9 => "rel-txt rel-good",
+        Some(r) if r >= 0.6 => "rel-txt rel-mid",
+        Some(_) => "rel-txt rel-bad",
+        None => "rel-txt muted",
+    };
+    let rel_title = format!(
+        "endpoint catalog-fetch success · 1h {} · 24h {} · 7d {}",
+        fmt_pct(st.and_then(|s| s.reliability_1h)),
+        fmt_pct(st.and_then(|s| s.reliability_24h)),
+        fmt_pct(st.and_then(|s| s.reliability_7d)),
+    );
+    let (lat, lat_title) = match st.and_then(|s| s.latency_p50_ms.zip(s.latency_p95_ms)) {
+        Some((p50, p95)) => (
+            format!("≤{p50} ms"),
+            format!(
+                "24h p50 ≤{p50} · p95 ≤{p95} ms ({})",
+                st.and_then(|s| s.latency_source).unwrap_or("catalog")
+            ),
+        ),
+        None => ("—".into(), "no latency samples yet".into()),
+    };
+    let age_cls = if ctx.is_stale(q) {
+        "tag tag-stale"
+    } else {
+        "muted"
+    };
+    let outlier = if ctx.is_outlier(q) {
+        r#" <span class="tag tag-outlier" title="&gt;10× off the median for this model">outlier</span>"#
+    } else {
+        ""
+    };
     format!(
         r#"<tr class="quote-row" {attrs}>
           <td><span class="src src-{source}">{source}</span></td>
@@ -936,12 +1024,14 @@ fn quote_row(q: &Quote, ratio: f64) -> String {
           </td>
           <td class="num">{pin_usd}</td>
           <td class="num">{pout_usd}</td>
-          <td class="blend">{blend}</td>
+          <td class="blend">{blend}{outlier}</td>
           <td>{delta}</td>
           <td class="num-sats">{pin_sats}</td>
           <td class="num-sats">{pout_sats}</td>
           <td class="muted">{ctx}</td>
-          <td class="muted" title="{at_full}">{at}</td>
+          <td><span class="{rel_cls}" title="{rel_title}">{rel}</span></td>
+          <td class="muted" title="{lat_title}">{lat}</td>
+          <td title="observed {at_full}"><span class="{age_cls}">{age}</span></td>
         </tr>"#,
         attrs = quote_data_attrs(q),
         source = esc(&q.source),
@@ -956,8 +1046,93 @@ fn quote_row(q: &Quote, ratio: f64) -> String {
         pin_sats = fmt_sats(q.price_in_sats),
         pout_sats = fmt_sats(q.price_out_sats),
         ctx = fmt_ctx(q.context_length),
-        at = q.observed_at.format("%H:%M:%S"),
+        rel = fmt_pct(rel),
+        rel_cls = rel_cls,
+        rel_title = esc_attr(&rel_title),
+        lat = lat,
+        lat_title = esc_attr(&lat_title),
+        age_cls = age_cls,
+        age = fmt_age(ctx.age_secs(q)),
+        outlier = outlier,
         at_full = q.observed_at.to_rfc3339(),
+    )
+}
+
+/// Compact age: `42s`, `7m`, `3h`, `2d`.
+fn fmt_age(secs: i64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
+}
+
+/// One-line feed health under the header, from the `/health` `feed` object.
+fn feed_strip_html(feed: &serde_json::Value, btc_age: Option<i64>) -> String {
+    let status = feed["status"].as_str().unwrap_or("unknown");
+    let mut parts: Vec<String> = vec![format!(
+        r#"<span class="feed-status feed-{s}">feed {s}</span>"#,
+        s = esc(status)
+    )];
+    let now = Utc::now();
+    let cycle = &feed["last_cycle"];
+    if let Some(at) = cycle["finished_at"]
+        .as_str()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+    {
+        let ago = (now - at.with_timezone(&Utc)).num_seconds().max(0);
+        let took = cycle["elapsed_ms"].as_u64().unwrap_or(0) as f64 / 1000.0;
+        parts.push(format!("last cycle {} ago ({took:.1}s)", fmt_age(ago)));
+    }
+    if let Some(sources) = feed["sources"].as_object() {
+        for (name, s) in sources {
+            let endpoints = s["endpoints"].as_u64().unwrap_or(0);
+            let healthy = s["healthy"].as_u64().unwrap_or(0);
+            let text = if name == "routstr" {
+                format!("routstr {healthy}/{endpoints} nodes OK")
+            } else {
+                let mark = if healthy == endpoints && endpoints > 0 {
+                    "✓"
+                } else {
+                    "✗"
+                };
+                format!("{} {mark} {}", esc(name), s["models"].as_u64().unwrap_or(0))
+            };
+            let title = s["last_error"]
+                .as_str()
+                .map(|e| format!(" title=\"last error: {}\"", esc_attr(e)))
+                .unwrap_or_default();
+            parts.push(format!("<span{title}>{text}</span>"));
+        }
+    }
+    parts.push(format!(
+        "{} stale quotes",
+        feed["stale_quotes"].as_u64().unwrap_or(0)
+    ));
+    if let Some(age) = btc_age {
+        parts.push(format!("BTC rate {} old", fmt_age(age)));
+    }
+    if let Some(lag) = feed["discovery"]["lag_secs"].as_i64() {
+        parts.push(format!("last announcement {} ago", fmt_age(lag)));
+    }
+    let reasons = feed["reasons"]
+        .as_array()
+        .map(|r| {
+            r.iter()
+                .filter_map(|v| v.as_str())
+                .map(esc)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let reasons = if reasons.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<div class="feed-reasons">{}</div>"#, reasons.join(" · "))
+    };
+    format!(
+        r#"<div class="feed">{} <a href="/health">/health</a>{reasons}</div>"#,
+        parts.join(" · ")
     )
 }
 
@@ -1559,5 +1734,60 @@ mod tests {
         assert!(qs.contains("kind=chat"));
         assert!(qs.contains("exclude_stale=1"));
         assert!(qs.contains("min_reliability=0.5"));
+        // Quality toggles can be switched off without dropping other filters.
+        let off = q.qs(&[("exclude_stale", None)]);
+        assert!(!off.contains("exclude_stale") && off.contains("kind=chat"));
+    }
+
+    #[test]
+    fn fmt_age_picks_one_unit() {
+        assert_eq!(fmt_age(42), "42s");
+        assert_eq!(fmt_age(7 * 60 + 5), "7m");
+        assert_eq!(fmt_age(3 * 3600), "3h");
+        assert_eq!(fmt_age(2 * 86_400 + 1), "2d");
+    }
+
+    #[test]
+    fn feed_strip_summarizes_and_escapes() {
+        let feed = serde_json::json!({
+            "status": "degraded",
+            "reasons": ["<b>no Routstr node is answering</b>"],
+            "stale_quotes": 3,
+            "last_cycle": {"finished_at": Utc::now().to_rfc3339(), "elapsed_ms": 1500},
+            "sources": {
+                "openrouter": {"endpoints": 1, "healthy": 1, "models": 400, "last_error": null},
+                "routstr": {"endpoints": 4, "healthy": 1, "models": 9, "last_error": "x\"><script>"},
+            },
+            "discovery": {"lag_secs": 90},
+        });
+        let html = feed_strip_html(&feed, Some(30));
+        assert!(html.contains("feed degraded"));
+        assert!(html.contains("(1.5s)"));
+        assert!(html.contains("openrouter ✓ 400"));
+        assert!(html.contains("routstr 1/4 nodes OK"));
+        assert!(html.contains("3 stale quotes"));
+        assert!(html.contains("BTC rate 30s old"));
+        assert!(html.contains("last announcement 1m ago"));
+        assert!(!html.contains("<b>") && !html.contains("\"><script>"));
+    }
+
+    #[tokio::test]
+    async fn board_shows_reliability_latency_and_age() {
+        let st = state();
+        st.store.upsert_quotes([
+            quote("m/fresh", "https://a", 1.0, 5, "chat"),
+            quote("m/old", "https://b", 2.0, 3600, "chat"),
+        ]);
+        st.store.record_poll("https://a", true, Some(120));
+        let resp = dashboard(State(st), Query(query(""))).await.into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("Rel 24h") && html.contains(">Latency<") && html.contains(">Age<"));
+        assert!(html.contains(r#"<span class="rel-txt rel-good""#));
+        assert!(html.contains(r#"<span class="tag tag-stale">1h</span>"#));
+        assert!(html.contains("hide stale <span>1</span>"));
+        assert!(html.contains(r#"class="feed""#));
     }
 }
