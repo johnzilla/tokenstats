@@ -116,7 +116,7 @@ Every response carries `X-Content-Type-Options: nosniff` and a `Content-Security
 
 ### Feed health
 
-`/health` and `/api/summary` include `status` (`ok` · `degraded` · `down` · `starting` · `offline`) and a `feed` object: `reasons`, `stale_quotes`, `last_cycle` (nodes ok/failed, delisted, expired, elapsed), per-source `endpoints`/`healthy`/`failing`/`models`/`last_success_at`/`last_error`, and Nostr `discovery.lag_secs`. Many dead Routstr nodes alone does not degrade the feed; zero healthy nodes does. The dashboard header shows `feed <status>` (hover for reasons).
+`/health` and `/api/summary` include `status` (`ok` · `degraded` · `down` · `starting` · `offline`) and a `feed` object: `reasons`, `stale_quotes`, `last_cycle` (nodes ok/failed, delisted, expired, elapsed), per-source `endpoints`/`healthy`/`failing`/`models`/`last_success_at`/`last_error`, and Nostr `discovery.lag_secs`. Many dead Routstr nodes alone does not degrade the feed; zero healthy nodes does. The dashboard shows a feed strip under the header (see [Feed strip and quality signals](#feed-strip-and-quality-signals)).
 
 ### Ephemeral / CI smoke
 
@@ -141,6 +141,12 @@ Restores quotes/nodes from SQLite; no network polling.
 Shows the cheapest **blended** quote for each popular family (Claude Sonnet, Grok, DeepSeek, etc.). Under the price: **provider · host** for the winning node/catalog.
 
 Flagship variants are preferred over mini/nano/lite when available.
+
+### Feed strip and quality signals
+
+Under the header, a one-line strip mirrors `/health` `feed`: status (with reasons when not `ok`), last poll cycle age and duration, each reference catalog (✓ + model count; hover a source for its last error), Routstr nodes OK / total, stale quote count, BTC rate age and Nostr announcement lag.
+
+The price board shows the API's per-quote signals: **Rel 24h** (endpoint catalog-fetch success; 1h right after a restart; hover for 1h / 24h / 7d), **Latency** (24h p50, hover for p95 and whether it comes from the `/v1/info` probe or the catalog fetch), **Age** (highlighted when stale), and an **outlier** tag on the blend. The **Quality** pills toggle `exclude_stale` / `exclude_outliers`; like the other filters they carry into links and CSV export.
 
 ### Blended cost
 
