@@ -1,0 +1,40 @@
+# Weekly version-update PRs (security updates arrive regardless).
+# CI (fmt, clippy, tests, MSRV 1.86 check, Docker build) gates every one.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for everything semver-compatible. 0.x crates (axum,
+      # tower-http, rusqlite, …) can still break on a "minor" bump; CI says so.
+      cargo:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    ignore:
+      # Upgrades only as an explicit task (AGENTS.md: no alpha pins).
+      - dependency-name: nostr-sdk
+      - dependency-name: "*"
+        update-types: [version-update:semver-major]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    ignore:
+      # Toolchain refs are versions on purpose: the msrv job pins 1.86
+      # alongside Cargo.toml and the Dockerfile.
+      - dependency-name: dtolnay/rust-toolchain
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      # The builder image is the MSRV; it moves with Cargo.toml rust-version.
+      - dependency-name: rust
