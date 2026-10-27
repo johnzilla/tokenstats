@@ -191,6 +191,49 @@ pub fn delta_pct(current: Option<f64>, previous: Option<f64>) -> Option<f64> {
     }
 }
 
+/// Cross-catalog key for "the same model": the `vendor/` prefix dropped,
+/// lowercased, `.` / `_` / spaces as `-`, and a trailing release date
+/// (`-20250929`, `-2025-09-29`) stripped, so OpenRouter's
+/// `anthropic/claude-sonnet-4.5` and a Routstr node's
+/// `claude-sonnet-4-5-20250929` share `claude-sonnet-4-5`. A `:variant`
+/// suffix (`:free`, `:batch`, `:8b`, …) is kept: it prices differently.
+pub fn canonical_model(id: &str) -> String {
+    let id = id.trim().to_ascii_lowercase();
+    let (base, variant) = match id.split_once(':') {
+        Some((b, v)) => (b, Some(v)),
+        None => (id.as_str(), None),
+    };
+    let base = base.rsplit('/').find(|s| !s.is_empty()).unwrap_or(base);
+    let dashed: String = base
+        .chars()
+        .map(|c| if matches!(c, '.' | '_' | ' ') { '-' } else { c })
+        .collect();
+    let key = strip_release_date(&dashed);
+    match variant.filter(|v| !v.is_empty()) {
+        Some(v) => format!("{key}:{v}"),
+        None => key.to_string(),
+    }
+}
+
+/// `-YYYYMMDD` or `-YYYY-MM-DD` (20xx) at the end of a model key.
+fn strip_release_date(key: &str) -> &str {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let is_year = |s: &str| s.len() == 4 && s.starts_with("20") && digits(s);
+    if let Some((head, tail)) = key.rsplit_once('-') {
+        if tail.len() == 8 && is_year(&tail[..4]) && digits(tail) && !head.is_empty() {
+            return head;
+        }
+    }
+    let parts: Vec<&str> = key.rsplitn(4, '-').collect();
+    if let [d, m, y, head] = parts[..] {
+        if d.len() == 2 && m.len() == 2 && digits(d) && digits(m) && is_year(y) && !head.is_empty()
+        {
+            return head;
+        }
+    }
+    key
+}
+
 pub fn matches_family(model: &str, family: &PopularFamily) -> bool {
     let m = model.to_ascii_lowercase();
     family
@@ -421,6 +464,29 @@ fn privacy_rank(q: &Quote, signals: &Signals) -> u8 {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn canonical_model_joins_catalog_spellings() {
+        for id in [
+            "anthropic/claude-sonnet-4.5",
+            "claude-sonnet-4-5",
+            "Claude-Sonnet-4-5-20250929",
+            "claude_sonnet_4.5-2025-09-29",
+            "openrouter/anthropic/claude-sonnet-4.5",
+        ] {
+            assert_eq!(canonical_model(id), "claude-sonnet-4-5", "{id}");
+        }
+        assert_eq!(
+            canonical_model("meta-llama/llama-3.3-70b-instruct:free"),
+            "llama-3-3-70b-instruct:free"
+        );
+        assert_eq!(canonical_model("llama3:8b"), "llama3:8b");
+        // Not a date: version numbers and short numeric tails stay.
+        assert_eq!(canonical_model("gpt-4o-2024"), "gpt-4o-2024");
+        assert_eq!(canonical_model("qwen-72b-12345678"), "qwen-72b-12345678");
+        assert_eq!(canonical_model("20250929"), "20250929");
+        assert_eq!(canonical_model("vendor/"), "vendor");
+    }
 
     fn q(model: &str, pin: f64, pout: f64) -> Quote {
         Quote {

@@ -64,7 +64,7 @@ Centralized in `src/config.rs`. Prefer adding new knobs there (CLI + `TOKENSTATS
 - Export path: `/export.csv` must honor the same filters as the board.
 - Escape all user/network-derived strings in HTML (`esc` / `esc_attr`).
 - Hrefs built from query params go through `percent_encode` (unreserved chars only) **and** `esc_attr`. A reflected-XSS regression test guards this.
-- No inline `<script>`: the app sends a strict `Content-Security-Policy` (`src/web/mod.rs`). Put dashboard JS in `src/web/static/` and serve it from `/static/`. Third-party scripts only via config (`--plausible-script`), which adds just that origin to the CSP.
+- No inline `<script>`: the app sends a strict `Content-Security-Policy` (`src/web/mod.rs`). Put dashboard JS in `src/web/static/` and serve it from `/static/`. Shared page CSS lives in `src/web/static/app.css` and is inlined into each page's `<style>` (inline styles are allowed). Third-party scripts only via config (`--plausible-script`), which adds just that origin to the CSP.
 
 ### Persistence
 
@@ -99,6 +99,7 @@ Related helpers (not substitutes for the full board):
 |----------|----------|
 | `GET /api/quotes` | **Main integration** — full filtered quote list |
 | `GET /api/summary` | Compact Best Now strip + counts + `btc_usd` + feed `status`/`feed` |
+| `GET /api/compare` | One model across sources. JSON array of groups keyed by `canonical_model` (`model` = substring of that key; same quality filters + `ratio`; `preset` ignored; `limit` = groups, default 50, max 1000). Exact match first, then most sources. Each group: `canonical_model`, `models` (ids as published), `sources`, `offers`, `blend_ratio`, `min/median/max_blended_usd`, `spread_pct` (null under 2 offers), `cheapest`, `cheapest_healthy` (quote objects or null), `quotes` (cheapest first, each with `vs_cheapest_pct`). Min / spread / cheapest skip outliers. HTML: `/compare` |
 | `GET /api/nodes` | Discovered Routstr endpoints + reliability (`reliability_1h/24h/7d`, `polls_24h`) + `latency_p50_ms/p95_ms`/`latency_source` + `identity_verified` + `probe` (`probed_at`, `ok`, `error`) + `info` (self-reported `/v1/info`: `name`, `version`, `npub`, `mints`, `onion_url`) + `last_success_at` / `last_error` / `consecutive_failures` + `skip_reason` (string \| null) when the SSRF guard refused to poll + `status` (`healthy` \| `failing` \| `dormant` \| `skipped` \| `pending`) + `failure_class` (`dns` \| `timeout` \| `tls` \| `connect` \| `http_4xx` \| `http_5xx` \| `parse` \| `ssrf_skip` \| `other` \| null) + `next_poll_at` (dormant nodes only) |
 | `GET /health` | Liveness + feed `status` / `feed` object / quote count / `btc_usd` + `btc_usd_at` / `btc_usd_age_secs` / `last_updated` |
 | `GET /export.csv` | Same filters as quotes, for offline analysis |
@@ -154,6 +155,7 @@ Empty store / no matches → `[]`.
 | `provider` | string | Human-readable provider / node name |
 | `provider_id` | string | Stable id (e.g. `openrouter`, Routstr `d` tag, seed id) |
 | `model` | string | Model id as published by the catalog |
+| `canonical_model` | string | Cross-catalog key for the same model: vendor prefix dropped, lowercased, `.`/`_`/spaces → `-`, trailing release date (`-YYYYMMDD`, `-YYYY-MM-DD`) stripped; `:variant` kept (`anthropic/claude-sonnet-4.5` → `claude-sonnet-4-5`). Join key for `/api/compare` |
 | `price_in_usd` | number \| null | USD per **1M input** tokens |
 | `price_out_usd` | number \| null | USD per **1M output** tokens |
 | `price_in_sats` | number \| null | Sats per 1M input (null until BTC rate known) |
@@ -178,7 +180,7 @@ Empty store / no matches → `[]`.
 | `latency_source` | string \| null | `probe` \| `catalog` \| null (no samples) |
 | `identity_verified` | bool \| null | Node's `/v1/info` `npub` matches the Nostr key that announced it. `false` = mismatch or unparsable npub; null = nothing to compare (reference catalogs, `--node` seeds, not probed since restart) |
 | `onion` | string \| null | Node's onion address, from the announcement or `/v1/info` |
-| `outlier` | bool | Blend is >10× above or below the median for the same model id across ≥3 quotes. Low outliers often mean a unit bug on the node. Computed with the request's `ratio`, so the flag can change with `ratio` |
+| `outlier` | bool | Blend is >10× above or below the median for the same `canonical_model` across ≥3 quotes (all sources). Low outliers often mean a unit bug on the node. Computed with the request's `ratio`, so the flag can change with `ratio` |
 | `healthy` | bool | Routable now: the endpoint's last catalog fetch succeeded, its 24h success rate (1h right after a restart) is ≥ 0.9, its `/v1/info` probe isn't failing, and the quote isn't stale. Always `false` without current poll evidence (e.g. `--no-poll` snapshots) |
 
 #### Example
@@ -274,8 +276,10 @@ catalog model row
 1. GET /health          → wait for status "ok" (or "degraded" + acceptable reasons)
 2. GET /api/quotes?kind=chat&exclude_outliers=1&healthy=1
                         → select candidates by blended_usd / source / model
-3. Optionally GET /api/nodes for reliability before routing to a Routstr endpoint
-4. Re-poll /api/quotes on an interval aligned with TOKENSTATS_POLL_INTERVAL_SECS (default 60s)
+3. Optionally GET /api/compare?model=<id>&healthy=1 to pick the cheapest offer of one model
+   across catalog spellings (cheapest_healthy / spread_pct)
+4. Optionally GET /api/nodes for reliability before routing to a Routstr endpoint
+5. Re-poll /api/quotes on an interval aligned with TOKENSTATS_POLL_INTERVAL_SECS (default 60s)
 ```
 
 ## Commands agents should use
@@ -307,7 +311,6 @@ docker compose up -d --build
 - Price history charts / multi-sample deltas beyond last snapshot
 - True inference latency / TTFT (needs paid completions; out of scope under "observe, don't pay")
 - Signed oracle publish of Best Now
-- Model compare (same model across OpenRouter vs Routstr nodes)
 - Stale TTL for nodes (quotes expire via `--quote-ttl-secs`)
 
 ## Docs to keep in sync

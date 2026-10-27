@@ -90,6 +90,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/quotes", get(handlers::api_quotes))
         .route("/api/nodes", get(handlers::api_nodes))
         .route("/api/summary", get(handlers::api_summary))
+        .route("/api/compare", get(handlers::api_compare))
+        .route("/compare", get(handlers::compare_page))
         .route("/health", get(handlers::health))
         .route("/static/app.js", get(handlers::app_js))
         .route(
@@ -155,7 +157,15 @@ mod tests {
 
     #[tokio::test]
     async fn every_response_gets_csp_and_nosniff() {
-        for path in ["/", "/health", "/api/quotes", "/static/app.js", "/nope"] {
+        for path in [
+            "/",
+            "/compare",
+            "/health",
+            "/api/quotes",
+            "/api/compare",
+            "/static/app.js",
+            "/nope",
+        ] {
             let resp = get(state(None), path).await;
             let h = resp.headers();
             assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{path}");
@@ -165,13 +175,15 @@ mod tests {
 
     #[tokio::test]
     async fn dashboard_has_no_inline_script_and_analytics_is_opt_in() {
-        let html = body(get(state(None), "/").await).await;
-        assert!(html.contains(r#"<script src="/static/app.js"></script>"#));
-        assert!(
-            !html.contains("<script>"),
-            "inline script would violate CSP"
-        );
-        assert!(!html.contains("plausible"));
+        for path in ["/", "/compare"] {
+            let html = body(get(state(None), path).await).await;
+            assert!(html.contains(r#"<script src="/static/app.js"></script>"#));
+            assert!(
+                !html.contains("<script>"),
+                "inline script would violate CSP on {path}"
+            );
+            assert!(!html.contains("plausible"));
+        }
         assert_eq!(
             get(state(None), "/static/plausible-init.js").await.status(),
             404
