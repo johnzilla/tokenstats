@@ -6,6 +6,7 @@ use serde_json::Value;
 use crate::pricing::{
     normalize_catalog_prices, sanitize_price, ExplicitPerMillion, NormalizedPrices,
 };
+use crate::store::Capabilities;
 
 /// One model entry after loose JSON parsing.
 #[derive(Debug, Clone)]
@@ -18,6 +19,7 @@ pub struct CatalogModel {
     pub context_length: Option<u64>,
     /// See [`model_kind`].
     pub kind: String,
+    pub caps: Capabilities,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,9 +143,55 @@ fn parse_one(v: &Value) -> Option<CatalogModel> {
         id,
         name: row.name,
         prices,
-        context_length: row.context_length,
+        context_length: row.context_length.or_else(|| {
+            v.pointer("/top_provider/context_length")
+                .and_then(Value::as_u64)
+                .filter(|n| *n > 0)
+        }),
         kind,
+        caps: parse_capabilities(v),
     })
+}
+
+/// Capability flags from OpenRouter-style metadata, read from the raw row so
+/// an odd shape can never drop the model. A flag is `None` when the catalog
+/// publishes nothing to decide it (no or empty `supported_parameters`, no
+/// `input_modalities`).
+pub fn parse_capabilities(v: &Value) -> Capabilities {
+    let params: Option<Vec<&str>> = v
+        .get("supported_parameters")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .filter(|p: &Vec<&str>| !p.is_empty());
+    let has = |names: &[&str]| params.as_ref().map(|p| p.iter().any(|x| names.contains(x)));
+    let input_modalities: Vec<String> = v
+        .pointer("/architecture/input_modalities")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_ascii_lowercase)
+                .collect()
+        })
+        .unwrap_or_default();
+    // OpenRouter also publishes a `reasoning` object for thinking models.
+    let reasoning = match has(&["reasoning", "include_reasoning", "reasoning_effort"]) {
+        Some(true) => Some(true),
+        _ if v.get("reasoning").is_some_and(Value::is_object) => Some(true),
+        other => other,
+    };
+    Capabilities {
+        tools: has(&["tools", "tool_choice"]),
+        reasoning,
+        vision: (!input_modalities.is_empty())
+            .then(|| input_modalities.iter().any(|m| m == "image")),
+        input_modalities,
+        max_output_tokens: v
+            .pointer("/top_provider/max_completion_tokens")
+            .or_else(|| v.get("max_completion_tokens"))
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0),
+    }
 }
 
 /// Classify a model by what it outputs. Uses OpenRouter-style
@@ -265,6 +313,55 @@ mod tests {
         assert_eq!(m[1].primary(), PricePrimary::Sats);
         // No explicit field: unchanged heuristic (per-token → per-1M).
         assert!((m[2].price_in_usd().unwrap() - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn capabilities_from_catalog_metadata() {
+        let body = json!({ "data": [
+            {
+                "id": "openai/gpt-x",
+                "supported_parameters": ["max_tokens", "tools", "tool_choice"],
+                "reasoning": { "mandatory": false },
+                "architecture": { "input_modalities": ["text", "Image"], "output_modalities": ["text"] },
+                "top_provider": { "context_length": 400000, "max_completion_tokens": 128000 }
+            },
+            {
+                "id": "plain",
+                "supported_parameters": ["max_tokens", "temperature"],
+                "architecture": { "input_modalities": ["text"] },
+                "context_length": 8192
+            },
+            // Routstr node shape: modalities, no supported_parameters.
+            { "id": "gpt-x", "architecture": { "input_modalities": ["text", "image"] } },
+            // Nothing published / odd shapes: unknown, row kept.
+            { "id": "empty", "supported_parameters": [] },
+            { "id": "odd", "supported_parameters": "tools", "architecture": { "input_modalities": null }, "top_provider": "x" }
+        ]});
+        let m = parse_models_payload(&body);
+        assert_eq!(m.len(), 5);
+        let c = &m[0].caps;
+        assert_eq!(
+            (c.tools, c.reasoning, c.vision),
+            (Some(true), Some(true), Some(true))
+        );
+        assert_eq!(c.input_modalities, ["text", "image"]);
+        assert_eq!(c.max_output_tokens, Some(128000));
+        assert_eq!(
+            m[0].context_length,
+            Some(400000),
+            "falls back to top_provider"
+        );
+        let c = &m[1].caps;
+        assert_eq!(
+            (c.tools, c.reasoning, c.vision),
+            (Some(false), Some(false), Some(false))
+        );
+        assert_eq!(m[1].context_length, Some(8192));
+        let c = &m[2].caps;
+        assert_eq!((c.tools, c.reasoning, c.vision), (None, None, Some(true)));
+        for row in &m[3..] {
+            assert_eq!(row.caps, Capabilities::default(), "{}", row.id);
+        }
     }
 
     #[test]

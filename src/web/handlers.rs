@@ -12,11 +12,11 @@ use super::feed::feed_status;
 use super::AppState;
 use crate::market::{
     apply_preset, best_now, blended_usd, canonical_model, delta_pct, EndpointSignals, Preset,
-    Signals, DEFAULT_BLEND_RATIO,
+    Signals, DEFAULT_BLEND_RATIO, REFERENCE_SOURCES,
 };
 use crate::pricing::{blend_sort_key, is_rankable_blend};
 use crate::store::{
-    normalize_endpoint, EndpointStats, FetchStatus, ProbeStatus, ProviderNode, Quote,
+    normalize_endpoint, Capabilities, EndpointStats, FetchStatus, ProbeStatus, ProviderNode, Quote,
 };
 
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -69,6 +69,9 @@ pub struct QuotesQuery {
     pub exclude_outliers: Option<String>,
     /// `1`/`true` keeps only quotes with `healthy: true`.
     pub healthy: Option<String>,
+    /// Required capabilities, comma-separated: tools | reasoning | vision.
+    /// A quote matches when each is `true` (published or inferred).
+    pub capabilities: Option<String>,
 }
 
 impl QuotesQuery {
@@ -104,6 +107,7 @@ impl QuotesQuery {
         let mut exclude_stale = self.exclude_stale.as_deref();
         let mut exclude_outliers = self.exclude_outliers.as_deref();
         let mut healthy = self.healthy.as_deref();
+        let mut capabilities = self.capabilities.as_deref();
 
         for (k, v) in overrides {
             match *k {
@@ -114,6 +118,7 @@ impl QuotesQuery {
                 "exclude_stale" => exclude_stale = *v,
                 "exclude_outliers" => exclude_outliers = *v,
                 "healthy" => healthy = *v,
+                "capabilities" => capabilities = *v,
                 "clear" if *v == Some("1") => {
                     source = None;
                     model = None;
@@ -140,6 +145,7 @@ impl QuotesQuery {
         set("exclude_stale", exclude_stale);
         set("exclude_outliers", exclude_outliers);
         set("healthy", healthy);
+        set("capabilities", capabilities);
 
         if pairs.is_empty() {
             return String::new();
@@ -523,13 +529,15 @@ pub async fn export_csv(State(state): State<AppState>, Query(q): Query<QuotesQue
         "source,provider,provider_id,model,price_in_usd,price_out_usd,blended_usd,blend_ratio,\
          price_in_sats,price_out_sats,delta_out_pct,endpoint,region,context_length,observed_at,\
          kind,age_secs,stale,reliability_1h,outlier,reliability_24h,reliability_7d,\
-         latency_p50_ms,latency_p95_ms,latency_source,identity_verified,healthy,canonical_model\n",
+         latency_p50_ms,latency_p95_ms,latency_source,identity_verified,healthy,canonical_model,\
+         tools,reasoning,vision,max_output_tokens,capabilities_inferred\n",
     );
     for quote in quotes.into_iter().take(limit) {
         let blend = blended_usd(quote.price_in_usd, quote.price_out_usd, ratio);
         let d = delta_pct(quote.price_out_usd, quote.prev_price_out_usd);
+        let (caps, inferred) = ctx.caps(&quote);
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             csv_cell(&quote.source),
             csv_cell(&quote.provider),
             csv_cell(&quote.provider_id),
@@ -565,6 +573,11 @@ pub async fn export_csv(State(state): State<AppState>, Query(q): Query<QuotesQue
                 .unwrap_or_default(),
             ctx.is_healthy(&quote),
             csv_cell(&canonical_model(&quote.model)),
+            opt_b(caps.tools),
+            opt_b(caps.reasoning),
+            opt_b(caps.vision),
+            opt_u(caps.max_output_tokens),
+            inferred.join(";"),
         ));
     }
 
@@ -851,6 +864,17 @@ pub async fn dashboard(
     .map(|(key, label, n, current)| toggle_pill(&q, "/", key, label, Some(*n), *current))
     .collect::<Vec<_>>()
     .join("");
+    let all_caps: Vec<Capabilities> = all.iter().map(|x| ctx.caps(x).0).collect();
+    let capability_pills: String = CAPABILITY_FLAGS
+        .iter()
+        .map(|flag| {
+            let n = all_caps
+                .iter()
+                .filter(|c| c.flag(flag) == Some(true))
+                .count();
+            capability_pill(&q, "/", flag, Some(n))
+        })
+        .collect();
 
     let filter_note = format!(
         " · {shown}/{total} · blend 1:{r:.0}",
@@ -920,6 +944,11 @@ pub async fn dashboard(
   <div class="pills">
     <span class="label">Quality</span>
     {quality_pills}
+  </div>
+  <div class="pills">
+    <span class="label">Capabilities</span>
+    {capability_pills}
+    <span class="meta">dashed = inferred from OpenRouter / OrcaRouter</span>
   </div>
 
   <h2>
@@ -1006,6 +1035,7 @@ pub async fn dashboard(
         analytics = analytics_tags(&state),
         feed_strip = feed_strip,
         quality_pills = quality_pills,
+        capability_pills = capability_pills,
         page_label = page_label,
         all_active = all_active,
         all_href = if all_href.is_empty() {
@@ -1071,6 +1101,7 @@ pub async fn compare_page(
         ("healthy", q.healthy.clone()),
         ("exclude_stale", q.exclude_stale.clone()),
         ("exclude_outliers", q.exclude_outliers.clone()),
+        ("capabilities", q.capabilities.clone()),
     ]
     .into_iter()
     .filter_map(|(k, v)| v.filter(|v| !v.is_empty()).map(|v| (k, v)))
@@ -1108,6 +1139,10 @@ pub async fn compare_page(
     .iter()
     .map(|(key, label, current)| toggle_pill(&q, "/compare", key, label, None, *current))
     .collect();
+    let capability_pills: String = CAPABILITY_FLAGS
+        .iter()
+        .map(|flag| capability_pill(&q, "/compare", flag, None))
+        .collect();
     let api_href = format!("/api/compare{}", q.qs(&[]));
     let board_href = format!("/{}", q.qs(&[]));
 
@@ -1143,6 +1178,10 @@ pub async fn compare_page(
   <div class="pills">
     <span class="label">Quality</span>
     {quality_pills}
+  </div>
+  <div class="pills">
+    <span class="label">Capabilities</span>
+    {capability_pills}
   </div>
   <p class="meta">{heading} · ids are joined on a canonical key (vendor prefix, case, <code>.</code>/<code>_</code> and release date ignored) · cheapest blend first</p>
   {sections}
@@ -1217,7 +1256,7 @@ fn compare_section(g: &CompareGroup, ctx: &QuoteCtx) -> String {
             format!(
                 r#"<tr class="{cls}" {attrs}>
           <td><span class="src src-{source}">{source}</span></td>
-          <td>{provider}<div class="sub muted">{node}</div><div class="sub"><code>{model}</code></div>{actions}</td>
+          <td>{provider}<div class="sub muted">{node}</div><div class="sub"><code>{model}</code>{caps}</div>{actions}</td>
           <td class="num">{pin}</td>
           <td class="num">{pout}</td>
           <td class="blend">{blend}</td>
@@ -1233,6 +1272,7 @@ fn compare_section(g: &CompareGroup, ctx: &QuoteCtx) -> String {
                 provider = esc(&q.provider),
                 node = esc(&node_display_name(q)),
                 model = esc(&q.model),
+                caps = cap_tags(ctx, q),
                 actions = row_actions_html(None),
                 pin = fmt_usd(q.price_in_usd),
                 pout = fmt_usd(q.price_out_usd),
@@ -1313,7 +1353,7 @@ fn quote_row(q: &Quote, ctx: &QuoteCtx) -> String {
             <div class="sub muted">{node}</div>
           </td>
           <td>
-            <strong class="model-id">{model}</strong>
+            <strong class="model-id">{model}</strong>{caps}
             {actions}
           </td>
           <td class="num">{pin_usd}</td>
@@ -1332,6 +1372,7 @@ fn quote_row(q: &Quote, ctx: &QuoteCtx) -> String {
         provider = esc(&q.provider),
         node = esc(&node_display_name(q)),
         model = esc(&q.model),
+        caps = cap_tags(ctx, q),
         actions = row_actions_html(Some((q, ctx.ratio))),
         pin_usd = fmt_usd(q.price_in_usd),
         pout_usd = fmt_usd(q.price_out_usd),
@@ -1490,6 +1531,49 @@ fn row_actions_html(compare: Option<(&Quote, f64)>) -> String {
     )
 }
 
+/// Capability flags exposed as fields, filters and tags.
+const CAPABILITY_FLAGS: [&str; 3] = ["tools", "reasoning", "vision"];
+
+/// A pill that adds / removes `flag` in the `capabilities` list.
+fn capability_pill(q: &QuotesQuery, base: &str, flag: &str, count: Option<usize>) -> String {
+    let mut items = list_items(q.capabilities.as_deref());
+    let on = items.iter().any(|i| i == flag);
+    if on {
+        items.retain(|i| i != flag);
+    } else {
+        items.push(flag.to_string());
+    }
+    let joined = items.join(",");
+    let value = (!joined.is_empty()).then_some(joined.as_str());
+    let href = format!("{base}{}", q.qs(&[("capabilities", value)]));
+    let cls = if on { "pill active" } else { "pill" };
+    let count = count
+        .map(|n| format!(" <span>{n}</span>"))
+        .unwrap_or_default();
+    format!(
+        r#"<a class="{cls}" href="{}">{flag}{count}</a>"#,
+        esc_attr(&href)
+    )
+}
+
+/// Small tags for the flags a quote has (dashed when inferred).
+fn cap_tags(ctx: &QuoteCtx, q: &Quote) -> String {
+    let (caps, inferred) = ctx.caps(q);
+    CAPABILITY_FLAGS
+        .iter()
+        .filter(|f| caps.flag(f) == Some(true))
+        .map(|f| {
+            if inferred.contains(f) {
+                format!(
+                    r#" <span class="tag tag-cap tag-inferred" title="{f}: inferred from a reference catalog listing this model">{f}</span>"#
+                )
+            } else {
+                format!(r#" <span class="tag tag-cap" title="{f}: published by this catalog">{f}</span>"#)
+            }
+        })
+        .collect()
+}
+
 /// A filter pill that toggles `key=1` on `base` (`/` or `/compare`).
 fn toggle_pill(
     q: &QuotesQuery,
@@ -1603,6 +1687,10 @@ struct QuoteCtx {
     signals: Signals,
     /// `canonical_model` → median rankable blend across all quotes.
     medians: HashMap<String, f64>,
+    /// `canonical_model` → capabilities the reference catalogs publish, used
+    /// to fill flags a row leaves out (Routstr nodes publish no
+    /// `supported_parameters`).
+    peer_caps: HashMap<String, Capabilities>,
 }
 
 impl QuoteCtx {
@@ -1625,6 +1713,16 @@ impl QuoteCtx {
                 median(&v).map(|m| (k, m))
             })
             .collect();
+        // OpenRouter first, so it wins when the catalogs disagree.
+        let mut peer_caps: HashMap<String, Capabilities> = HashMap::new();
+        for src in REFERENCE_SOURCES {
+            for q in all.iter().filter(|q| q.source == *src) {
+                peer_caps
+                    .entry(canonical_model(&q.model))
+                    .or_default()
+                    .merge_missing(&q.caps);
+            }
+        }
         let stats = state.store.endpoint_stats();
         let probes = state.store.probe_statuses();
         let onions: HashMap<String, String> = state
@@ -1676,6 +1774,7 @@ impl QuoteCtx {
             fetches,
             signals,
             medians,
+            peer_caps,
         }
     }
 
@@ -1724,6 +1823,19 @@ impl QuoteCtx {
             && !self.is_stale(q)
     }
 
+    /// The quote's capabilities with unpublished flags filled from a
+    /// reference catalog's listing of the same `canonical_model`, plus the
+    /// names of the flags that were filled.
+    fn caps(&self, q: &Quote) -> (Capabilities, Vec<&'static str>) {
+        let mut caps = q.caps.clone();
+        let inferred = self
+            .peer_caps
+            .get(&canonical_model(&q.model))
+            .map(|peer| caps.fill_from(peer))
+            .unwrap_or_default();
+        (caps, inferred)
+    }
+
     fn is_outlier(&self, q: &Quote) -> bool {
         let Some(b) = blended_usd(q.price_in_usd, q.price_out_usd, self.ratio)
             .filter(|b| is_rankable_blend(Some(*b)))
@@ -1734,6 +1846,15 @@ impl QuoteCtx {
             .get(&canonical_model(&q.model))
             .is_some_and(|m| b < m / OUTLIER_FACTOR || b > m * OUTLIER_FACTOR)
     }
+}
+
+/// Lowercased, trimmed, non-empty items of a comma-separated param.
+fn list_items(list: Option<&str>) -> Vec<String> {
+    list.unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 fn truthy(v: Option<&str>) -> bool {
@@ -1756,6 +1877,7 @@ fn in_list(list: Option<&str>, value: &str) -> bool {
 
 fn enrich_json(q: &Quote, ctx: &QuoteCtx) -> serde_json::Value {
     let ratio = ctx.ratio;
+    let (caps, inferred) = ctx.caps(q);
     serde_json::json!({
         "source": q.source,
         "provider": q.provider,
@@ -1790,6 +1912,12 @@ fn enrich_json(q: &Quote, ctx: &QuoteCtx) -> serde_json::Value {
         "onion": ctx.onion(q),
         "outlier": ctx.is_outlier(q),
         "healthy": ctx.is_healthy(q),
+        "tools": caps.tools,
+        "reasoning": caps.reasoning,
+        "vision": caps.vision,
+        "input_modalities": (!caps.input_modalities.is_empty()).then_some(&caps.input_modalities),
+        "max_output_tokens": caps.max_output_tokens,
+        "capabilities_inferred": inferred,
     })
 }
 
@@ -1797,6 +1925,7 @@ fn filter_quotes(quotes: Vec<Quote>, q: &QuotesQuery, ctx: &QuoteCtx) -> Vec<Quo
     let exclude_stale = truthy(q.exclude_stale.as_deref());
     let exclude_outliers = truthy(q.exclude_outliers.as_deref());
     let healthy_only = truthy(q.healthy.as_deref());
+    let required_caps = list_items(q.capabilities.as_deref());
     quotes
         .into_iter()
         .filter(|quote| {
@@ -1836,6 +1965,12 @@ fn filter_quotes(quotes: Vec<Quote>, q: &QuotesQuery, ctx: &QuoteCtx) -> Vec<Quo
             }
             if healthy_only && !ctx.is_healthy(quote) {
                 return false;
+            }
+            if !required_caps.is_empty() {
+                let (caps, _) = ctx.caps(quote);
+                if !required_caps.iter().all(|c| caps.flag(c) == Some(true)) {
+                    return false;
+                }
             }
             if let Some(ref m) = q.model {
                 if !quote
@@ -1900,6 +2035,10 @@ fn fmt_pct(v: Option<f64>) -> String {
         .unwrap_or_else(|| "—".into())
 }
 
+fn opt_b(v: Option<bool>) -> String {
+    v.map(|x| x.to_string()).unwrap_or_default()
+}
+
 fn opt_u(v: Option<u64>) -> String {
     v.map(|x| x.to_string()).unwrap_or_default()
 }
@@ -1954,6 +2093,7 @@ mod tests {
             observed_at: Utc::now() - chrono::Duration::seconds(age_secs),
             raw_kind: None,
             kind: kind.into(),
+            caps: Default::default(),
         }
     }
 
@@ -2399,5 +2539,89 @@ mod tests {
         )
         .await;
         assert!(html.contains(r#"<a href="/compare?model=claude-sonnet-4-5&amp;ratio=4""#));
+    }
+
+    fn with_caps(mut q: Quote, tools: Option<bool>, vision: Option<bool>) -> Quote {
+        q.caps.tools = tools;
+        q.caps.vision = vision;
+        q
+    }
+
+    #[tokio::test]
+    async fn capabilities_are_inferred_filtered_and_shown() {
+        let st = state();
+        let all = vec![
+            // OpenRouter publishes tools; the node only its modalities.
+            with_caps(
+                src(
+                    "openrouter",
+                    quote("anthropic/claude-sonnet-4.5", "https://or", 3.0, 5, "chat"),
+                ),
+                Some(true),
+                Some(true),
+            ),
+            with_caps(
+                quote("claude-sonnet-4-5", "https://node", 2.0, 5, "chat"),
+                None,
+                Some(false),
+            ),
+            with_caps(
+                quote("mystery-model", "https://node", 1.0, 5, "chat"),
+                None,
+                None,
+            ),
+        ];
+        let ctx = QuoteCtx::new(&st, &all, 3.0);
+        let node = enrich_json(&all[1], &ctx);
+        assert_eq!(node["tools"], true);
+        // The node's own published value wins over the reference catalog.
+        assert_eq!(node["vision"], false);
+        assert_eq!(node["capabilities_inferred"], serde_json::json!(["tools"]));
+        let or = enrich_json(&all[0], &ctx);
+        assert_eq!(or["capabilities_inferred"], serde_json::json!([]));
+        let unknown = enrich_json(&all[2], &ctx);
+        assert!(unknown["tools"].is_null() && unknown["input_modalities"].is_null());
+
+        let models = |qs: &str| -> Vec<String> {
+            filter_quotes(all.clone(), &query(qs), &ctx)
+                .into_iter()
+                .map(|q| q.model)
+                .collect()
+        };
+        assert_eq!(models("capabilities=tools").len(), 2);
+        assert_eq!(
+            models("capabilities=Tools,%20vision"),
+            ["anthropic/claude-sonnet-4.5"]
+        );
+        assert!(models("capabilities=telepathy").is_empty());
+        assert_eq!(models("capabilities=").len(), 3);
+        assert!(query("capabilities=tools")
+            .qs(&[])
+            .contains("capabilities=tools"));
+
+        st.store.upsert_quotes(all);
+        let html = html_of(
+            dashboard(State(st.clone()), Query(query("")))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert!(html.contains(r#"<span class="tag tag-cap tag-inferred""#));
+        assert!(html.contains(r#"href="/?capabilities=tools">tools <span>2</span></a>"#));
+        let html = html_of(
+            dashboard(State(st.clone()), Query(query("capabilities=tools,vision")))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert!(html.contains(r#"<a class="pill active" href="/?capabilities=vision">tools"#));
+
+        let csv = html_of(export_csv(State(st), Query(query(""))).await).await;
+        let mut lines = csv.lines();
+        let header = lines.next().unwrap().split(',').count();
+        for line in lines {
+            assert_eq!(line.split(',').count(), header, "{line}");
+        }
+        assert!(csv.contains(",true,,false,,tools\n"));
     }
 }

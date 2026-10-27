@@ -173,6 +173,16 @@ where \(r\) is the output:input ratio (2, 3, or 4). Default \(r = 3\) (1:3 in:ou
 Presets run after the other filters, so combine them with `kind=chat` to keep embedding models out.
 | **Local-first** | Ollama, vLLM, localhost, free local-style rows |
 
+### Capabilities
+
+Each quote carries `tools`, `reasoning` and `vision` (`true` / `false` / `null` = not published), plus `input_modalities` and `max_output_tokens`, read from OpenRouter-style catalog metadata (`supported_parameters`, `architecture.input_modalities`, `top_provider`). Routstr nodes publish modalities but not `supported_parameters`, so their `tools` / `reasoning` are filled from OpenRouter (else OrcaRouter) for the same `canonical_model` and named in `capabilities_inferred`: the model supports it upstream, the node may not forward it.
+
+Filter with `capabilities=tools,vision` (all must be `true`) on the board, `/api/quotes`, `/api/compare` and CSV. The dashboard shows a **Capabilities** pill row and small tags on each model (dashed = inferred).
+
+```bash
+curl -s 'localhost:8080/api/quotes?kind=chat&healthy=1&capabilities=tools&limit=20' | jq '.[] | {model, node, blended_usd, capabilities_inferred}'
+```
+
 ### Compare a model across sources
 
 `/compare?model=claude-sonnet-4.5` (or **compare** when hovering a board row) puts every offer of one model side by side: OpenRouter, OrcaRouter and each Routstr node, cheapest blend first, with **vs cheapest**, out sats, Rel 24h, latency, age and a healthy mark. Without `model` it lists the models offered by the most sources.
@@ -198,7 +208,7 @@ curl -OJ 'http://127.0.0.1:8080/export.csv?source=openrouter&model=claude'
 curl -OJ 'http://127.0.0.1:8080/export.csv?source=openrouter,orcarouter&model=claude'
 ```
 
-Columns include source, provider, model, USD/sats, blended price, delta, endpoint, context, timestamps, plus `kind`, `age_secs`, `stale`, reliability / latency, `outlier`, `healthy` and `canonical_model`. Export honors the same filters as the board and API.
+Columns include source, provider, model, USD/sats, blended price, delta, endpoint, context, timestamps, plus `kind`, `age_secs`, `stale`, reliability / latency, `outlier`, `healthy`, `canonical_model`, and `tools` / `reasoning` / `vision` / `max_output_tokens` / `capabilities_inferred` (`;`-separated). Export honors the same filters as the board and API.
 
 ## API examples
 
