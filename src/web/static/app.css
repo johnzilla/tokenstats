@@ -184,3 +184,5 @@ a { color: var(--accent); }
 }
 .cmp-best td { background: var(--best); }
 .table-wrap { overflow-x: auto; }
+.tag-cap { color: var(--blue); margin-left: 0.15rem; }
+.tag-inferred { border-style: dashed; opacity: 0.8; }

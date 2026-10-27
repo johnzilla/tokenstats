@@ -57,7 +57,8 @@ impl Db {
                 context_length INTEGER,
                 observed_at TEXT NOT NULL,
                 raw_kind INTEGER,
-                kind TEXT
+                kind TEXT,
+                caps TEXT
             );
             CREATE TABLE IF NOT EXISTS nodes (
                 endpoint TEXT PRIMARY KEY,
@@ -98,11 +99,13 @@ impl Db {
             ",
         )?;
         // Columns added after the initial schema.
-        let has_kind = conn
-            .prepare("SELECT 1 FROM pragma_table_info('quotes') WHERE name = 'kind'")?
-            .exists([])?;
-        if !has_kind {
-            conn.execute("ALTER TABLE quotes ADD COLUMN kind TEXT", [])?;
+        for column in ["kind", "caps"] {
+            let exists = conn
+                .prepare("SELECT 1 FROM pragma_table_info('quotes') WHERE name = ?1")?
+                .exists([column])?;
+            if !exists {
+                conn.execute(&format!("ALTER TABLE quotes ADD COLUMN {column} TEXT"), [])?;
+            }
         }
         info!(path = %path.display(), "sqlite opened");
         Ok(Self {
@@ -144,7 +147,7 @@ impl Db {
             "SELECT source, provider, provider_id, model,
                     price_in_usd, price_out_usd, price_in_sats, price_out_sats,
                     prev_price_out_usd, prev_price_in_usd,
-                    endpoint, region, context_length, observed_at, raw_kind, kind
+                    endpoint, region, context_length, observed_at, raw_kind, kind, caps
              FROM quotes",
         )?;
         let quotes: Vec<Quote> = stmt
@@ -170,6 +173,11 @@ impl Db {
                     observed_at: parse_ts(&row.get::<_, String>(13)?),
                     raw_kind: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
                     kind,
+                    // JSON; missing (older DB) or unreadable = nothing published.
+                    caps: row
+                        .get::<_, Option<String>>(16)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
                 })
             })?
             .filter_map(|r| r.ok())
@@ -252,8 +260,8 @@ impl Db {
                     key, source, provider, provider_id, model,
                     price_in_usd, price_out_usd, price_in_sats, price_out_sats,
                     prev_price_out_usd, prev_price_in_usd,
-                    endpoint, region, context_length, observed_at, raw_kind, kind
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                    endpoint, region, context_length, observed_at, raw_kind, kind, caps
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             )?;
             for q in store.all_quotes_raw() {
                 let key = Store::quote_key(&q.source, &q.provider_id, &q.model);
@@ -275,6 +283,7 @@ impl Db {
                     q.observed_at.to_rfc3339(),
                     q.raw_kind.map(|v| v as i64),
                     q.kind,
+                    serde_json::to_string(&q.caps).ok(),
                 ])?;
             }
         }
@@ -420,6 +429,32 @@ mod tests {
         store.record_probe("https://n1", Ok((Default::default(), 30, None)));
         let btc_at = Utc::now() - chrono::Duration::minutes(3);
         store.set_btc_usd(81_000.0, Some(btc_at));
+        let caps = crate::store::Capabilities {
+            tools: Some(true),
+            vision: Some(false),
+            input_modalities: vec!["text".into()],
+            max_output_tokens: Some(4096),
+            ..Default::default()
+        };
+        store.upsert_quotes([Quote {
+            source: "openrouter".into(),
+            provider: "OpenRouter".into(),
+            provider_id: "openrouter".into(),
+            model: "a/m".into(),
+            price_in_usd: Some(1.0),
+            price_out_usd: Some(2.0),
+            price_in_sats: None,
+            price_out_sats: None,
+            prev_price_out_usd: None,
+            prev_price_in_usd: None,
+            endpoint: Some("https://or".into()),
+            region: None,
+            context_length: None,
+            observed_at: Utc::now(),
+            raw_kind: None,
+            kind: "chat".into(),
+            caps: caps.clone(),
+        }]);
         let db = Db::open(&path).unwrap();
         db.save_from(&store).unwrap();
         // Second save only rewrites the current hour; still one row.
@@ -430,6 +465,7 @@ mod tests {
         db.load_into(&restored).unwrap();
         let st = &restored.endpoint_stats()["https://n1"];
         assert_eq!(st.polls_24h, 3);
+        assert_eq!(restored.list_quotes()[0].caps, caps);
         assert_eq!(restored.btc_usd(), Some(81_000.0));
         assert_eq!(
             restored.btc_usd_at().map(|t| t.timestamp()),
@@ -438,6 +474,39 @@ mod tests {
         // Probe history persists too and wins for latency.
         assert_eq!(st.latency_source, Some("probe"));
         assert_eq!(st.latency_p50_ms, Some(32));
+        drop(db);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
+
+    #[test]
+    fn opens_a_db_from_before_the_caps_column() {
+        let path = std::env::temp_dir().join(format!(
+            "tokenstats-test-old-{}-{}.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE quotes (key TEXT PRIMARY KEY, source TEXT NOT NULL,
+                   provider TEXT NOT NULL, provider_id TEXT NOT NULL, model TEXT NOT NULL,
+                   price_in_usd REAL, price_out_usd REAL, price_in_sats REAL,
+                   price_out_sats REAL, prev_price_out_usd REAL, prev_price_in_usd REAL,
+                   endpoint TEXT, region TEXT, context_length INTEGER,
+                   observed_at TEXT NOT NULL, raw_kind INTEGER, kind TEXT);
+                 INSERT INTO quotes (key, source, provider, provider_id, model, observed_at)
+                   VALUES ('k', 'openrouter', 'OpenRouter', 'openrouter', 'a/m',
+                           '2026-10-27T00:00:00Z');",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let store = Store::new();
+        db.load_into(&store).unwrap();
+        let q = &store.list_quotes()[0];
+        assert_eq!(q.caps, crate::store::Capabilities::default());
         drop(db);
         for ext in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{ext}", path.display()));

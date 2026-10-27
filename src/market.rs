@@ -506,6 +506,7 @@ mod tests {
             observed_at: Utc::now(),
             raw_kind: None,
             kind: "chat".into(),
+            caps: Default::default(),
         }
     }
 

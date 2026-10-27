@@ -57,6 +57,7 @@ cargo run -- serve --bind 0.0.0.0:8080 --db ./tokenstats.db
 | **Presets** | Cheapest Frontier · Fastest · Most Private · Local-first |
 | **Feed strip** | Feed status + reasons, last cycle, per-source health, Routstr nodes OK + dormant, stale count, BTC rate age |
 | **Signals** | Per-quote 24h reliability, p50 latency, age (stale highlighted), outlier tag; **Quality** pills: healthy only, hide stale / outliers |
+| **Capabilities** | `tools` / `reasoning` / `vision` tags per model (dashed = inferred from OpenRouter / OrcaRouter for Routstr nodes); pills filter on them |
 | **Δ out** | Price change vs previous catalog snapshot |
 | **Hover → copy** | **curl** or OpenAI-compatible **config** JSON for that quote; **compare** opens the model across sources |
 | **Compare** | `/compare?model=…`: one model's offers from every source side by side, cheapest first, with spread and cheapest healthy offer |
@@ -71,7 +72,7 @@ Query params: `?source=openrouter&preset=frontier&ratio=4&model=deepseek`
 |------|-------------|
 | `GET /` | HTML dashboard (auto-refresh ~15s) |
 | `GET /health` | Liveness + feed `status` (`ok`/`degraded`/`down`/…) + counts + `last_updated` |
-| `GET /api/quotes` | JSON quotes (`source`, `model`, `kind`, `preset`, `ratio`, `limit`, `max_age_secs`, `min_reliability`, `min_reliability_24h`, `max_latency_ms`, `exclude_stale`, `exclude_outliers`, `healthy`); each quote carries `canonical_model` |
+| `GET /api/quotes` | JSON quotes (`source`, `model`, `kind`, `preset`, `ratio`, `limit`, `max_age_secs`, `min_reliability`, `min_reliability_24h`, `max_latency_ms`, `exclude_stale`, `exclude_outliers`, `healthy`, `capabilities`); each quote carries `canonical_model` and `tools` / `reasoning` / `vision` / `input_modalities` / `max_output_tokens` |
 | `GET /api/nodes` | Discovered nodes + `status` (healthy/failing/dormant/skipped) + `failure_class` + reliability (1h/24h/7d) + latency p50/p95 + last success/error (+ `skip_reason` when not polled) |
 | `GET /api/summary` | Aggregates + Best Now strip |
 | `GET /api/compare` | Same model across sources, grouped by `canonical_model` (`model`, `ratio`, `limit` groups, plus the quote filters): offers, min/median/max blend, `spread_pct`, `cheapest`, `cheapest_healthy` |

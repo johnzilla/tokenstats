@@ -49,6 +49,7 @@ Centralized in `src/config.rs`. Prefer adding new knobs there (CLI + `TOKENSTATS
 
 - Quote key: `{source}:{provider_id}:{model}` (latest-wins).
 - Catalog fetches go through `replace_catalog` (drops delisted models for that source/provider/endpoint; empty fetch is a no-op). Quotes older than `--quote-ttl-secs` are expired by the poller.
+- Capabilities (`Quote.caps`) are stored exactly as the catalog published them (`None` = not published) and persisted as JSON in `quotes.caps`; inference from reference catalogs happens per request in `QuoteCtx::caps`, never in the store.
 - On upsert, preserve `prev_price_*` for delta indicators; oracle sats updates must **not** clobber deltas (`apply_sats_normalization`).
 - Nodes are bounded: `upsert_node` enforces `--max-nodes` (evicts the lowest (fetched-in-24h, last_seen) discovered node, refuses newcomers that rank below everyone) and `prune_stale_nodes` expires nodes not announced/polled OK for `--node-ttl-secs` after a full TTL of attempts. Nostr `last_seen` = event `created_at` (clamped), never "now".
 - BTC/USD: `Store::set_btc_usd(rate, at)` rejects rates outside `pricing::BTC_USD_MIN..=MAX`; `btc_usd_at` is persisted in `meta` and drives feed staleness.
@@ -60,7 +61,7 @@ Centralized in `src/config.rs`. Prefer adding new knobs there (CLI + `TOKENSTATS
 ### Web / dashboard
 
 - Server-rendered HTML is intentional (no frontend build).
-- Query params: `source`, `model`, `preset`, `ratio`, `limit`, plus quality filters `kind`, `max_age_secs`, `min_reliability`, `exclude_stale`, `exclude_outliers` (carried through board links and CSV export by `QuotesQuery::qs`).
+- Query params: `source`, `model`, `preset`, `ratio`, `limit`, plus quality filters `kind`, `max_age_secs`, `min_reliability`, `exclude_stale`, `exclude_outliers`, `healthy`, `capabilities` (carried through board links and CSV export by `QuotesQuery::qs`).
 - Export path: `/export.csv` must honor the same filters as the board.
 - Escape all user/network-derived strings in HTML (`esc` / `esc_attr`).
 - Hrefs built from query params go through `percent_encode` (unreserved chars only) **and** `esc_attr`. A reflected-XSS regression test guards this.
@@ -109,7 +110,7 @@ Default base URL locally: `http://127.0.0.1:8080`.
 ### Request
 
 ```
-GET /api/quotes?source=&model=&kind=&preset=&ratio=&limit=&max_age_secs=&min_reliability=&min_reliability_24h=&max_latency_ms=&exclude_stale=&exclude_outliers=&healthy=
+GET /api/quotes?source=&model=&kind=&preset=&ratio=&limit=&max_age_secs=&min_reliability=&min_reliability_24h=&max_latency_ms=&exclude_stale=&exclude_outliers=&healthy=&capabilities=
 ```
 
 | Query param | Type | Default | Description |
@@ -123,6 +124,7 @@ GET /api/quotes?source=&model=&kind=&preset=&ratio=&limit=&max_age_secs=&min_rel
 | `exclude_stale` | bool | off | `1`/`true` hides quotes with `stale: true` |
 | `exclude_outliers` | bool | off | `1`/`true` hides quotes with `outlier: true` |
 | `healthy` | bool | off | `1`/`true` keeps only quotes with `healthy: true` |
+| `capabilities` | string | (none) | Comma-separated `tools`, `reasoning`, `vision`: keeps quotes where each is `true` (published or inferred). Unknown (`null`) never matches; an unknown name matches nothing |
 | `model` | string | (all) | Case-insensitive **substring** on model id (e.g. `deepseek`, `claude-sonnet`) |
 | `preset` | string | (none) | View preset (see below). When set, applies preset filter/sort instead of plain blend sort |
 | `ratio` | float | `3` | Output:input workload for blended cost (`1:r`). Allowed range effectively `>0` and `≤20`; invalid falls back to `3` |
@@ -181,6 +183,10 @@ Empty store / no matches → `[]`.
 | `identity_verified` | bool \| null | Node's `/v1/info` `npub` matches the Nostr key that announced it. `false` = mismatch or unparsable npub; null = nothing to compare (reference catalogs, `--node` seeds, not probed since restart) |
 | `onion` | string \| null | Node's onion address, from the announcement or `/v1/info` |
 | `outlier` | bool | Blend is >10× above or below the median for the same `canonical_model` across ≥3 quotes (all sources). Low outliers often mean a unit bug on the node. Computed with the request's `ratio`, so the flag can change with `ratio` |
+| `tools`, `reasoning`, `vision` | bool \| null | Tool calling (`supported_parameters` has `tools`), reasoning tokens (`reasoning` / `include_reasoning` or a `reasoning` object), image input (`input_modalities` has `image`). `null` = not published anywhere for this model. A flag the row's own catalog leaves out is filled from OpenRouter (else OrcaRouter) for the same `canonical_model` and listed in `capabilities_inferred` |
+| `input_modalities` | string[] \| null | `architecture.input_modalities` as published (lowercased); null when absent |
+| `max_output_tokens` | number \| null | `top_provider.max_completion_tokens` (or `max_completion_tokens`) |
+| `capabilities_inferred` | string[] | Flags taken from a reference catalog rather than this row's catalog (typically `tools` / `reasoning` on Routstr nodes, which publish no `supported_parameters`). Inferred = the model supports it upstream; the node may not forward it |
 | `healthy` | bool | Routable now: the endpoint's last catalog fetch succeeded, its 24h success rate (1h right after a restart) is ≥ 0.9, its `/v1/info` probe isn't failing, and the quote isn't stale. Always `false` without current poll evidence (e.g. `--no-poll` snapshots) |
 
 #### Example
@@ -274,7 +280,7 @@ catalog model row
 
 ```
 1. GET /health          → wait for status "ok" (or "degraded" + acceptable reasons)
-2. GET /api/quotes?kind=chat&exclude_outliers=1&healthy=1
+2. GET /api/quotes?kind=chat&exclude_outliers=1&healthy=1[&capabilities=tools]
                         → select candidates by blended_usd / source / model
 3. Optionally GET /api/compare?model=<id>&healthy=1 to pick the cheapest offer of one model
    across catalog spellings (cheapest_healthy / spread_pct)

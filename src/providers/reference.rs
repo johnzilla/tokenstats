@@ -71,6 +71,7 @@ fn quotes_from_payload(body: &serde_json::Value, cat: &ReferenceCatalog) -> Vec<
                 context_length: m.context_length,
                 observed_at: now,
                 raw_kind: None,
+                caps: m.caps,
                 kind: m.kind,
             }
         })

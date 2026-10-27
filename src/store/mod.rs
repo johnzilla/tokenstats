@@ -48,6 +48,68 @@ pub struct Quote {
     pub raw_kind: Option<u32>,
     /// What the model produces: `chat`, `embedding`, `image`, `audio`, `rerank`, `other`.
     pub kind: String,
+    /// What the catalog says the model supports (`None` = not published).
+    pub caps: Capabilities,
+}
+
+/// Capability flags as the catalog published them. `None` means the catalog
+/// didn't say, which is not the same as `false`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, serde::Deserialize)]
+pub struct Capabilities {
+    /// Tool / function calling (`supported_parameters` has `tools`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<bool>,
+    /// Reasoning / thinking tokens (`reasoning`, `include_reasoning`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+    /// Image input (`architecture.input_modalities` has `image`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
+    /// `architecture.input_modalities`, lowercased; empty = not published.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_modalities: Vec<String>,
+    /// Max completion tokens (`top_provider.max_completion_tokens`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+}
+
+impl Capabilities {
+    /// Fill flags this row didn't publish from `peer` (same model elsewhere).
+    /// Returns the names filled.
+    pub fn fill_from(&mut self, peer: &Capabilities) -> Vec<&'static str> {
+        let mut filled = Vec::new();
+        for (name, mine, theirs) in [
+            ("tools", &mut self.tools, peer.tools),
+            ("reasoning", &mut self.reasoning, peer.reasoning),
+            ("vision", &mut self.vision, peer.vision),
+        ] {
+            if mine.is_none() && theirs.is_some() {
+                *mine = theirs;
+                filled.push(name);
+            }
+        }
+        filled
+    }
+
+    /// Flag value by name (`tools` | `reasoning` | `vision`); unknown names
+    /// are `None`.
+    pub fn flag(&self, name: &str) -> Option<bool> {
+        match name {
+            "tools" => self.tools,
+            "reasoning" => self.reasoning,
+            "vision" => self.vision,
+            _ => None,
+        }
+    }
+
+    /// Fold another row of the same model in: first published value wins.
+    pub fn merge_missing(&mut self, other: &Capabilities) {
+        self.fill_from(other);
+        if self.input_modalities.is_empty() {
+            self.input_modalities = other.input_modalities.clone();
+        }
+        self.max_output_tokens = self.max_output_tokens.or(other.max_output_tokens);
+    }
 }
 
 /// A Routstr (or compatible) node discovered via Nostr or config.
@@ -1051,6 +1113,7 @@ mod tests {
             observed_at: Utc::now(),
             raw_kind: None,
             kind: "chat".into(),
+            caps: Default::default(),
         }
     }
 
