@@ -1,6 +1,6 @@
 # Checkpoint
 
-_Last updated: 2026-10-31 · capability flags shipped (#22), all of #17–#22 live; arbstr v2.5.0 / arbstr-node v1.3.0 released_
+_Last updated: 2026-11-01 · price history in review; #17–#22 live; arbstr v2.5.0 / arbstr-node v1.3.0 released_
 
 ## Where I am
 
@@ -16,7 +16,8 @@ Live on tokenstats.ai (DigitalOcean Droplet, pulls the CI-built GHCR image, `doc
 - **Model compare** (#19): `canonical_model` on quotes/CSV, `GET /api/compare` + `/compare` page (offers, spread, cheapest / cheapest healthy; outliers never cheapest); outlier medians now cross-source
 - **Capabilities** (#22): per-quote `tools` / `reasoning` / `vision`, `input_modalities`, `max_output_tokens` (persisted as `quotes.caps`); flags Routstr nodes leave out are inferred from OpenRouter, then OrcaRouter, by `canonical_model` (`capabilities_inferred`); `capabilities=` filter on the board, API and CSV
 - **Hygiene**: CI (fmt, clippy `-D warnings`, tests, MSRV 1.86, Docker build + smoke, GHCR publish on main) (#6, #13, #14); deploy hardening docs (#10)
-- 109 unit tests; `.github/dependabot.yml` for weekly grouped version PRs (nostr-sdk and MSRV toolchain refs excluded)
+- **Price history** (this PR): a point per published-price change (USD, or sats for sats-only nodes), 90 days in SQLite `price_points`; `/api/history` + `/history` (SVG step chart, change log, `changed=1`), per-quote `price_changed_at` / `blend_change_{24h,7d,30d}_pct`
+- 122 unit tests; `.github/dependabot.yml` for weekly grouped version PRs (nostr-sdk and MSRV toolchain refs excluded)
 - **Consumers**: arbstr v2.4.0 fetches only routable sources with `kind=chat`, `max_age_secs`, `exclude_outliers`, gates on `/health` `status`, trusts `reliability_24h`; arbstr v2.5.0 adds opt-in `[tokenstats].require_healthy` (uses `healthy`); arbstr-node v1.3.0 pins arbstr 2.5.0 + arbstr-vault 1.3.2
 
 ## Decisions made
@@ -35,7 +36,7 @@ Live on tokenstats.ai (DigitalOcean Droplet, pulls the CI-built GHCR image, `doc
 
 ## Next step
 
-None queued. Redeployed 2026-10-31 (first deploy since #17): watch the live strip, where Routstr dormant count should settle near the 45 failing nodes and poll cycles shorten. Candidates in `AGENTS.md` "Good next features" (price history, signed Best Now publish).
+None queued. Redeployed 2026-10-31 (first deploy since #17): watch the live strip, where Routstr dormant count should settle near the 45 failing nodes and poll cycles shorten. After deploying price history, history starts accruing (no backfill): `blend_change_7d_pct` fills in after a week. Candidates in `AGENTS.md` "Good next features" (signed Best Now publish).
 
 ## Anchors
 

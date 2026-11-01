@@ -49,6 +49,7 @@ Centralized in `src/config.rs`. Prefer adding new knobs there (CLI + `TOKENSTATS
 
 - Quote key: `{source}:{provider_id}:{model}` (latest-wins).
 - Catalog fetches go through `replace_catalog` (drops delisted models for that source/provider/endpoint; empty fetch is a no-op). Quotes older than `--quote-ttl-secs` are expired by the poller.
+- Price history (`src/store/prices.rs`): `upsert_quotes` records a `PricePoint` per quote key when the **published** price changes by ≥0.1% (USD if the catalog lists USD, else sats; never oracle-converted sides, which move every poll). Kept `--price-history-days` (default 90, 0 = off; the newest point before the cutoff stays as baseline), max 1000 points per key, pruned by the poller; series of delisted quotes go once they're past retention. Persisted incrementally in `price_points` (only points newer than the last save are written).
 - Capabilities (`Quote.caps`) are stored exactly as the catalog published them (`None` = not published) and persisted as JSON in `quotes.caps`; inference from reference catalogs happens per request in `QuoteCtx::caps`, never in the store.
 - On upsert, preserve `prev_price_*` for delta indicators; oracle sats updates must **not** clobber deltas (`apply_sats_normalization`).
 - Nodes are bounded: `upsert_node` enforces `--max-nodes` (evicts the lowest (fetched-in-24h, last_seen) discovered node, refuses newcomers that rank below everyone) and `prune_stale_nodes` expires nodes not announced/polled OK for `--node-ttl-secs` after a full TTL of attempts. Nostr `last_seen` = event `created_at` (clamped), never "now".
@@ -61,7 +62,7 @@ Centralized in `src/config.rs`. Prefer adding new knobs there (CLI + `TOKENSTATS
 ### Web / dashboard
 
 - Server-rendered HTML is intentional (no frontend build).
-- Query params: `source`, `model`, `preset`, `ratio`, `limit`, plus quality filters `kind`, `max_age_secs`, `min_reliability`, `exclude_stale`, `exclude_outliers`, `healthy`, `capabilities` (carried through board links and CSV export by `QuotesQuery::qs`).
+- Query params: `source`, `model`, `preset`, `ratio`, `limit`, plus quality filters `kind`, `max_age_secs`, `min_reliability`, `exclude_stale`, `exclude_outliers`, `healthy`, `capabilities` (carried through board links and CSV export by `QuotesQuery::qs`), plus `days` / `changed` for history pages.
 - Export path: `/export.csv` must honor the same filters as the board.
 - Escape all user/network-derived strings in HTML (`esc` / `esc_attr`).
 - Hrefs built from query params go through `percent_encode` (unreserved chars only) **and** `esc_attr`. A reflected-XSS regression test guards this.
@@ -101,6 +102,7 @@ Related helpers (not substitutes for the full board):
 | `GET /api/quotes` | **Main integration** — full filtered quote list |
 | `GET /api/summary` | Compact Best Now strip + counts + `btc_usd` + feed `status`/`feed` |
 | `GET /api/compare` | One model across sources. JSON array of groups keyed by `canonical_model` (`model` = substring of that key; same quality filters + `ratio`; `preset` ignored; `limit` = groups, default 50, max 1000). Exact match first, then most sources. Each group: `canonical_model`, `models` (ids as published), `sources`, `offers`, `blend_ratio`, `min/median/max_blended_usd`, `spread_pct` (null under 2 offers), `cheapest`, `cheapest_healthy` (quote objects or null), `quotes` (cheapest first, each with `vs_cheapest_pct`). Min / spread / cheapest skip outliers. HTML: `/compare` |
+| `GET /api/history` | Published-price change points. Same grouping, filters and `limit` as `/api/compare`, plus `days` (default 30, capped at `--price-history-days`) and `changed` (`1` = only offers with a change in the window; groups then sorted by latest change). Each group: `canonical_model`, `days`, `from`, `blend_ratio`, `offers`, `changes`, `last_change_at`, `quotes` (quote objects + `unit` `usd`\|`sats`, `changes`, `points`: `at`, the four price fields (other unit null), `blended_usd` / `blended_sats`; the first point is the price in effect at `from`, so its `at` may be earlier). `[]` when history is off. HTML: `/history` |
 | `GET /api/nodes` | Discovered Routstr endpoints + reliability (`reliability_1h/24h/7d`, `polls_24h`) + `latency_p50_ms/p95_ms`/`latency_source` + `identity_verified` + `probe` (`probed_at`, `ok`, `error`) + `info` (self-reported `/v1/info`: `name`, `version`, `npub`, `mints`, `onion_url`) + `last_success_at` / `last_error` / `consecutive_failures` + `skip_reason` (string \| null) when the SSRF guard refused to poll + `status` (`healthy` \| `failing` \| `dormant` \| `skipped` \| `pending`) + `failure_class` (`dns` \| `timeout` \| `tls` \| `connect` \| `http_4xx` \| `http_5xx` \| `parse` \| `ssrf_skip` \| `other` \| null) + `next_poll_at` (dormant nodes only) |
 | `GET /health` | Liveness + feed `status` / `feed` object / quote count / `btc_usd` + `btc_usd_at` / `btc_usd_age_secs` / `last_updated` |
 | `GET /export.csv` | Same filters as quotes, for offline analysis |
@@ -187,6 +189,9 @@ Empty store / no matches → `[]`.
 | `input_modalities` | string[] \| null | `architecture.input_modalities` as published (lowercased); null when absent |
 | `max_output_tokens` | number \| null | `top_provider.max_completion_tokens` (or `max_completion_tokens`) |
 | `capabilities_inferred` | string[] | Flags taken from a reference catalog rather than this row's catalog (typically `tools` / `reasoning` on Routstr nodes, which publish no `supported_parameters`). Inferred = the model supports it upstream; the node may not forward it |
+| `price_history_since` | string (RFC3339) \| null | First retained history point: the published price is known from here on. Null = not tracked (history off, or restored but not re-fetched yet) |
+| `price_changed_at` | string (RFC3339) \| null | Latest published-price change within retention; null = unchanged since tracking began |
+| `blend_change_24h_pct`, `blend_change_7d_pct`, `blend_change_30d_pct` | number \| null | % change of the blend (request `ratio`, in the published unit) vs the price in effect that long ago. Null until tracked for the whole window, or when the unit switched |
 | `healthy` | bool | Routable now: the endpoint's last catalog fetch succeeded, its 24h success rate (1h right after a restart) is ≥ 0.9, its `/v1/info` probe isn't failing, and the quote isn't stale. Always `false` without current poll evidence (e.g. `--no-poll` snapshots) |
 
 #### Example
@@ -240,7 +245,7 @@ Example element (illustrative):
 3. **Invalid / dynamic prices are `null`**, not negative. Catalog sentinels (OpenRouter `"-1"`, negative floats) are sanitized at ingest and on SQLite restore, and USD prices above `TOKENSTATS_MAX_PRICE_USD_PER_1M` (default $1000/1M) are nulled as unit errors. Do not invent costs for `null` sides.
 4. **Default cheapest sort** ranks only **strictly positive** blends; free (`0`) and missing prices sort last (not first).
 5. **`delta_*` may be null** until a second catalog poll changes a price; do not treat null as “flat”.
-6. **Data is latest-wins in memory** (optionally restored from SQLite). There is no historical series on this endpoint yet. `observed_at` is the last successful fetch that listed the model; delisted models are removed on the next successful fetch, and quotes unseen for `TOKENSTATS_QUOTE_TTL_SECS` (default 24h) are dropped.
+6. **Data is latest-wins in memory** (optionally restored from SQLite). Change history lives in `/api/history`; here only `price_changed_at` / `blend_change_*_pct` summarize it. `observed_at` is the last successful fetch that listed the model; delisted models are removed on the next successful fetch, and quotes unseen for `TOKENSTATS_QUOTE_TTL_SECS` (default 24h) are dropped.
 7. **No auth** on the local/default bind. If exposing publicly, put a reverse proxy / network policy in front; do not assume API keys exist on tokenstats.
 8. **Breaking changes:** prefer additive fields. If renaming/removing fields or changing array-vs-object envelope, update this section, `docs/USAGE.md`, and call out arbstr/agent consumers.
 9. **Check `/health` `status` before trusting the board.** `ok` = fresh; `degraded` = usable, read `feed.reasons`; `down` / `starting` = don't route on it; `offline` = serving a snapshot (`--no-poll`). `ok: true` is liveness only.
@@ -314,7 +319,6 @@ docker compose up -d --build
 
 ## Good next features (if asked)
 
-- Price history charts / multi-sample deltas beyond last snapshot
 - True inference latency / TTFT (needs paid completions; out of scope under "observe, don't pay")
 - Signed oracle publish of Best Now
 - Stale TTL for nodes (quotes expire via `--quote-ttl-secs`)

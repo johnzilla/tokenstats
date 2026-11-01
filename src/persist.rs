@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::providers::model_kind;
-use crate::store::{HourBucket, ProviderNode, Quote, Store, Stream};
+use crate::store::{HourBucket, PricePoint, ProviderNode, Quote, Store, Stream};
 
 /// SQLite table per hourly history stream (same schema).
 const HOURLY_TABLES: [(Stream, &str); 2] = [
@@ -24,7 +24,14 @@ pub struct Db {
     path: PathBuf,
     /// Oldest hour that may have changed since the last save (`None` = save all).
     hourly_dirty_from: Mutex<Option<i64>>,
+    /// Price points first observed at or after this were not saved yet
+    /// (`None` = save all).
+    prices_dirty_from: Mutex<Option<i64>>,
 }
+
+/// Points recorded while a save runs can carry an `at` slightly before it
+/// started; re-saving this overlap is harmless (upsert).
+const PRICE_SAVE_OVERLAP_SECS: i64 = 300;
 
 impl Db {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -92,6 +99,15 @@ impl Db {
                 latency_hist TEXT NOT NULL,
                 PRIMARY KEY (endpoint, hour)
             );
+            CREATE TABLE IF NOT EXISTS price_points (
+                key TEXT NOT NULL,
+                at INTEGER NOT NULL,
+                price_in_usd REAL,
+                price_out_usd REAL,
+                price_in_sats REAL,
+                price_out_sats REAL,
+                PRIMARY KEY (key, at)
+            );
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -112,6 +128,7 @@ impl Db {
             conn: Mutex::new(conn),
             path,
             hourly_dirty_from: Mutex::new(None),
+            prices_dirty_from: Mutex::new(None),
         })
     }
 
@@ -238,10 +255,33 @@ impl Db {
             store.load_hourly(stream, hours);
         }
 
+        let mut stmt = conn.prepare(
+            "SELECT key, at, price_in_usd, price_out_usd, price_in_sats, price_out_sats
+             FROM price_points ORDER BY key, at",
+        )?;
+        let points: Vec<(String, PricePoint)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    PricePoint {
+                        at: row.get(1)?,
+                        price_in_usd: row.get(2)?,
+                        price_out_usd: row.get(3)?,
+                        price_in_sats: row.get(4)?,
+                        price_out_sats: row.get(5)?,
+                    },
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        let n_points = points.len();
+        store.load_price_history(points);
+
         info!(
             quotes = n_quotes,
             nodes = n_nodes,
             endpoint_hours = n_hours,
+            price_points = n_points,
             "restored from sqlite"
         );
         Ok(())
@@ -342,6 +382,46 @@ impl Db {
             )?;
         }
 
+        // Price points: insert what's new since the last save, then mirror the
+        // store's pruning (keep each key's price in effect at the cutoff; drop
+        // keys that are delisted and unchanged within retention).
+        let started = Utc::now().timestamp();
+        if let Some(cutoff) = store.price_history_cutoff(started) {
+            let dirty_from = *self.prices_dirty_from.lock().expect("dirty lock");
+            let mut stmt = tx.prepare(
+                "INSERT INTO price_points
+                    (key, at, price_in_usd, price_out_usd, price_in_sats, price_out_sats)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(key, at) DO UPDATE SET
+                    price_in_usd = excluded.price_in_usd,
+                    price_out_usd = excluded.price_out_usd,
+                    price_in_sats = excluded.price_in_sats,
+                    price_out_sats = excluded.price_out_sats",
+            )?;
+            for (key, p) in store.price_history_snapshot(dirty_from) {
+                stmt.execute(params![
+                    key,
+                    p.at,
+                    p.price_in_usd,
+                    p.price_out_usd,
+                    p.price_in_sats,
+                    p.price_out_sats
+                ])?;
+            }
+            tx.execute(
+                "DELETE FROM price_points WHERE at < ?1 AND EXISTS (
+                    SELECT 1 FROM price_points n
+                    WHERE n.key = price_points.key AND n.at > price_points.at AND n.at < ?1)",
+                params![cutoff],
+            )?;
+            tx.execute(
+                "DELETE FROM price_points
+                 WHERE key NOT IN (SELECT key FROM quotes)
+                   AND key NOT IN (SELECT key FROM price_points WHERE at >= ?1)",
+                params![cutoff],
+            )?;
+        }
+
         if let Some(rate) = store.btc_usd() {
             tx.execute(
                 "INSERT INTO meta(key, value) VALUES('btc_usd', ?1)
@@ -360,6 +440,8 @@ impl Db {
         tx.commit()?;
         // Only advance after a successful commit, so a failed save retries.
         *self.hourly_dirty_from.lock().expect("dirty lock") = Some(now_hour);
+        *self.prices_dirty_from.lock().expect("dirty lock") =
+            Some(started - PRICE_SAVE_OVERLAP_SECS);
         debug!(
             quotes = store.quote_count(),
             nodes = store.node_count(),
@@ -474,6 +556,58 @@ mod tests {
         // Probe history persists too and wins for latency.
         assert_eq!(st.latency_source, Some("probe"));
         assert_eq!(st.latency_p50_ms, Some(32));
+        drop(db);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
+
+    #[test]
+    fn price_history_roundtrips_and_expires_in_sqlite() {
+        let path = std::env::temp_dir().join(format!(
+            "tokenstats-test-prices-{}-{}.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let quote = |model: &str, out: f64, days_ago: i64| Quote {
+            source: "openrouter".into(),
+            provider: "OpenRouter".into(),
+            provider_id: "openrouter".into(),
+            model: model.into(),
+            price_in_usd: Some(1.0),
+            price_out_usd: Some(out),
+            price_in_sats: None,
+            price_out_sats: None,
+            prev_price_out_usd: None,
+            prev_price_in_usd: None,
+            endpoint: Some("https://or".into()),
+            region: None,
+            context_length: None,
+            observed_at: Utc::now() - chrono::Duration::days(days_ago),
+            raw_kind: None,
+            kind: "chat".into(),
+            caps: Default::default(),
+        };
+        let store = Store::new();
+        store.set_price_history_days(30);
+        store.upsert_quotes([quote("a/m", 2.0, 50)]);
+        store.upsert_quotes([quote("a/m", 3.0, 40)]);
+        store.upsert_quotes([quote("a/m", 4.0, 5)]);
+        let db = Db::open(&path).unwrap();
+        db.save_from(&store).unwrap();
+        store.upsert_quotes([quote("a/m", 5.0, 0)]);
+        db.save_from(&store).unwrap();
+
+        // The 50-day-old point is past retention and superseded by the 40-day one.
+        let restored = Store::new();
+        restored.set_price_history_days(30);
+        db.load_into(&restored).unwrap();
+        let outs: Vec<_> = restored
+            .price_history_snapshot(None)
+            .into_iter()
+            .map(|(_, p)| p.price_out_usd.unwrap())
+            .collect();
+        assert_eq!(outs, [3.0, 4.0, 5.0]);
         drop(db);
         for ext in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{ext}", path.display()));

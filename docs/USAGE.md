@@ -35,6 +35,7 @@ Binary after release build: `./target/release/tokenstats serve`.
 | `TOKENSTATS_NODE_CONCURRENCY` | `--node-concurrency` | `16` |
 | `TOKENSTATS_NODE_TIMEOUT_SECS` | `--node-timeout-secs` | `10` |
 | `TOKENSTATS_QUOTE_TTL_SECS` | `--quote-ttl-secs` | `86400` (`0` = never expire) |
+| `TOKENSTATS_PRICE_HISTORY_DAYS` | `--price-history-days` | `90` (`0` = don't record price history) |
 | `TOKENSTATS_MAX_NODES` | `--max-nodes` | `512` (`0` = unlimited; `--node` seeds don't count) |
 | `TOKENSTATS_NODE_TTL_SECS` | `--node-ttl-secs` | `604800` (`0` = never expire) |
 | `TOKENSTATS_STALE_AFTER_SECS` | `--stale-after-secs` | `600` |
@@ -189,6 +190,19 @@ curl -s 'localhost:8080/api/quotes?kind=chat&healthy=1&capabilities=tools&limit=
 
 Catalogs spell ids differently (`anthropic/claude-sonnet-4.5`, `claude-sonnet-4-5`, `claude-sonnet-4-5-20250929`), so offers are joined on `canonical_model`: vendor prefix dropped, lowercased, `.` / `_` as `-`, trailing release date stripped. A `:variant` suffix (`:free`, `:batch`) stays its own group. `model` matches as a substring of that key. Blend ratio and the quality filters apply; presets don't. Each group's cheapest offer and spread skip outliers (usually a node's unit bug), which stay listed with a negative **vs cheapest**.
 
+### Price history
+
+tokenstats records a point whenever a catalog's **published** price for a quote changes: USD when the catalog lists USD, sats only for sats-only nodes (converted sides move with BTC/USD on every poll, so they aren't tracked). Moves under 0.1% are ignored. Points are kept for `--price-history-days` (default 90; the price in effect at the cutoff stays as the baseline) and persisted in SQLite (`price_points`), so history survives restarts. Tracking starts on the first poll after upgrading; there is no backfill.
+
+- `/history?model=deepseek` (or **price history** on a compare group): each offer's blend as a step chart over 1d / 7d / 30d / 90d, and a change log (old → new in/out, blend Δ). **changed only** lists just the offers that moved; `/history?changed=1&days=7` (header **History** link) is "what changed this week" across all models.
+- `/api/history`: same grouping and filters as `/api/compare`, plus `days` (default 30, capped at retention) and `changed=1`. Each group has `changes` and `last_change_at`; each quote is the usual quote object plus `unit` (`usd` \| `sats`), `changes` and `points` (`at`, prices, `blended_usd` / `blended_sats`), led by the price in effect at the window start.
+- Every quote (`/api/quotes`, CSV) carries `price_history_since`, `price_changed_at` and `blend_change_24h_pct` / `_7d_pct` / `_30d_pct` (null until the quote has been tracked for that long).
+
+```bash
+curl -s 'localhost:8080/api/history?changed=1&days=7&kind=chat' | jq '.[] | {canonical_model, changes, last_change_at}'
+curl -s 'localhost:8080/api/quotes?kind=chat&limit=20000' | jq '[.[] | select(.blend_change_7d_pct != null and .blend_change_7d_pct != 0)] | length'
+```
+
 ### Copy curl / OpenAI config
 
 Hover a Best Now or price-board row → **curl** or **config** (or **compare**, see above).
@@ -208,7 +222,7 @@ curl -OJ 'http://127.0.0.1:8080/export.csv?source=openrouter&model=claude'
 curl -OJ 'http://127.0.0.1:8080/export.csv?source=openrouter,orcarouter&model=claude'
 ```
 
-Columns include source, provider, model, USD/sats, blended price, delta, endpoint, context, timestamps, plus `kind`, `age_secs`, `stale`, reliability / latency, `outlier`, `healthy`, `canonical_model`, and `tools` / `reasoning` / `vision` / `max_output_tokens` / `capabilities_inferred` (`;`-separated). Export honors the same filters as the board and API.
+Columns include source, provider, model, USD/sats, blended price, delta, endpoint, context, timestamps, plus `kind`, `age_secs`, `stale`, reliability / latency, `outlier`, `healthy`, `canonical_model`, and `tools` / `reasoning` / `vision` / `max_output_tokens` / `capabilities_inferred` (`;`-separated), then `price_changed_at` and `blend_change_24h_pct` / `_7d_pct` / `_30d_pct`. Export honors the same filters as the board and API.
 
 ## API examples
 

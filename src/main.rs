@@ -79,6 +79,7 @@ async fn run_serve(cfg: Config) -> Result<()> {
     // Set before restore so legacy snapshot rows are bounded too.
     store.set_price_ceiling_usd(cfg.max_price_usd_per_1m);
     store.set_max_nodes(cfg.max_nodes);
+    store.set_price_history_days(cfg.price_history_days);
     info!(version = env!("CARGO_PKG_VERSION"), "tokenstats starting");
     cfg.log_summary();
 

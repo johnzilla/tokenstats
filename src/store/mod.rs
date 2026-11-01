@@ -12,6 +12,8 @@ use crate::pricing::{sane_btc_usd, sanitize_opt};
 mod history;
 use history::Window;
 pub use history::{EndpointStats, HourBucket, HISTORY_HOURS};
+pub mod prices;
+pub use prices::{PricePoint, PriceSummary};
 
 /// How long to keep poll samples for reliability scoring.
 const RELIABILITY_WINDOW: Duration = Duration::hours(1);
@@ -350,6 +352,10 @@ pub struct Store {
     price_ceiling_usd: RwLock<Option<f64>>,
     /// Max discovered (non-`cli`) nodes; 0 = unlimited.
     max_nodes: AtomicUsize,
+    /// Published-price change points per quote key (see [`prices`]).
+    price_history: RwLock<HashMap<String, VecDeque<PricePoint>>>,
+    /// Price history retention in days; 0 = not recorded.
+    price_history_days: AtomicUsize,
 }
 
 impl Store {
@@ -373,11 +379,26 @@ impl Store {
 
     pub fn upsert_quotes(&self, quotes: impl IntoIterator<Item = Quote>) {
         let ceiling = self.price_ceiling();
+        let track = self.price_history_days() > 0;
+        let mut points = Vec::new();
         if let Ok(mut map) = self.quotes.write() {
             for mut q in quotes {
                 // Drop dynamic sentinels / invalids before they can poison sorts or SQLite.
                 q = sanitize_quote(q, ceiling);
                 let k = Self::quote_key(&q.source, &q.provider_id, &q.model);
+                if track {
+                    // Fresh from the catalog, so only the published unit is set.
+                    points.push((
+                        k.clone(),
+                        PricePoint::native(
+                            q.observed_at.timestamp(),
+                            q.price_in_usd,
+                            q.price_out_usd,
+                            q.price_in_sats,
+                            q.price_out_sats,
+                        ),
+                    ));
+                }
                 if let Some(prev) = map.get(&k) {
                     // Preserve previous prices for delta unless caller already set them.
                     if q.prev_price_out_usd.is_none() {
@@ -398,6 +419,104 @@ impl Store {
                     }
                 }
                 map.insert(k, q);
+            }
+        }
+        // After the quotes lock is released (see the locking rule on `Store`).
+        if !points.is_empty() {
+            if let Ok(mut hist) = self.price_history.write() {
+                for (k, p) in points {
+                    prices::record(hist.entry(k).or_default(), p);
+                }
+            }
+        }
+    }
+
+    /// Price history retention (`--price-history-days`; 0 = off).
+    pub fn set_price_history_days(&self, days: usize) {
+        self.price_history_days.store(days, Ordering::Relaxed);
+    }
+
+    pub fn price_history_days(&self) -> usize {
+        self.price_history_days.load(Ordering::Relaxed)
+    }
+
+    /// Unix-seconds cutoff for retained price history (`None` when off).
+    pub fn price_history_cutoff(&self, now: i64) -> Option<i64> {
+        let days = self.price_history_days();
+        (days > 0).then(|| now - days as i64 * 86_400)
+    }
+
+    /// Expire price points older than the retention window, keeping each
+    /// series' price in effect at the cutoff. A series whose quote is gone and
+    /// that hasn't changed within the window is dropped. Returns points removed.
+    pub fn prune_price_history(&self, now: i64) -> usize {
+        let Some(cutoff) = self.price_history_cutoff(now) else {
+            return 0;
+        };
+        let listed: HashSet<String> = self
+            .quotes
+            .read()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        let Ok(mut hist) = self.price_history.write() else {
+            return 0;
+        };
+        let mut removed = 0;
+        hist.retain(|k, series| {
+            removed += prices::prune(series, cutoff);
+            let keep = listed.contains(k) || series.back().is_some_and(|p| p.at >= cutoff);
+            if !keep {
+                removed += series.len();
+            }
+            keep
+        });
+        removed
+    }
+
+    /// Per-quote history summaries (change windows end at `now`).
+    pub fn price_summaries(&self, now: i64) -> HashMap<String, PriceSummary> {
+        let Ok(hist) = self.price_history.read() else {
+            return HashMap::new();
+        };
+        hist.iter()
+            .filter_map(|(k, s)| PriceSummary::of(s, now).map(|sum| (k.clone(), sum)))
+            .collect()
+    }
+
+    /// Points at or after `from` for `keys`, led by the price in effect at
+    /// `from` (whose `at` may be earlier).
+    pub fn price_series(&self, keys: &[String], from: i64) -> HashMap<String, Vec<PricePoint>> {
+        let Ok(hist) = self.price_history.read() else {
+            return HashMap::new();
+        };
+        keys.iter()
+            .filter_map(|k| {
+                let s = hist.get(k)?;
+                let start = s.partition_point(|p| p.at <= from).saturating_sub(1);
+                Some((k.clone(), s.range(start..).copied().collect()))
+            })
+            .collect()
+    }
+
+    /// Points first observed at or after `since` (all when `None`), for persistence.
+    pub fn price_history_snapshot(&self, since: Option<i64>) -> Vec<(String, PricePoint)> {
+        let Ok(hist) = self.price_history.read() else {
+            return Vec::new();
+        };
+        hist.iter()
+            .flat_map(|(k, s)| {
+                s.iter()
+                    .filter(move |p| since.is_none_or(|t| p.at >= t))
+                    .map(move |p| (k.clone(), *p))
+            })
+            .collect()
+    }
+
+    /// Restore price history (startup), rows in `(key, at)` order.
+    pub fn load_price_history(&self, rows: Vec<(String, PricePoint)>) {
+        if let Ok(mut hist) = self.price_history.write() {
+            for (k, p) in rows {
+                prices::record(hist.entry(k).or_default(), p);
             }
         }
     }
@@ -1115,6 +1234,61 @@ mod tests {
             kind: "chat".into(),
             caps: Default::default(),
         }
+    }
+
+    #[test]
+    fn price_history_records_published_changes_only() {
+        let store = Store::new();
+        store.set_price_history_days(90);
+        let at = |m: i64| Utc::now() - Duration::minutes(m);
+        let mut q = sample("m", 2.0);
+        q.observed_at = at(30);
+        store.upsert_quotes([q.clone()]);
+        // Sats filled by the oracle never become points.
+        store.apply_sats_normalization(60_000.0);
+        q.observed_at = at(20);
+        store.upsert_quotes([q.clone()]);
+        q.price_out_usd = Some(3.0);
+        q.observed_at = at(10);
+        store.upsert_quotes([q]);
+
+        let key = Store::quote_key("t", "p", "m");
+        let series = &store.price_series(std::slice::from_ref(&key), 0)[&key];
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[1].price_out_usd, Some(3.0));
+        assert_eq!(series[1].price_out_sats, None);
+        let sum = &store.price_summaries(Utc::now().timestamp())[&key];
+        assert_eq!(sum.changed_at, Some(at(10).timestamp()));
+
+        // Sats-only rows are tracked in sats.
+        let mut s = sample("s", 1.0);
+        (s.price_in_usd, s.price_out_usd) = (None, None);
+        (s.price_in_sats, s.price_out_sats) = (Some(5.0), Some(9.0));
+        store.upsert_quotes([s]);
+        let key = Store::quote_key("t", "p", "s");
+        let p = store.price_series(std::slice::from_ref(&key), 0)[&key][0];
+        assert_eq!(p.unit(), prices::PriceUnit::Sats);
+    }
+
+    #[test]
+    fn price_history_off_by_default_and_pruned_when_delisted() {
+        let store = Store::new();
+        store.upsert_quotes([sample("m", 2.0)]);
+        assert!(store.price_history_snapshot(None).is_empty());
+
+        store.set_price_history_days(1);
+        let mut old = sample("gone", 2.0);
+        old.observed_at = Utc::now() - Duration::days(3);
+        store.upsert_quotes([old, sample("m", 2.0)]);
+        store.prune_stale_quotes(Duration::days(2));
+        // "gone" is delisted and unchanged for longer than retention.
+        assert_eq!(store.prune_price_history(Utc::now().timestamp()), 1);
+        let keys: Vec<_> = store
+            .price_history_snapshot(None)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, [Store::quote_key("t", "p", "m")]);
     }
 
     #[test]
