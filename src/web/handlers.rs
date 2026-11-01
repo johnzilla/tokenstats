@@ -15,8 +15,10 @@ use crate::market::{
     Signals, DEFAULT_BLEND_RATIO, REFERENCE_SOURCES,
 };
 use crate::pricing::{blend_sort_key, is_rankable_blend};
+use crate::store::prices::PriceUnit;
 use crate::store::{
-    normalize_endpoint, Capabilities, EndpointStats, FetchStatus, ProbeStatus, ProviderNode, Quote,
+    normalize_endpoint, Capabilities, EndpointStats, FetchStatus, PricePoint, PriceSummary,
+    ProbeStatus, ProviderNode, Quote, Store,
 };
 
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -72,6 +74,10 @@ pub struct QuotesQuery {
     /// Required capabilities, comma-separated: tools | reasoning | vision.
     /// A quote matches when each is `true` (published or inferred).
     pub capabilities: Option<String>,
+    /// History window in days (`/api/history`, `/history`; default 30).
+    pub days: Option<i64>,
+    /// `1`/`true` keeps only offers whose price changed in the window (history).
+    pub changed: Option<String>,
 }
 
 impl QuotesQuery {
@@ -108,6 +114,8 @@ impl QuotesQuery {
         let mut exclude_outliers = self.exclude_outliers.as_deref();
         let mut healthy = self.healthy.as_deref();
         let mut capabilities = self.capabilities.as_deref();
+        let mut days = self.days.map(|d| d.to_string());
+        let mut changed = self.changed.as_deref();
 
         for (k, v) in overrides {
             match *k {
@@ -119,6 +127,8 @@ impl QuotesQuery {
                 "exclude_outliers" => exclude_outliers = *v,
                 "healthy" => healthy = *v,
                 "capabilities" => capabilities = *v,
+                "days" => days = v.map(|s| s.to_string()),
+                "changed" => changed = *v,
                 "clear" if *v == Some("1") => {
                     source = None;
                     model = None;
@@ -146,6 +156,8 @@ impl QuotesQuery {
         set("exclude_outliers", exclude_outliers);
         set("healthy", healthy);
         set("capabilities", capabilities);
+        set("days", days.as_deref());
+        set("changed", changed);
 
         if pairs.is_empty() {
             return String::new();
@@ -484,6 +496,172 @@ pub async fn api_compare(
     Json(groups)
 }
 
+/// One offer's published-price history inside a window.
+struct HistoryOffer {
+    quote: Quote,
+    /// Led by the price in effect at the window start (its `at` may be earlier).
+    points: Vec<PricePoint>,
+    /// Price changes inside the window.
+    changes: usize,
+}
+
+impl HistoryOffer {
+    fn last_change_at(&self) -> Option<i64> {
+        (self.changes > 0)
+            .then(|| self.points.last().map(|p| p.at))
+            .flatten()
+    }
+
+    /// (previous, new) for each change inside the window.
+    fn changes_since(&self, from: i64) -> impl Iterator<Item = (&PricePoint, &PricePoint)> {
+        self.points
+            .windows(2)
+            .filter(move |w| w[1].at >= from)
+            .map(|w| (&w[0], &w[1]))
+    }
+}
+
+struct HistoryGroup {
+    key: String,
+    offers: Vec<HistoryOffer>,
+}
+
+impl HistoryGroup {
+    fn changes(&self) -> usize {
+        self.offers.iter().map(|o| o.changes).sum()
+    }
+
+    fn last_change_at(&self) -> Option<i64> {
+        self.offers.iter().filter_map(|o| o.last_change_at()).max()
+    }
+}
+
+/// Default and allowed history windows (days).
+const DEFAULT_HISTORY_DAYS: i64 = 30;
+const HISTORY_DAY_PILLS: [i64; 4] = [1, 7, 30, 90];
+
+/// Window start (Unix seconds) and length in days, capped at retention.
+/// `None` when price history is off.
+fn history_window(state: &AppState, q: &QuotesQuery, now: i64) -> Option<(i64, i64)> {
+    let retention = state.store.price_history_days() as i64;
+    (retention > 0).then(|| {
+        let days = q
+            .days
+            .filter(|d| *d > 0)
+            .unwrap_or(DEFAULT_HISTORY_DAYS)
+            .min(retention);
+        (now - days * 86_400, days)
+    })
+}
+
+/// `compare_groups` with each offer's history since `from`. With
+/// `changed=1`, only offers that changed in the window, latest change first.
+fn history_groups(
+    state: &AppState,
+    all: Vec<Quote>,
+    q: &QuotesQuery,
+    ctx: &QuoteCtx,
+    from: i64,
+) -> Vec<HistoryGroup> {
+    let groups = compare_groups(all, q, ctx);
+    let keys: Vec<String> = groups
+        .iter()
+        .flat_map(|g| &g.quotes)
+        .map(|q| Store::quote_key(&q.source, &q.provider_id, &q.model))
+        .collect();
+    let mut series = state.store.price_series(&keys, from);
+    let changed_only = truthy(q.changed.as_deref());
+    let mut out: Vec<HistoryGroup> = groups
+        .into_iter()
+        .map(|g| HistoryGroup {
+            key: g.key,
+            offers: g
+                .quotes
+                .into_iter()
+                .map(|quote| {
+                    let points = series
+                        .remove(&Store::quote_key(
+                            &quote.source,
+                            &quote.provider_id,
+                            &quote.model,
+                        ))
+                        .unwrap_or_default();
+                    let changes = points.iter().skip(1).filter(|p| p.at >= from).count();
+                    HistoryOffer {
+                        quote,
+                        points,
+                        changes,
+                    }
+                })
+                .filter(|o| !changed_only || o.changes > 0)
+                .collect(),
+        })
+        .filter(|g| !g.offers.is_empty())
+        .collect();
+    if changed_only {
+        // Stable: ties keep compare's order.
+        out.sort_by_key(|g| std::cmp::Reverse(g.last_change_at()));
+    }
+    out
+}
+
+fn point_json(p: &PricePoint, ratio: f64) -> serde_json::Value {
+    let blend = p.blended(ratio);
+    let usd = p.unit() == PriceUnit::Usd;
+    serde_json::json!({
+        "at": ts(p.at),
+        "price_in_usd": p.price_in_usd,
+        "price_out_usd": p.price_out_usd,
+        "price_in_sats": p.price_in_sats,
+        "price_out_sats": p.price_out_sats,
+        "blended_usd": if usd { blend } else { None },
+        "blended_sats": if usd { None } else { blend },
+    })
+}
+
+fn history_json(g: &HistoryGroup, ctx: &QuoteCtx, from: i64, days: i64) -> serde_json::Value {
+    let quotes: Vec<_> = g
+        .offers
+        .iter()
+        .map(|o| {
+            let mut v = enrich_json(&o.quote, ctx);
+            v["unit"] = serde_json::json!(o.points.last().map(|p| p.unit().as_str()));
+            v["changes"] = serde_json::json!(o.changes);
+            v["points"] = o.points.iter().map(|p| point_json(p, ctx.ratio)).collect();
+            v
+        })
+        .collect();
+    serde_json::json!({
+        "canonical_model": g.key,
+        "days": days,
+        "from": ts(from),
+        "blend_ratio": ctx.ratio,
+        "offers": g.offers.len(),
+        "changes": g.changes(),
+        "last_change_at": g.last_change_at().and_then(ts),
+        "quotes": quotes,
+    })
+}
+
+/// Published-price history of one model across sources.
+pub async fn api_history(
+    State(state): State<AppState>,
+    Query(q): Query<QuotesQuery>,
+) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(50).min(MAX_COMPARE_GROUPS);
+    let all = state.store.list_quotes();
+    let ctx = QuoteCtx::new(&state, &all, q.blend_ratio());
+    let Some((from, days)) = history_window(&state, &q, ctx.now.timestamp()) else {
+        return Json(Vec::new());
+    };
+    let groups: Vec<_> = history_groups(&state, all, &q, &ctx, from)
+        .iter()
+        .take(limit)
+        .map(|g| history_json(g, &ctx, from, days))
+        .collect();
+    Json(groups)
+}
+
 /// `/api/compare` group cap.
 const MAX_COMPARE_GROUPS: usize = 1_000;
 
@@ -530,14 +708,15 @@ pub async fn export_csv(State(state): State<AppState>, Query(q): Query<QuotesQue
          price_in_sats,price_out_sats,delta_out_pct,endpoint,region,context_length,observed_at,\
          kind,age_secs,stale,reliability_1h,outlier,reliability_24h,reliability_7d,\
          latency_p50_ms,latency_p95_ms,latency_source,identity_verified,healthy,canonical_model,\
-         tools,reasoning,vision,max_output_tokens,capabilities_inferred\n",
+         tools,reasoning,vision,max_output_tokens,capabilities_inferred,price_changed_at,\
+         blend_change_24h_pct,blend_change_7d_pct,blend_change_30d_pct\n",
     );
     for quote in quotes.into_iter().take(limit) {
         let blend = blended_usd(quote.price_in_usd, quote.price_out_usd, ratio);
         let d = delta_pct(quote.price_out_usd, quote.prev_price_out_usd);
         let (caps, inferred) = ctx.caps(&quote);
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             csv_cell(&quote.source),
             csv_cell(&quote.provider),
             csv_cell(&quote.provider_id),
@@ -578,6 +757,14 @@ pub async fn export_csv(State(state): State<AppState>, Query(q): Query<QuotesQue
             opt_b(caps.vision),
             opt_u(caps.max_output_tokens),
             inferred.join(";"),
+            ctx.price_summary(&quote)
+                .and_then(|s| s.changed_at)
+                .and_then(ts)
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_default(),
+            opt_f(ctx.blend_change_pct(&quote, 0)),
+            opt_f(ctx.blend_change_pct(&quote, 1)),
+            opt_f(ctx.blend_change_pct(&quote, 2)),
         ));
     }
 
@@ -920,6 +1107,7 @@ pub async fn dashboard(
     <span class="meta links">
       <a href="{csv_href}">Export CSV</a>
       <a href="/compare">Compare</a>
+      <a href="/history?changed=1&amp;days=7">History</a>
       <a href="/api/summary">/api/summary</a>
       <a href="/api/quotes">/api/quotes</a>
       <a href="/health">/health</a>
@@ -1145,6 +1333,7 @@ pub async fn compare_page(
         .collect();
     let api_href = format!("/api/compare{}", q.qs(&[]));
     let board_href = format!("/{}", q.qs(&[]));
+    let history_href = format!("/history{}", q.qs(&[]));
 
     let html = format!(
         r#"<!DOCTYPE html>
@@ -1163,6 +1352,7 @@ pub async fn compare_page(
     <span class="meta">compare one model across sources · blend 1:{ratio_i}</span>
     <span class="meta links">
       <a href="{board_href}">Board</a>
+      <a href="{history_href}">History</a>
       <a href="{api_href}">/api/compare</a>
     </span>
   </header>
@@ -1195,6 +1385,7 @@ pub async fn compare_page(
         analytics = analytics_tags(&state),
         ratio_i = ratio as i32,
         board_href = esc_attr(&board_href),
+        history_href = esc_attr(&history_href),
         api_href = esc_attr(&api_href),
         model_attr = esc_attr(model),
     );
@@ -1293,7 +1484,7 @@ fn compare_section(g: &CompareGroup, ctx: &QuoteCtx) -> String {
         })
         .collect();
     format!(
-        r#"<h2>{key} <span class="hint">{hint}</span></h2>
+        r#"<h2>{key} <span class="hint">{hint}</span> <a class="export" href="{history_href}">price history</a></h2>
   <div class="table-wrap"><table>
     <thead><tr>
       <th>Source</th><th>Provider / node / id</th><th>In</th><th>Out</th>
@@ -1304,6 +1495,363 @@ fn compare_section(g: &CompareGroup, ctx: &QuoteCtx) -> String {
   </table></div>"#,
         key = esc(&g.key),
         hint = esc(&hint.join(" · ")),
+        history_href = esc_attr(&format!("/history?model={}", percent_encode(&g.key))),
+    )
+}
+
+/// Models shown on `/history` (the API takes `limit`).
+const HISTORY_PAGE_GROUPS: usize = 10;
+/// Lines per chart (`.hl-0` … `.hl-7` in app.css); the change log lists all.
+const HISTORY_CHART_LINES: usize = 8;
+/// Change-log rows per model on `/history`.
+const HISTORY_LOG_ROWS: usize = 50;
+
+/// `/history?model=`: blend over time per offer, plus a change log.
+pub async fn history_page(
+    State(state): State<AppState>,
+    Query(q): Query<QuotesQuery>,
+) -> impl IntoResponse {
+    let ratio = q.blend_ratio();
+    let all = state.store.list_quotes();
+    let ctx = QuoteCtx::new(&state, &all, ratio);
+    let now = ctx.now.timestamp();
+    let model = q.model.as_deref().unwrap_or("").trim();
+    let window = history_window(&state, &q, now);
+    let groups = window
+        .map(|(from, _)| history_groups(&state, all, &q, &ctx, from))
+        .unwrap_or_default();
+    let days = window.map(|(_, d)| d).unwrap_or(0);
+    let btc = state.store.btc_usd();
+
+    let sections: String = match window {
+        None => {
+            r#"<p class="empty">Price history is off (<code>--price-history-days 0</code>).</p>"#
+                .to_string()
+        }
+        Some(_) if groups.is_empty() => format!(
+            r#"<p class="empty">No model matches “{}” with these filters.</p>"#,
+            esc(model)
+        ),
+        Some((from, _)) => groups
+            .iter()
+            .take(HISTORY_PAGE_GROUPS)
+            .map(|g| history_section(g, &ctx, from, now, btc))
+            .collect(),
+    };
+    let since = state
+        .store
+        .price_summaries(now)
+        .values()
+        .map(|s| s.since)
+        .min()
+        .and_then(ts)
+        .map(|t| format!(" · tracked since {}", t.format("%Y-%m-%d")))
+        .unwrap_or_default();
+
+    let hidden: String = [
+        ("ratio", q.ratio.map(|r| r.to_string())),
+        ("days", q.days.map(|d| d.to_string())),
+        ("changed", q.changed.clone()),
+        ("source", q.source.clone()),
+        ("kind", q.kind.clone()),
+        ("healthy", q.healthy.clone()),
+        ("exclude_stale", q.exclude_stale.clone()),
+        ("exclude_outliers", q.exclude_outliers.clone()),
+        ("capabilities", q.capabilities.clone()),
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| v.filter(|v| !v.is_empty()).map(|v| (k, v)))
+    .map(|(k, v)| {
+        format!(
+            r#"<input type="hidden" name="{k}" value="{}"/>"#,
+            esc_attr(&v)
+        )
+    })
+    .collect();
+    let retention = state.store.price_history_days() as i64;
+    let day_pills: String = HISTORY_DAY_PILLS
+        .iter()
+        .filter(|d| **d <= retention.max(1))
+        .map(|d| {
+            let cls = if *d == days { "pill active" } else { "pill" };
+            let href = format!("/history{}", q.qs(&[("days", Some(&d.to_string()))]));
+            format!(r#"<a class="{cls}" href="{}">{d}d</a>"#, esc_attr(&href))
+        })
+        .collect();
+    let filter_pills: String = [
+        ("changed", "changed only", q.changed.as_deref()),
+        ("healthy", "healthy only", q.healthy.as_deref()),
+        (
+            "exclude_outliers",
+            "hide outliers",
+            q.exclude_outliers.as_deref(),
+        ),
+    ]
+    .iter()
+    .map(|(key, label, current)| toggle_pill(&q, "/history", key, label, None, *current))
+    .collect();
+    let api_href = format!("/api/history{}", q.qs(&[]));
+    let compare_href = format!("/compare{}", q.qs(&[("days", None), ("changed", None)]));
+
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>tokenstats — price history {title}</title>
+  <style>
+{css}  </style>
+{analytics}
+</head>
+<body>
+  <header>
+    <h1><span>token</span>stats</h1>
+    <span class="meta">price history · blend 1:{ratio_i}{since}</span>
+    <span class="meta links">
+      <a href="/">Board</a>
+      <a href="{compare_href}">Compare</a>
+      <a href="{api_href}">/api/history</a>
+    </span>
+  </header>
+  <form class="search" method="get" action="/history">
+    <input type="search" name="model" value="{model_attr}" placeholder="model id, e.g. claude-sonnet-4.5 or deepseek" aria-label="Model"/>
+    {hidden}
+    <button type="submit">History</button>
+  </form>
+  <div class="pills">
+    <span class="label">Window</span>
+    {day_pills}
+  </div>
+  <div class="pills">
+    <span class="label">Filter</span>
+    {filter_pills}
+  </div>
+  <p class="meta">A point is recorded when a catalog's published price changes (USD, or sats for sats-only nodes) · offers joined on the canonical model id, as on Compare</p>
+  {sections}
+  <footer>tokenstats · observe only: prices are catalog list prices, not measured spend</footer>
+  <div id="toast" class="toast" role="status"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>"#,
+        title = esc(if model.is_empty() { "models" } else { model }),
+        css = APP_CSS,
+        analytics = analytics_tags(&state),
+        ratio_i = ratio as i32,
+        compare_href = esc_attr(&compare_href),
+        api_href = esc_attr(&api_href),
+        model_attr = esc_attr(model),
+    );
+    ([(header::CACHE_CONTROL, "no-store")], Html(html))
+}
+
+fn history_section(
+    g: &HistoryGroup,
+    ctx: &QuoteCtx,
+    from: i64,
+    now: i64,
+    btc: Option<f64>,
+) -> String {
+    let ratio = ctx.ratio;
+    // Offers that moved first, then cheapest; outliers would flatten the axis.
+    let mut charted: Vec<&HistoryOffer> = g
+        .offers
+        .iter()
+        .filter(|o| !ctx.is_outlier(&o.quote))
+        .collect();
+    charted.sort_by_key(|o| o.changes == 0);
+    charted.truncate(HISTORY_CHART_LINES);
+    let chart = history_chart(&charted, from, now, ratio, btc);
+    let legend: String = charted
+        .iter()
+        .enumerate()
+        .map(|(i, o)| {
+            let sats = o.points.last().is_some_and(|p| p.unit() == PriceUnit::Sats);
+            format!(
+                r#"<li><span class="sw hl-{i}"></span>{node} <code>{model}</code>{note}</li>"#,
+                node = esc(&node_display_name(&o.quote)),
+                model = esc(&o.quote.model),
+                note = if sats {
+                    r#" <span class="muted">(sats, at today's BTC/USD)</span>"#
+                } else {
+                    ""
+                },
+            )
+        })
+        .collect();
+
+    let mut log: Vec<(&HistoryOffer, &PricePoint, &PricePoint)> = g
+        .offers
+        .iter()
+        .flat_map(|o| o.changes_since(from).map(move |(a, b)| (o, a, b)))
+        .collect();
+    log.sort_by_key(|(_, _, b)| std::cmp::Reverse(b.at));
+    let rows: String = log
+        .iter()
+        .take(HISTORY_LOG_ROWS)
+        .map(|(o, a, b)| {
+            let fmt = |v: Option<f64>| match b.unit() {
+                PriceUnit::Usd => fmt_usd(v),
+                PriceUnit::Sats => format!("{} sats", fmt_sats(v)),
+            };
+            let (ai, ao) = a.prices();
+            let (bi, bo) = b.prices();
+            let side = |x: Option<f64>, y: Option<f64>| {
+                if x == y {
+                    fmt(y)
+                } else {
+                    format!("{} → {}", fmt(x), fmt(y))
+                }
+            };
+            let delta = if a.unit() == b.unit() {
+                delta_pct(b.blended(ratio), a.blended(ratio))
+            } else {
+                None
+            };
+            format!(
+                r#"<tr class="quote-row" {attrs}>
+          <td class="muted">{when}</td>
+          <td><span class="src src-{source}">{source}</span></td>
+          <td>{provider}<div class="sub muted">{node}</div><div class="sub"><code>{model}</code></div></td>
+          <td class="num">{pin}</td>
+          <td class="num">{pout}</td>
+          <td>{delta}</td>
+        </tr>"#,
+                attrs = quote_data_attrs(&o.quote),
+                when = ts(b.at)
+                    .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_default(),
+                source = esc(&o.quote.source),
+                provider = esc(&o.quote.provider),
+                node = esc(&node_display_name(&o.quote)),
+                model = esc(&o.quote.model),
+                pin = side(ai, bi),
+                pout = side(ao, bo),
+                delta = fmt_delta(delta),
+            )
+        })
+        .collect();
+    let log_html = if log.is_empty() {
+        r#"<p class="meta">No published price changes in this window.</p>"#.to_string()
+    } else {
+        format!(
+            r#"<div class="table-wrap"><table>
+    <thead><tr>
+      <th>When (UTC)</th><th>Source</th><th>Provider / node / id</th><th>In</th><th>Out</th><th>Blend Δ</th>
+    </tr></thead>
+    <tbody>{rows}</tbody>
+  </table></div>"#
+        )
+    };
+    let mut hint = vec![format!("{} offers", g.offers.len())];
+    hint.push(match g.changes() {
+        1 => "1 change".to_string(),
+        n => format!("{n} changes"),
+    });
+    if log.len() > HISTORY_LOG_ROWS {
+        hint.push(format!("latest {HISTORY_LOG_ROWS} shown"));
+    }
+    let compare_href = format!("/compare?model={}", percent_encode(&g.key));
+    format!(
+        r#"<h2>{key} <span class="hint">{hint}</span> <a class="export" href="{compare_href}">compare offers</a></h2>
+  {chart}
+  <ul class="hist-legend">{legend}</ul>
+  {log_html}"#,
+        key = esc(&g.key),
+        hint = esc(&hint.join(" · ")),
+        compare_href = esc_attr(&compare_href),
+    )
+}
+
+/// Step chart of each offer's blend (USD) from `from` to `now`. Sats-priced
+/// offers are converted at the current rate (skipped without one).
+fn history_chart(
+    offers: &[&HistoryOffer],
+    from: i64,
+    now: i64,
+    ratio: f64,
+    btc: Option<f64>,
+) -> String {
+    const W: f64 = 760.0;
+    const H: f64 = 200.0;
+    const LEFT: f64 = 72.0;
+    const RIGHT: f64 = 8.0;
+    const TOP: f64 = 8.0;
+    const BOTTOM: f64 = 22.0;
+    let lines: Vec<(usize, Vec<(i64, f64)>)> = offers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| {
+            let steps: Vec<(i64, f64)> = o
+                .points
+                .iter()
+                .filter_map(|p| {
+                    let b = p.blended(ratio)?;
+                    let usd = match p.unit() {
+                        PriceUnit::Usd => b,
+                        PriceUnit::Sats => b / 100_000_000.0 * btc?,
+                    };
+                    Some((p.at.max(from), usd))
+                })
+                .collect();
+            (!steps.is_empty()).then_some((i, steps))
+        })
+        .collect();
+    let values = lines.iter().flat_map(|(_, s)| s.iter().map(|(_, v)| *v));
+    let (Some(lo), Some(hi)) = (values.clone().reduce(f64::min), values.reduce(f64::max)) else {
+        return String::new();
+    };
+    let pad = if hi > lo {
+        (hi - lo) * 0.1
+    } else {
+        hi.abs().max(1e-6) * 0.05
+    };
+    let (lo, hi) = ((lo - pad).max(0.0), hi + pad);
+    let span = (now - from).max(1) as f64;
+    let x = |t: i64| LEFT + (t.clamp(from, now) - from) as f64 / span * (W - LEFT - RIGHT);
+    let y = |v: f64| TOP + (hi - v) / (hi - lo) * (H - TOP - BOTTOM);
+
+    let paths: String = lines
+        .iter()
+        .map(|(i, steps)| {
+            let (t0, v0) = steps[0];
+            let mut d = format!("M{:.1} {:.1}", x(t0), y(v0));
+            for (t, v) in &steps[1..] {
+                d.push_str(&format!(" H{:.1} V{:.1}", x(*t), y(*v)));
+            }
+            d.push_str(&format!(" H{:.1}", x(now)));
+            // The dot keeps an offer tracked only since "now" visible.
+            let last = steps[steps.len() - 1].1;
+            format!(
+                r#"<path class="hl-{i}" d="{d}"/><circle class="hl-{i}" cx="{:.1}" cy="{:.1}" r="2.5"/>"#,
+                x(now),
+                y(last)
+            )
+        })
+        .collect();
+    let grid: String = [hi, (hi + lo) / 2.0, lo]
+        .iter()
+        .map(|v| {
+            format!(
+                r#"<line class="grid" x1="{LEFT}" x2="{x2}" y1="{yv:.1}" y2="{yv:.1}"/><text x="{tx}" y="{ty:.1}" text-anchor="end">{label}</text>"#,
+                x2 = W - RIGHT,
+                yv = y(*v),
+                tx = LEFT - 6.0,
+                ty = y(*v) + 3.0,
+                label = esc(&fmt_usd(Some(*v))),
+            )
+        })
+        .collect();
+    let day = |t: i64| {
+        ts(t)
+            .map(|d| d.format("%b %-d").to_string())
+            .unwrap_or_default()
+    };
+    format!(
+        r#"<svg class="hist-chart" viewBox="0 0 {W} {H}" role="img" aria-label="Blended USD per 1M tokens, {start} to now">{grid}{paths}<text x="{LEFT}" y="{by}">{start}</text><text x="{rx}" y="{by}" text-anchor="end">now</text></svg>"#,
+        start = day(from),
+        by = H - 6.0,
+        rx = W - RIGHT,
     )
 }
 
@@ -1691,6 +2239,8 @@ struct QuoteCtx {
     /// to fill flags a row leaves out (Routstr nodes publish no
     /// `supported_parameters`).
     peer_caps: HashMap<String, Capabilities>,
+    /// Quote key → published-price history summary.
+    prices: HashMap<String, PriceSummary>,
 }
 
 impl QuoteCtx {
@@ -1764,8 +2314,10 @@ impl QuoteCtx {
                 (k.clone(), sig)
             })
             .collect();
+        let now = Utc::now();
         Self {
-            now: Utc::now(),
+            prices: state.store.price_summaries(now.timestamp()),
+            now,
             stale_after_secs: state.stale_after.as_secs() as i64,
             ratio,
             stats,
@@ -1836,6 +2388,16 @@ impl QuoteCtx {
         (caps, inferred)
     }
 
+    fn price_summary(&self, q: &Quote) -> Option<&PriceSummary> {
+        self.prices
+            .get(&Store::quote_key(&q.source, &q.provider_id, &q.model))
+    }
+
+    /// % change of the published blend over `CHANGE_WINDOWS[window]` (24h, 7d, 30d).
+    fn blend_change_pct(&self, q: &Quote, window: usize) -> Option<f64> {
+        self.price_summary(q)?.blend_change_pct(window, self.ratio)
+    }
+
     fn is_outlier(&self, q: &Quote) -> bool {
         let Some(b) = blended_usd(q.price_in_usd, q.price_out_usd, self.ratio)
             .filter(|b| is_rankable_blend(Some(*b)))
@@ -1878,7 +2440,7 @@ fn in_list(list: Option<&str>, value: &str) -> bool {
 fn enrich_json(q: &Quote, ctx: &QuoteCtx) -> serde_json::Value {
     let ratio = ctx.ratio;
     let (caps, inferred) = ctx.caps(q);
-    serde_json::json!({
+    let mut v = serde_json::json!({
         "source": q.source,
         "provider": q.provider,
         "provider_id": q.provider_id,
@@ -1918,7 +2480,19 @@ fn enrich_json(q: &Quote, ctx: &QuoteCtx) -> serde_json::Value {
         "input_modalities": (!caps.input_modalities.is_empty()).then_some(&caps.input_modalities),
         "max_output_tokens": caps.max_output_tokens,
         "capabilities_inferred": inferred,
-    })
+    });
+    // Separate so the macro above stays under the recursion limit.
+    let history = ctx.price_summary(q);
+    v["price_history_since"] = serde_json::json!(history.and_then(|s| ts(s.since)));
+    v["price_changed_at"] = serde_json::json!(history.and_then(|s| s.changed_at).and_then(ts));
+    v["blend_change_24h_pct"] = serde_json::json!(ctx.blend_change_pct(q, 0));
+    v["blend_change_7d_pct"] = serde_json::json!(ctx.blend_change_pct(q, 1));
+    v["blend_change_30d_pct"] = serde_json::json!(ctx.blend_change_pct(q, 2));
+    v
+}
+
+fn ts(secs: i64) -> Option<DateTime<Utc>> {
+    DateTime::from_timestamp(secs, 0)
 }
 
 fn filter_quotes(quotes: Vec<Quote>, q: &QuotesQuery, ctx: &QuoteCtx) -> Vec<Quote> {
@@ -2622,6 +3196,116 @@ mod tests {
         for line in lines {
             assert_eq!(line.split(',').count(), header, "{line}");
         }
-        assert!(csv.contains(",true,,false,,tools\n"));
+        assert!(csv.contains(",true,,false,,tools,,,,\n"));
+    }
+
+    /// A store tracking history with `m` on two nodes: `https://a` went
+    /// 2 → 4 a day ago (tracked for 40 days), `https://b` never changed.
+    fn history_state() -> AppState {
+        let st = state();
+        st.store.set_price_history_days(90);
+        st.store
+            .upsert_quotes([quote("v/m", "https://a", 2.0, 40 * 86_400, "chat")]);
+        st.store
+            .upsert_quotes([quote("v/m", "https://a", 4.0, 86_400, "chat")]);
+        st.store.upsert_quotes([
+            quote("v/m", "https://a", 4.0, 5, "chat"),
+            quote("m", "https://b", 3.0, 5, "chat"),
+        ]);
+        st
+    }
+
+    #[tokio::test]
+    async fn history_api_returns_change_points_per_offer() {
+        let st = history_state();
+        let resp = api_history(State(st.clone()), Query(query("model=m&days=7")))
+            .await
+            .into_response();
+        let v: serde_json::Value = serde_json::from_str(&html_of(resp).await).unwrap();
+        let g = &v[0];
+        assert_eq!(g["canonical_model"], "m");
+        assert_eq!(
+            (g["offers"].as_u64(), g["changes"].as_u64()),
+            (Some(2), Some(1))
+        );
+        let a = g["quotes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|q| q["endpoint"] == "https://a")
+            .unwrap();
+        assert_eq!(a["unit"], "usd");
+        assert_eq!(a["changes"], 1);
+        // Led by the price in effect at the window start (40 days old).
+        let outs: Vec<_> = a["points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["price_out_usd"].as_f64().unwrap())
+            .collect();
+        assert_eq!(outs, [2.0, 4.0]);
+        assert_eq!(a["blend_change_7d_pct"], 100.0);
+        assert_eq!(a["blend_change_24h_pct"], 0.0);
+        assert!(a["price_changed_at"].is_string());
+
+        // changed=1 keeps only the offer that moved.
+        let resp = api_history(State(st.clone()), Query(query("model=m&changed=1")))
+            .await
+            .into_response();
+        let v: serde_json::Value = serde_json::from_str(&html_of(resp).await).unwrap();
+        assert_eq!(v[0]["quotes"].as_array().unwrap().len(), 1);
+
+        // History off → empty, not an error.
+        st.store.set_price_history_days(0);
+        let resp = api_history(State(st), Query(query("model=m")))
+            .await
+            .into_response();
+        assert_eq!(html_of(resp).await, "[]");
+    }
+
+    #[tokio::test]
+    async fn quotes_carry_history_fields() {
+        let st = history_state();
+        let resp = api_quotes(State(st), Query(query("model=m")))
+            .await
+            .into_response();
+        let v: serde_json::Value = serde_json::from_str(&html_of(resp).await).unwrap();
+        let b = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|q| q["endpoint"] == "https://b")
+            .unwrap();
+        // Tracked for seconds: no change yet, no 24h window.
+        assert!(b["price_history_since"].is_string());
+        assert!(b["price_changed_at"].is_null());
+        assert!(b["blend_change_24h_pct"].is_null());
+    }
+
+    #[tokio::test]
+    async fn history_page_charts_and_logs_changes() {
+        let st = history_state();
+        let html = html_of(
+            history_page(State(st.clone()), Query(query("model=m&days=7")))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert!(html.contains(r#"<svg class="hist-chart""#));
+        assert!(html.contains(r#"<path class="hl-0""#));
+        assert!(html.contains("$2.0000 → $4.0000"));
+        assert!(
+            html.contains(r#"<a class="pill active" href="/history?model=m&amp;days=7">7d</a>"#)
+        );
+        assert!(!html.contains("<script>"));
+
+        let html = html_of(
+            history_page(State(st), Query(query(XSS)))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert!(!html.contains("<script>alert"), "payload reflected raw");
+        assert!(!html.contains("\"><script>"), "attribute broken out of");
     }
 }

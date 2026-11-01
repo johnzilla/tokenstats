@@ -61,6 +61,7 @@ cargo run -- serve --bind 0.0.0.0:8080 --db ./tokenstats.db
 | **Δ out** | Price change vs previous catalog snapshot |
 | **Hover → copy** | **curl** or OpenAI-compatible **config** JSON for that quote; **compare** opens the model across sources |
 | **Compare** | `/compare?model=…`: one model's offers from every source side by side, cheapest first, with spread and cheapest healthy offer |
+| **History** | `/history?model=…`: each offer's blend over 1/7/30/90 days (server-rendered SVG) and a log of published price changes; `?changed=1` lists what moved |
 | **Export CSV** | Current filtered view → `/export.csv?...` |
 | **Nodes** | Discovered RIP-02 endpoints + reliability (last hour; 24h/7d on hover) + p50/p95 latency |
 
@@ -72,11 +73,13 @@ Query params: `?source=openrouter&preset=frontier&ratio=4&model=deepseek`
 |------|-------------|
 | `GET /` | HTML dashboard (auto-refresh ~15s) |
 | `GET /health` | Liveness + feed `status` (`ok`/`degraded`/`down`/…) + counts + `last_updated` |
-| `GET /api/quotes` | JSON quotes (`source`, `model`, `kind`, `preset`, `ratio`, `limit`, `max_age_secs`, `min_reliability`, `min_reliability_24h`, `max_latency_ms`, `exclude_stale`, `exclude_outliers`, `healthy`, `capabilities`); each quote carries `canonical_model` and `tools` / `reasoning` / `vision` / `input_modalities` / `max_output_tokens` |
+| `GET /api/quotes` | JSON quotes (`source`, `model`, `kind`, `preset`, `ratio`, `limit`, `max_age_secs`, `min_reliability`, `min_reliability_24h`, `max_latency_ms`, `exclude_stale`, `exclude_outliers`, `healthy`, `capabilities`); each quote carries `canonical_model`, `tools` / `reasoning` / `vision` / `input_modalities` / `max_output_tokens`, and `price_changed_at` / `blend_change_24h_pct` / `_7d_` / `_30d_` |
 | `GET /api/nodes` | Discovered nodes + `status` (healthy/failing/dormant/skipped) + `failure_class` + reliability (1h/24h/7d) + latency p50/p95 + last success/error (+ `skip_reason` when not polled) |
 | `GET /api/summary` | Aggregates + Best Now strip |
 | `GET /api/compare` | Same model across sources, grouped by `canonical_model` (`model`, `ratio`, `limit` groups, plus the quote filters): offers, min/median/max blend, `spread_pct`, `cheapest`, `cheapest_healthy` |
 | `GET /compare` | HTML compare view |
+| `GET /api/history` | Published-price change points per offer, grouped like `/api/compare` (`days` window, default 30; `changed=1` = only offers that moved, latest first) |
+| `GET /history` | HTML price history: step chart + change log |
 | `GET /export.csv` | CSV of current filtered view |
 
 ## Architecture
@@ -124,6 +127,7 @@ Specs: [Routstr/protocol](https://github.com/Routstr/protocol)
 | Persist interval | `--persist-interval-secs` | `30` |
 | Node poll concurrency / timeout | `--node-concurrency` / `--node-timeout-secs` | `16` / `10` |
 | Quote expiry | `--quote-ttl-secs` | `86400` |
+| Price history retention (days) | `--price-history-days` | `90` (`0` = off) |
 | Node cap / expiry | `--max-nodes` / `--node-ttl-secs` | `512` / `604800` |
 | Stale flag threshold | `--stale-after-secs` | `600` |
 | Price ceiling (USD/1M) | `--max-price-usd-per-1m` | `1000` |

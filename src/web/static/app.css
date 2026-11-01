@@ -186,3 +186,29 @@ a { color: var(--accent); }
 .table-wrap { overflow-x: auto; }
 .tag-cap { color: var(--blue); margin-left: 0.15rem; }
 .tag-inferred { border-style: dashed; opacity: 0.8; }
+
+/* /history: step chart (inline SVG, no script) + legend. */
+.hist-chart {
+  display: block; width: 100%; max-width: 760px; height: auto;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+}
+.hist-chart path { fill: none; stroke: currentColor; stroke-width: 1.5; }
+.hist-chart circle { fill: currentColor; }
+.hist-chart .grid { stroke: var(--border); stroke-width: 1; }
+.hist-chart text { fill: var(--muted); font-size: 10px; font-family: inherit; }
+.hist-legend {
+  list-style: none; padding: 0; margin: 0.5rem 0 0.75rem;
+  display: flex; flex-wrap: wrap; gap: 0.3rem 1.1rem; font-size: 0.75rem; color: var(--muted);
+}
+.hist-legend .sw {
+  display: inline-block; width: 0.9rem; height: 0.2rem; margin-right: 0.35rem;
+  vertical-align: middle; background: currentColor;
+}
+.hl-0 { color: var(--accent); }
+.hl-1 { color: var(--blue); }
+.hl-2 { color: var(--warn); }
+.hl-3 { color: var(--up); }
+.hl-4 { color: #c792ea; }
+.hl-5 { color: #4dd0e1; }
+.hl-6 { color: #f78c6c; }
+.hl-7 { color: var(--text); }

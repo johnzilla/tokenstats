@@ -92,6 +92,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/summary", get(handlers::api_summary))
         .route("/api/compare", get(handlers::api_compare))
         .route("/compare", get(handlers::compare_page))
+        .route("/api/history", get(handlers::api_history))
+        .route("/history", get(handlers::history_page))
         .route("/health", get(handlers::health))
         .route("/static/app.js", get(handlers::app_js))
         .route(
@@ -163,6 +165,8 @@ mod tests {
             "/health",
             "/api/quotes",
             "/api/compare",
+            "/history",
+            "/api/history",
             "/static/app.js",
             "/nope",
         ] {
@@ -175,7 +179,7 @@ mod tests {
 
     #[tokio::test]
     async fn dashboard_has_no_inline_script_and_analytics_is_opt_in() {
-        for path in ["/", "/compare"] {
+        for path in ["/", "/compare", "/history"] {
             let html = body(get(state(None), path).await).await;
             assert!(html.contains(r#"<script src="/static/app.js"></script>"#));
             assert!(

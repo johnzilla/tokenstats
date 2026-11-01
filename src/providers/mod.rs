@@ -48,7 +48,7 @@ use anyhow::Result;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::store::{normalize_endpoint, FetchStatus, PollCycle, Store};
 
@@ -281,6 +281,10 @@ async fn poll_once(
         .unwrap_or(0);
     if nodes_expired > 0 {
         info!(nodes_expired, "expired nodes not seen within node TTL");
+    }
+    let price_points_expired = store.prune_price_history(chrono::Utc::now().timestamp());
+    if price_points_expired > 0 {
+        debug!(price_points_expired, "expired price history");
     }
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
