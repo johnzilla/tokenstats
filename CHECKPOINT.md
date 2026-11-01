@@ -1,6 +1,6 @@
 # Checkpoint
 
-_Last updated: 2026-10-27 · dashboard signals, node quality and model compare shipped (#17–#19)_
+_Last updated: 2026-10-31 · capability flags shipped (#22), all of #17–#22 live; arbstr v2.5.0 / arbstr-node v1.3.0 released_
 
 ## Where I am
 
@@ -14,9 +14,10 @@ Live on tokenstats.ai (DigitalOcean Droplet, pulls the CI-built GHCR image, `doc
 - **Dashboard signals** (#17): feed-health strip, Rel 24h / latency / age columns, outlier tag, Quality pills
 - **Node quality** (#18): dormant backoff after 5 failed fetches (2×…1h, reset by a fresh announcement), failure classes (`dns`, `http_4xx`, `timeout`, …), `/api/nodes` `status` / `failure_class` / `next_poll_at`, per-quote `healthy` + `healthy=1` filter; presets sideline failing endpoints
 - **Model compare** (#19): `canonical_model` on quotes/CSV, `GET /api/compare` + `/compare` page (offers, spread, cheapest / cheapest healthy; outliers never cheapest); outlier medians now cross-source
+- **Capabilities** (#22): per-quote `tools` / `reasoning` / `vision`, `input_modalities`, `max_output_tokens` (persisted as `quotes.caps`); flags Routstr nodes leave out are inferred from OpenRouter, then OrcaRouter, by `canonical_model` (`capabilities_inferred`); `capabilities=` filter on the board, API and CSV
 - **Hygiene**: CI (fmt, clippy `-D warnings`, tests, MSRV 1.86, Docker build + smoke, GHCR publish on main) (#6, #13, #14); deploy hardening docs (#10)
-- 106 unit tests; `.github/dependabot.yml` for weekly grouped version PRs (nostr-sdk and MSRV toolchain refs excluded)
-- **Consumers**: arbstr v2.4.0 fetches only routable sources with `kind=chat`, `max_age_secs`, `exclude_outliers`, gates on `/health` `status`, trusts `reliability_24h`; arbstr-node v1.2.0 pins it. Next arbstr release adds `healthy=1`
+- 109 unit tests; `.github/dependabot.yml` for weekly grouped version PRs (nostr-sdk and MSRV toolchain refs excluded)
+- **Consumers**: arbstr v2.4.0 fetches only routable sources with `kind=chat`, `max_age_secs`, `exclude_outliers`, gates on `/health` `status`, trusts `reliability_24h`; arbstr v2.5.0 adds opt-in `[tokenstats].require_healthy` (uses `healthy`); arbstr-node v1.3.0 pins arbstr 2.5.0 + arbstr-vault 1.3.2
 
 ## Decisions made
 
@@ -30,10 +31,11 @@ Live on tokenstats.ai (DigitalOcean Droplet, pulls the CI-built GHCR image, `doc
 ## Open questions
 
 - Whether arbstr should use `/api/compare` (`cheapest_healthy`) for per-model routing instead of its own selection
+- Whether arbstr should filter on capability flags (e.g. require `tools` when a request carries tools)
 
 ## Next step
 
-None queued. Watch the live strip: Routstr dormant count should settle near the dead-node total, poll cycles shorter. Candidates in `AGENTS.md` "Good next features" (price history, signed Best Now publish).
+None queued. Redeployed 2026-10-31 (first deploy since #17): watch the live strip, where Routstr dormant count should settle near the 45 failing nodes and poll cycles shorten. Candidates in `AGENTS.md` "Good next features" (price history, signed Best Now publish).
 
 ## Anchors
 
