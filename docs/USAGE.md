@@ -121,6 +121,8 @@ The probe also returns what the node says about itself (`name`, `version`, `npub
 
 Every response carries `X-Content-Type-Options: nosniff` and a `Content-Security-Policy`: no inline scripts (the dashboard JS is `/static/app.js`), scripts and connections only from this origin, inline styles allowed, no framing. Setting `--plausible-script` (https only) adds that one origin to `script-src`/`connect-src` and loads `/static/plausible-init.js`. Without it, the dashboard loads no third-party code.
 
+`/robots.txt` keeps crawlers off filtered views (any URL with a query string), `/export.csv` and `/api/`, which otherwise get crawled once per filter combination.
+
 ### Feed health
 
 `/health` and `/api/summary` include `status` (`ok` · `degraded` · `down` · `starting` · `offline`) and a `feed` object: `reasons`, `stale_quotes`, `last_cycle` (nodes ok/failed, delisted, expired, elapsed), per-source `endpoints`/`healthy`/`failing`/`dormant`/`failure_classes`/`models`/`last_success_at`/`last_error` (Routstr also `skipped`), `last_cycle.nodes_dormant` (not due this cycle), and Nostr `discovery.lag_secs`. Many dead Routstr nodes alone does not degrade the feed; zero healthy nodes does. The dashboard shows a feed strip under the header (see [Feed strip and quality signals](#feed-strip-and-quality-signals)).

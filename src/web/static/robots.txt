@@ -1,0 +1,7 @@
+# Crawlers: index the board, compare and history pages, not every filter
+# combination. Filtered views, CSV export and the JSON API are for people
+# and agents, and crawling them only adds load.
+User-agent: *
+Disallow: /*?
+Disallow: /export.csv
+Disallow: /api/

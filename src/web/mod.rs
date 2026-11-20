@@ -95,6 +95,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/history", get(handlers::api_history))
         .route("/history", get(handlers::history_page))
         .route("/health", get(handlers::health))
+        .route("/robots.txt", get(handlers::robots_txt))
         .route("/static/app.js", get(handlers::app_js))
         .route(
             "/static/plausible-init.js",
@@ -168,6 +169,7 @@ mod tests {
             "/history",
             "/api/history",
             "/static/app.js",
+            "/robots.txt",
             "/nope",
         ] {
             let resp = get(state(None), path).await;
@@ -175,6 +177,21 @@ mod tests {
             assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{path}");
             assert!(h.contains_key(header::CONTENT_SECURITY_POLICY), "{path}");
         }
+    }
+
+    #[tokio::test]
+    async fn robots_txt_blocks_filtered_views_export_and_api() {
+        let resp = get(state(None), "/robots.txt").await;
+        assert_eq!(resp.status(), 200);
+        assert!(resp.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain"));
+        let txt = body(resp).await;
+        for rule in ["Disallow: /*?", "Disallow: /export.csv", "Disallow: /api/"] {
+            assert!(txt.lines().any(|l| l == rule), "missing {rule}");
+        }
+        assert!(!txt.lines().any(|l| l == "Disallow: /"));
     }
 
     #[tokio::test]
