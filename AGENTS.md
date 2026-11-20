@@ -77,6 +77,7 @@ Centralized in `src/config.rs`. Prefer adding new knobs there (CLI + `TOKENSTATS
 ### Images / deploy
 
 - CI's `docker` job builds and smoke-tests the image on every PR; on green `main` it pushes that same image to `ghcr.io/johnzilla/tokenstats` (`:latest`, `:sha-<short>`). Never push from PR builds.
+- Every compose service uses the `x-logging` anchor (json-file, 5 × 10 MB). Uncapped Docker logs filled the Droplet's disk once; keep the cap on any new service.
 - `docker-compose.yml` pulls the image (`TOKENSTATS_TAG`, default `latest`) and keeps `build: .` as a fallback. Production deploys are pull-based: `docs/DEPLOY.md` §6.
 
 ### Git

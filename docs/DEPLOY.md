@@ -325,6 +325,8 @@ docker compose --profile proxy up -d
 docker compose logs -f tokenstats     # wait for "poll cycle complete", Ctrl-C
 ```
 
+Old images pile up with every pull. Now and then run `docker image prune -f` (it removes only untagged images, never the running one).
+
 Check the CI run for the commit you're deploying is green first (the image only exists once the `docker` job passed). The run summary names the published tags.
 
 Verify from anywhere:
@@ -412,6 +414,7 @@ App CLI/env details: [USAGE.md](./USAGE.md).
 | Stale binary | `docker compose --profile proxy pull && docker compose --profile proxy up -d`; check the running revision with the `docker inspect` line in §6 |
 | `:8080` reachable from the internet | Docker bypasses UFW: set `TOKENSTATS_PUBLISH_PORT=127.0.0.1:8080` in `.env`, `docker compose --profile proxy up -d`, and add the cloud firewall (§2) |
 | `doctl … firewall create` → 403 | Token lacks firewall write scope; see §2 |
+| Disk full / `No space left on device` | `df -h /`, then `du -sh /var/lib/docker/containers` (container logs) and `journalctl --disk-usage`. Compose caps each container's log at 5 × 10 MB; containers created before that cap (Nov 2026) keep unbounded logs until recreated: `docker compose --profile proxy up -d --force-recreate`. To free space without a restart: `truncate -s 0 "$(docker inspect -f '{{.LogPath}}' tokenstats-caddy)"` (same for `tokenstats`), `journalctl --vacuum-size=200M`, `docker image prune -f` |
 | `/health` `status` not `ok` | Read `.feed.reasons`; `down` = no catalog fetched recently (outbound HTTPS / DNS?) |
 
 Health:
