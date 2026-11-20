@@ -673,6 +673,7 @@ const MAX_API_LIMIT: usize = 20_000;
 const APP_JS: &str = include_str!("static/app.js");
 const APP_CSS: &str = include_str!("static/app.css");
 const PLAUSIBLE_INIT_JS: &str = include_str!("static/plausible-init.js");
+const ROBOTS_TXT: &str = include_str!("static/robots.txt");
 
 fn js(body: &'static str) -> Response {
     (
@@ -687,6 +688,20 @@ fn js(body: &'static str) -> Response {
 
 pub async fn app_js() -> Response {
     js(APP_JS)
+}
+
+/// Keeps crawlers off filter permutations, CSV export and the API: on
+/// tokenstats.ai they walked every `/?source=…` link and filled the disk with
+/// request logs.
+pub async fn robots_txt() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        ROBOTS_TXT,
+    )
+        .into_response()
 }
 
 pub async fn plausible_init_js(State(state): State<AppState>) -> Response {

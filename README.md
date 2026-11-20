@@ -78,6 +78,7 @@ Query params: `?source=openrouter&preset=frontier&ratio=4&model=deepseek`
 | `GET /api/summary` | Aggregates + Best Now strip |
 | `GET /api/compare` | Same model across sources, grouped by `canonical_model` (`model`, `ratio`, `limit` groups, plus the quote filters): offers, min/median/max blend, `spread_pct`, `cheapest`, `cheapest_healthy` |
 | `GET /compare` | HTML compare view |
+| `GET /robots.txt` | Lets crawlers index `/`, `/compare`, `/history`; disallows query-string variants, `/export.csv`, `/api/` |
 | `GET /api/history` | Published-price change points per offer, grouped like `/api/compare` (`days` window, default 30; `changed=1` = only offers that moved, latest first) |
 | `GET /history` | HTML price history: step chart + change log |
 | `GET /export.csv` | CSV of current filtered view |
